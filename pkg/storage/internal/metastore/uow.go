@@ -3,6 +3,7 @@ package metastore
 import (
 	"context"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqlkit"
 	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqltx"
 )
 
@@ -30,7 +31,7 @@ func (s *Store) Do(ctx context.Context, fn func(ctx context.Context) error) erro
 	if _, ok := sqltx.From(ctx); ok {
 		return fn(ctx)
 	}
-	return s.withRetry(ctx, func() error {
+	return sqlkit.WithRetry(ctx, func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err

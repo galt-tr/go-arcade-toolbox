@@ -4,11 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"embed"
-	"fmt"
-	"io/fs"
 
-	"github.com/pressly/goose/v3"
-	goosedb "github.com/pressly/goose/v3/database"
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqlkit"
 )
 
 // migrationsFS holds the embedded goose migration sets, one directory per
@@ -25,38 +22,9 @@ var migrationsFS embed.FS
 const versionTable = "goose_db_version_utxo"
 
 // migrate brings db up to the latest schema for engine using the embedded
-// goose migrations. It is idempotent: goose applies only pending versions.
+// goose migrations. It is idempotent: goose applies only pending versions. The
+// shared runner lives in [sqlkit.Migrate]; this package supplies its own
+// embed.FS and version-table name.
 func migrate(ctx context.Context, db *sql.DB, engine Engine) error {
-	var (
-		dialect goose.Dialect
-		dir     string
-	)
-	switch engine {
-	case EnginePostgres:
-		dialect, dir = goose.DialectPostgres, "migrations/postgres"
-	case EngineSQLite:
-		dialect, dir = goose.DialectSQLite3, "migrations/sqlite"
-	default:
-		return fmt.Errorf("no migrations for engine %q", engine)
-	}
-
-	sub, err := fs.Sub(migrationsFS, dir)
-	if err != nil {
-		return fmt.Errorf("sub filesystem %q: %w", dir, err)
-	}
-
-	// A custom store carries the non-default version table name. goose requires
-	// the dialect argument to NewProvider be empty when a store is supplied.
-	store, err := goosedb.NewStore(dialect, versionTable)
-	if err != nil {
-		return fmt.Errorf("goose store: %w", err)
-	}
-	provider, err := goose.NewProvider("", db, sub, goose.WithStore(store))
-	if err != nil {
-		return fmt.Errorf("goose provider: %w", err)
-	}
-	if _, err := provider.Up(ctx); err != nil {
-		return fmt.Errorf("goose up: %w", err)
-	}
-	return nil
+	return sqlkit.Migrate(ctx, db, migrationsFS, engine, versionTable)
 }

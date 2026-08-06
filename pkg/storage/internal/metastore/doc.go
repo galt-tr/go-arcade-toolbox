@@ -9,8 +9,8 @@
 // database/sql (no ORM); the differences are confined to the embedded goose
 // migration set, the '?'→$N placeholder rewrite, the boolean spelling and the
 // timestamp encoding (PostgreSQL TIMESTAMPTZ vs SQLite INTEGER Unix
-// microseconds). These helpers are intentionally the same shape as
-// pkg/utxostore/sqlstore's; see "Duplication" below.
+// microseconds). That dialect scaffolding is shared with pkg/utxostore/sqlstore
+// through internal/sqlkit; see "Shared dialect scaffolding" below.
 //
 // # Repositories and the Unit of Work
 //
@@ -66,15 +66,19 @@
 // disjoint and is what makes one funder correct over both a shared SQL database
 // and a split SQL-metadata / Aerospike-inventory deployment.
 //
-// # Duplication with sqlstore (flagged for later consolidation)
+// # Shared dialect scaffolding (internal/sqlkit)
 //
-// The dialect scaffolding here is copy-adapted from pkg/utxostore/sqlstore
-// rather than shared: the '?'→$N rebind, the isLockError classifier + bounded
-// withRetry, the encTime/boolVal encoders and the tsScan/boolScan scan helpers,
-// the sqlite DSN pragmas and the postgres DSN builder, and the goose
-// embed.FS-per-engine setup. Per the task brief this is accepted for now (the
-// two packages must not depend on each other's internals yet); a later
-// consolidation task should lift the shared pieces into a small internal/sqlkit
-// package. The migration version tables are deliberately different names so the
-// two chains stay independent in a shared Mode-A database.
+// The dialect scaffolding is shared with pkg/utxostore/sqlstore through
+// internal/sqlkit rather than copy-adapted: the '?'→$N rebind, the IsLockError
+// classifier + bounded WithRetry, the EncTime/BoolVal encoders and the
+// TsScan/BoolScan scan helpers, the SQLite DSN pragmas and the Postgres DSN
+// builder, the connection-pool sizing, the ambient-transaction resolver
+// (Execer), and the goose embed.FS-per-engine runner. Single-sourcing these
+// matters in Mode A: the two stores share one *sql.DB, so their pragmas must
+// match and one retry classifier must govern both statement chains. The
+// store-specific pieces stay here — the repository scans, the SQL strings, the
+// FOR UPDATE SKIP LOCKED clause, the pagination clause. The migration version
+// tables keep deliberately different names (goose_db_version_meta here,
+// goose_db_version_utxo in sqlstore) so the two chains stay independent in a
+// shared Mode-A database.
 package metastore

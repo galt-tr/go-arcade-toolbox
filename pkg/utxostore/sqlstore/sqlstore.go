@@ -5,22 +5,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
-	"github.com/jackc/pgx/v5/pgconn"
-	sqlitedrv "modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 
 	// Registers the "pgx" database/sql driver used by the PostgreSQL engine.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqlkit"
 	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqltx"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
@@ -28,21 +22,16 @@ import (
 
 // Engine selects the SQL dialect a [Store] speaks. One implementation drives
 // both; the differences are confined to the migration set, the placeholder
-// syntax, the claim statement shape, and the timestamp encoding.
-type Engine string
+// syntax, the claim statement shape, and the timestamp encoding. It is an alias
+// for [sqlkit.Engine], the single dialect enum shared with the metastore.
+type Engine = sqlkit.Engine
 
 const (
 	// EnginePostgres is PostgreSQL, driven through the pgx stdlib driver.
-	EnginePostgres Engine = "postgres"
+	EnginePostgres = sqlkit.EnginePostgres
 	// EngineSQLite is SQLite, driven through the CGo-free modernc driver.
-	EngineSQLite Engine = "sqlite"
+	EngineSQLite = sqlkit.EngineSQLite
 )
-
-// maxLockRetries bounds the retry loop for lock/deadlock/serialization errors
-// on the guarded (non-claim) mutations. Claims never retry: they use
-// SKIP LOCKED and treat an empty result as "nothing available" (see the
-// package doc, "Design notes").
-const maxLockRetries = 3
 
 // errClosed is returned by every method after Close.
 var errClosed = errors.New("sqlstore: store is closed")
@@ -65,7 +54,7 @@ type Store struct {
 	engine Engine
 	ownsDB bool
 	now    func() time.Time
-	pool   poolConfig
+	pool   sqlkit.PoolConfig
 
 	mu     sync.Mutex
 	closed bool
@@ -74,36 +63,15 @@ type Store struct {
 // compile-time interface check.
 var _ utxostore.Store = (*Store)(nil)
 
-// poolConfig holds connection-pool knobs applied to a PostgreSQL pool the
-// store owns. Zero fields fall back to sane defaults at apply time.
-type poolConfig struct {
-	maxOpen     int
-	maxIdle     int
-	connMaxIdle time.Duration
-	connMaxLife time.Duration
-}
-
-// applyTo configures db's pool, substituting sane defaults for any zero field.
-// Sized for the claim hot path, not the low defs defaults.
-func (p poolConfig) applyTo(db *sql.DB) {
-	maxOpen, maxIdle := p.maxOpen, p.maxIdle
-	connMaxIdle, connMaxLife := p.connMaxIdle, p.connMaxLife
-	if maxOpen <= 0 {
-		maxOpen = 25
-	}
-	if maxIdle <= 0 {
-		maxIdle = 10
-	}
-	if connMaxIdle <= 0 {
-		connMaxIdle = 5 * time.Minute
-	}
-	if connMaxLife <= 0 {
-		connMaxLife = 30 * time.Minute
-	}
-	db.SetMaxOpenConns(maxOpen)
-	db.SetMaxIdleConns(maxIdle)
-	db.SetConnMaxIdleTime(connMaxIdle)
-	db.SetConnMaxLifetime(connMaxLife)
+// defaultPool sizes an owned PostgreSQL pool for the claim hot path, not the
+// low defs defaults. It backfills any field [WithConnPool] left zero. The
+// metastore keeps a smaller default set; the sizing mechanism is shared via
+// [sqlkit.PoolConfig].
+var defaultPool = sqlkit.PoolConfig{
+	MaxOpen:     25,
+	MaxIdle:     10,
+	ConnMaxIdle: 5 * time.Minute,
+	ConnMaxLife: 30 * time.Minute,
 }
 
 // Option configures a Store.
@@ -122,7 +90,7 @@ func WithClock(now func() time.Time) Option {
 // for [New] (the caller owns the shared pool).
 func WithConnPool(maxOpen, maxIdle int, connMaxIdle, connMaxLife time.Duration) Option {
 	return func(s *Store) {
-		s.pool = poolConfig{maxOpen: maxOpen, maxIdle: maxIdle, connMaxIdle: connMaxIdle, connMaxLife: connMaxLife}
+		s.pool = sqlkit.PoolConfig{MaxOpen: maxOpen, MaxIdle: maxIdle, ConnMaxIdle: connMaxIdle, ConnMaxLife: connMaxLife}
 	}
 }
 
@@ -207,7 +175,7 @@ func newStore(ctx context.Context, db *sql.DB, engine Engine, ownsDB bool, opts 
 	// the pool). SQLite pins SetMaxOpenConns(1) in OpenSQLite and New leaves
 	// the caller's shared pool untouched.
 	if ownsDB && engine == EnginePostgres {
-		s.pool.applyTo(db)
+		s.pool.ApplyTo(db, defaultPool)
 	}
 	if err := migrate(ctx, db, engine); err != nil {
 		return nil, fmt.Errorf("sqlstore: migrate: %w", err)
@@ -215,49 +183,17 @@ func newStore(ctx context.Context, db *sql.DB, engine Engine, ownsDB bool, opts 
 	return s, nil
 }
 
-// sqliteDSN builds a modernc SQLite DSN for path with the store's required
-// pragmas. modernc parses these query parameters and applies them on every new
-// connection, so the pool never hands out a connection missing them.
+// sqliteDSN builds the shared modernc SQLite DSN for path (WAL, busy_timeout,
+// synchronous=NORMAL, foreign_keys, immediate transactions). See [sqlkit.SQLiteDSN].
 func sqliteDSN(path string) string {
-	q := url.Values{}
-	q.Set("_journal_mode", "WAL")
-	q.Set("_busy_timeout", "5000")
-	q.Set("_foreign_keys", "on")
-	q.Set("_txlock", "immediate")
-	q.Add("_pragma", "synchronous(NORMAL)")
-	return path + "?" + q.Encode()
+	return sqlkit.SQLiteDSN(path)
 }
 
-// postgresDSN renders a postgres:// URL DSN from a [defs.PostgreSQL] config.
-// It uses net/url so that values with spaces or reserved characters (notably
-// the password) are percent-escaped rather than truncated by a key=value
-// parser — and so a crafted value cannot inject extra connection parameters
-// (e.g. downgrade sslmode). See the postgresDSN round-trip unit test.
+// postgresDSN renders a postgres:// URL DSN from a [defs.PostgreSQL] config,
+// percent-escaping every value so a crafted password cannot inject extra
+// connection parameters. See [sqlkit.PostgresDSN] and the round-trip unit test.
 func postgresDSN(cfg defs.PostgreSQL) string {
-	ssl := cfg.SslMode
-	if ssl == "" {
-		ssl = "disable"
-	}
-	host := cfg.Host
-	if cfg.Port != "" {
-		host = net.JoinHostPort(cfg.Host, cfg.Port)
-	}
-	q := url.Values{}
-	q.Set("sslmode", ssl)
-	if cfg.Schema != "" {
-		q.Set("search_path", cfg.Schema)
-	}
-	if cfg.TimeZone != "" {
-		q.Set("TimeZone", cfg.TimeZone)
-	}
-	u := url.URL{
-		Scheme:   "postgres",
-		User:     url.UserPassword(cfg.User, cfg.Password),
-		Host:     host,
-		Path:     "/" + cfg.DBName,
-		RawQuery: q.Encode(),
-	}
-	return u.String()
+	return sqlkit.PostgresDSN(cfg)
 }
 
 // SharesDatabase reports whether this store runs over db, so a co-located
@@ -310,20 +246,13 @@ func (s *Store) isClosed() bool {
 
 // queryer is the subset of *sql.DB / *sql.Tx the store uses, so the same code
 // runs against the pool or a transaction (an ambient one from ctx, or a
-// per-call one from withTx).
-type queryer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
+// per-call one from withTx). It aliases [sqlkit.SQLExecer].
+type queryer = sqlkit.SQLExecer
 
 // execer returns the queryer for a non-transactional statement: the ambient
 // transaction carried by ctx (Mode A) if present, else the pool.
 func (s *Store) execer(ctx context.Context) queryer {
-	if tx, ok := sqltx.From(ctx); ok {
-		return tx
-	}
-	return s.db
+	return sqlkit.Execer(ctx, s.db)
 }
 
 // withTx runs fn inside a transaction. If ctx already carries one (Mode A) it
@@ -341,7 +270,7 @@ func (s *Store) withTx(ctx context.Context, fn func(q queryer) error) error {
 	if tx, ok := sqltx.From(ctx); ok {
 		return fn(tx)
 	}
-	return s.withRetry(ctx, func() error {
+	return sqlkit.WithRetry(ctx, func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -354,74 +283,12 @@ func (s *Store) withTx(ctx context.Context, fn func(q queryer) error) error {
 	})
 }
 
-// withRetry runs fn, retrying up to maxLockRetries times with exponential
-// backoff while it returns a lock/deadlock/serialization error.
-func (s *Store) withRetry(ctx context.Context, fn func() error) error {
-	var err error
-	for attempt := 0; ; attempt++ {
-		err = fn()
-		if err == nil || !isLockError(err) || attempt >= maxLockRetries {
-			return err
-		}
-		backoff := time.Duration(100<<attempt) * time.Millisecond // 100ms, 200ms, 400ms
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-	}
-}
-
-// isLockError classifies transient lock/deadlock/serialization errors that a
-// bounded retry can clear. It mirrors teranode's classifier, adapted to the
-// pgx (not lib/pq) and modernc (extended result codes) drivers this store uses.
-func isLockError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		// 40001 serialization_failure, 40P01 deadlock_detected,
-		// 55P03 lock_not_available.
-		return pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "55P03"
-	}
-	var liteErr *sqlitedrv.Error
-	if errors.As(err, &liteErr) {
-		// modernc enables extended result codes; mask to the primary code.
-		code := liteErr.Code() & 0xFF
-		return code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "database is locked") ||
-		strings.Contains(msg, "database table is locked") ||
-		strings.Contains(msg, "deadlock")
-}
-
 // rebind converts the '?' placeholders used throughout this package to the
 // $N form PostgreSQL requires; SQLite keeps '?'. The claim statements are
 // engine-specific and already carry their own placeholders, so they bypass
-// rebind.
-//
-// Caveat: this is a naive scan that rewrites every '?', so it would corrupt a
-// literal '?' inside a string constant or a PostgreSQL jsonb `?` operator.
-// None of this package's rebind-ed queries contain either; keep it that way.
+// rebind. See [sqlkit.Rebind] for the naive-scan caveat.
 func (s *Store) rebind(q string) string {
-	if s.engine != EnginePostgres {
-		return q
-	}
-	var b strings.Builder
-	b.Grow(len(q) + 8)
-	n := 0
-	for i := 0; i < len(q); i++ {
-		if q[i] == '?' {
-			n++
-			b.WriteByte('$')
-			b.WriteString(strconv.Itoa(n))
-			continue
-		}
-		b.WriteByte(q[i])
-	}
-	return b.String()
+	return sqlkit.Rebind(s.engine, q)
 }
 
 // forUpdate is the row-lock clause appended to the guarded read-modify-write
@@ -438,48 +305,32 @@ func (s *Store) forUpdate() string {
 // encTime encodes t for a bound parameter: a UTC time.Time for PostgreSQL
 // TIMESTAMPTZ, or Unix microseconds for SQLite's INTEGER columns.
 func (s *Store) encTime(t time.Time) any {
-	if s.engine == EngineSQLite {
-		return t.UnixMicro()
-	}
-	return t.UTC()
+	return sqlkit.EncTime(s.engine, t)
 }
 
 // boolVal encodes a boolean for a bound parameter: a bool for PostgreSQL, or
 // 0/1 for SQLite's INTEGER columns.
 func (s *Store) boolVal(b bool) any {
-	if s.engine == EngineSQLite {
-		if b {
-			return int64(1)
-		}
-		return int64(0)
-	}
-	return b
+	return sqlkit.BoolVal(s.engine, b)
 }
 
 // boolScan holds a scanned boolean in whichever representation the engine uses
 // (PostgreSQL BOOLEAN, SQLite INTEGER 0/1). Mirrors tsScan: use boolDest to
-// build the Scan target and boolGet to decode.
-type boolScan struct {
-	b bool  // postgres
-	i int64 // sqlite
-}
+// build the Scan target and boolGet to decode. It aliases [sqlkit.BoolScan].
+type boolScan = sqlkit.BoolScan
 
 func (s *Store) boolDest(x *boolScan) any {
-	if s.engine == EngineSQLite {
-		return &x.i
-	}
-	return &x.b
+	return sqlkit.BoolDest(s.engine, x)
 }
 
 func (s *Store) boolGet(x boolScan) bool {
-	if s.engine == EngineSQLite {
-		return x.i != 0
-	}
-	return x.b
+	return sqlkit.BoolGet(s.engine, x)
 }
 
 // decodeHash builds a chainhash.Hash from a spent_by column's bytes. The four
-// spent_by decode sites share it.
+// spent_by decode sites share it. It stays local to sqlstore: the metastore
+// stores txids as opaque bytes and never joins them against chainhash, so this
+// is not shared dialect plumbing.
 func decodeHash(b []byte) (*chainhash.Hash, error) {
 	h, err := chainhash.NewHash(b)
 	if err != nil {
@@ -489,36 +340,20 @@ func decodeHash(b []byte) (*chainhash.Hash, error) {
 }
 
 // tsScan holds a scanned nullable timestamp in whichever representation the
-// engine uses. Use tsDest to build the Scan target and tsTime to decode.
-type tsScan struct {
-	t sql.NullTime  // postgres
-	i sql.NullInt64 // sqlite
-}
+// engine uses. Use tsDest to build the Scan target and tsTime to decode. It
+// aliases [sqlkit.TsScan].
+type tsScan = sqlkit.TsScan
 
 func (s *Store) tsDest(x *tsScan) any {
-	if s.engine == EngineSQLite {
-		return &x.i
-	}
-	return &x.t
+	return sqlkit.TsDest(s.engine, x)
 }
 
 func (s *Store) tsTime(x tsScan) time.Time {
-	if s.engine == EngineSQLite {
-		if x.i.Valid {
-			return time.UnixMicro(x.i.Int64).UTC()
-		}
-		return time.Time{}
-	}
-	if x.t.Valid {
-		return x.t.Time.UTC()
-	}
-	return time.Time{}
+	return sqlkit.TsGet(s.engine, x)
 }
 
-// rowScanner is satisfied by *sql.Row and *sql.Rows.
-type rowScanner interface {
-	Scan(dest ...any) error
-}
+// rowScanner is satisfied by *sql.Row and *sql.Rows. It aliases [sqlkit.RowScanner].
+type rowScanner = sqlkit.RowScanner
 
 // scanUTXO scans the utxoCols projection into a UTXO plus its seq (used only
 // for deterministic claim ordering).
