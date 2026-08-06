@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint, test, and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # golangci-lint and `go vet` fail on a module with zero packages, so
+      # skip them until the first package lands. `make test` and `go build`
+      # tolerate the empty state and stay unconditional.
+      - name: Check for Go packages
+        id: packages
+        run: echo "has_packages=$(test -n "$(go list ./... 2>/dev/null)" && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Lint
+        if: steps.packages.outputs.has_packages == 'true'
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+      - name: Test
+        run: make test
+
+      - name: Vet
+        if: steps.packages.outputs.has_packages == 'true'
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...

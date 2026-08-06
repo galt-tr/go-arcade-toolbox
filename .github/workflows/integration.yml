@@ -1,0 +1,39 @@
+name: Integration Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - labeled
+      - synchronize
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration tests
+    # Runs on pushes to main, manual dispatch, or on PRs that carry the
+    # "integration" label (add the label to opt a PR into this workflow;
+    # new pushes to an already-labeled PR re-run it via `synchronize`).
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'integration') ||
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify Docker is available
+        run: docker version
+
+      - name: Run integration tests
+        run: make test-integration

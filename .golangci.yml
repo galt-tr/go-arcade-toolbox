@@ -1,0 +1,54 @@
+version: "2"
+
+run:
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - revive
+    - unused
+    - ineffassign
+    - unconvert
+    - misspell
+    - gosec
+  settings:
+    misspell:
+      locale: US
+    gosec:
+      excludes:
+        - G104 # unhandled errors are covered by errcheck
+  exclusions:
+    rules:
+      # Test files commonly use math/rand, hardcoded test data, and ignore
+      # some errors in setup/teardown - relax the noisier linters there.
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+  settings:
+    gofmt:
+      simplify: true
+    gofumpt:
+      extra-rules: false
+
+issues:
+  uniq-by-line: true
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-issued-lines: true
+      print-linter-name: true
+
+severity:
+  default: warning
