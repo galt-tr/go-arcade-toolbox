@@ -1,0 +1,144 @@
+// Package utxostore defines the storage contract for the wallet's UTXO
+// inventory: the [Store] interface, its types, and its error taxonomy. Every
+// storage provider (SQLite, PostgreSQL, Aerospike) implements this interface,
+// and the funder and reconciler are written against it — the contracts below
+// are what make one funder correct on every backend.
+//
+// The in-memory reference implementation lives in the memstore subpackage; the
+// backend-agnostic conformance suite that every provider must pass lives in
+// the utxostoretest subpackage.
+//
+// # Wallet semantics, not node semantics
+//
+// The design is inspired by teranode's stores/utxo (per-item batch errors,
+// typed error taxonomy, a shared conformance suite), but a wallet's UTXO store
+// answers a different question than a node's:
+//
+//   - Ownership: every output belongs to a (userID, basket) pair. All queries
+//     are scoped; no operation ever crosses a user boundary implicitly.
+//   - The hot operation is "claim any suitable coin" — an atomic
+//     reserve-by-predicate (smallest sufficient, largest insufficient, exact
+//     denomination) — not "spend this exact outpoint". A node validates spends
+//     it is given; a wallet selects coins to fund transactions it is building.
+//   - Conflict detection is external: Arcade is the transaction-truth oracle.
+//     The store records what the wallet believes (reserved, spent-by, tier)
+//     and the reconciler corrects that belief from oracle verdicts. The store
+//     itself never adjudicates double-spends.
+//
+// # Deliberately dropped from teranode
+//
+// The following teranode features are intentionally absent:
+//
+//   - Alert-system reassignment (ReAssignUTXO): wallets do not enforce
+//     court-ordered reassignment; coins are frozen/unfrozen explicitly instead.
+//   - Conflicting-children graph (SetConflicting, GetConflictingChildren):
+//     Arcade is the conflict oracle; the wallet has no mempool graph to walk.
+//   - Field masks (fields.FieldName): wallet rows are small and fixed; partial
+//     reads buy nothing and complicate every provider.
+//   - UTXO-hash checksums: teranode hashes (txid, vout, script, satoshis) to
+//     detect corrupted spends from untrusted peers; a wallet is the sole
+//     writer of its own rows.
+//   - Block-height push (SetBlockHeight/SetMedianBlockTime): confirmation
+//     state arrives via the reconciler as explicit [Store.Promote] calls, not
+//     via a store-internal height clock.
+//   - Per-tx pagination records (unmined iterators, per-tx metadata pages):
+//     wallet queries are per-(user, basket), never chain-wide scans.
+//   - ANY TTL- or height-based deletion (DeleteAtHeight, PreserveUntil,
+//     cleanup services): see below.
+//
+// # No TTL deletion — ever
+//
+// A node can delete aggressively because it can rebuild its UTXO set from the
+// chain. A wallet cannot: its UTXO set is the only record of which outputs it
+// controls, and silently expiring a row is indistinguishable from losing
+// funds. Deletion is therefore explicit only — [Store.Remove] (operator
+// intent) and [Store.RemoveByMintTx] (the reconciler reacting to an oracle
+// verdict that the minting transaction is invalid). No implementation may
+// add background expiry.
+//
+// # Tier model
+//
+// A coin's [Tier] tracks how settled its minting transaction is:
+//
+//   - [TierSending] (1): the mint transaction's broadcast is in flight.
+//   - [TierUnproven] (2): the oracle accepted it (SEEN_* status) but the
+//     wallet has not verified a proof.
+//   - [TierMined] (3): a header-verified merkle proof exists.
+//
+// Tiers order risk, and the funder walks them explicitly — one tier per
+// micro-query ([Scope] makes the tier mandatory) — so that every claim is a
+// single index walk on every backend. [Store.Promote] moves coins between
+// tiers in both directions: up as evidence arrives, down on reorg.
+//
+// # Atomicity contracts
+//
+// These five rules are the core of the interface; the conformance suite
+// enforces them and every provider must honor them:
+//
+//  1. Every method is atomic PER ITEM, never across items. Batch methods may
+//     partially succeed; they report failures per item (via the op's Err
+//     field where one exists, otherwise via typed errors joined into the
+//     returned error) plus the [ErrBatch] sentinel at the top level.
+//  2. Claim methods are single-round-trip atomic transitions. No interface
+//     method ever requires the caller to hold a lock across calls — this is
+//     what makes one funder correct on both SQL and Aerospike.
+//  3. Guards are exact-match state preconditions carried in the op (a spend
+//     carries its reservation; an unspend carries its spending txid). A failed
+//     guard is per-item data, not corruption.
+//  4. Idempotency table — every operation a crash-recovery outbox replays is
+//     idempotent by construction:
+//     Mint: same data again = no-op success.
+//     Spend: same spender again = success.
+//     Unspend: guard mismatch = skip.
+//     Release: already free = skip.
+//     Remove: missing = no-op.
+//     Promote: already at the target tier = counts as unchanged.
+//  5. Frozen rows are invisible to claims and refuse Spend ([FrozenError]),
+//     but Release, Unspend, and Promote still apply to them. Precedence: an
+//     already-recorded spend wins over the freeze — a same-spender Spend
+//     replay on a since-frozen row is an idempotent success, and a competing
+//     spender gets [SpentError], not [FrozenError].
+//
+// # Design notes
+//
+// Decisions the interface commits to where the contract left latitude:
+//
+//   - ReleaseOutpoints guard mismatch is a per-item SKIP, not an error,
+//     consistent with the idempotency table: releasing something you no
+//     longer hold is a stale intent, and replays must be harmless.
+//   - Spend keeps ReservedBy on the row after the transition. The reservation
+//     is provenance (which funding run spent the coin) and drives the
+//     AlreadyReserved/AlreadySpentBy classification in [RemoveByMintReport].
+//     Unspend clears both SpentBy and the reservation: the coin returns to
+//     the claimable pool.
+//   - [ReservedError] is the general reservation-guard failure: HeldBy names
+//     the current holder, and HeldBy == "" means the row is not reserved at
+//     all (e.g. Spend of an unreserved row).
+//   - Mint idempotency compares the immutable coin identity only (UserID,
+//     Basket, Satoshis, InputSize). Tier is a starting state, not identity: a
+//     replayed mint whose row has since been promoted, reserved, or spent is
+//     still a no-op success. A mismatch in identity is [AlreadyExistsError].
+//   - Remove refuses frozen rows without force, like reserved/spent ones: a
+//     freeze is an explicit hold and silent deletion would defeat it.
+//     RemoveByMintTx, by contrast, removes frozen-but-unreserved rows: if the
+//     minting transaction is invalid the coin is phantom, and a frozen
+//     phantom is strictly worse than no row.
+//   - Batch methods whose ops are plain []Outpoint (Remove, Freeze, Unfreeze)
+//     have no per-item Err slot; they report failures as typed per-item
+//     errors joined into the returned error together with [ErrBatch]
+//     (errors.Is finds ErrBatch, errors.As finds the item errors).
+//   - Balance buckets: a row is Claimable (per tier) when unspent, unreserved
+//     and not frozen; Reserved when reserved and unspent (frozen or not).
+//     Frozen unreserved rows appear in neither bucket — a freeze removes
+//     value from the spendable balance by design.
+//   - FindStaleReservations dates a reservation by its OLDEST row (the
+//     funder may claim several times under one token) and should return
+//     oldest-first; approximate backends may relax the ordering (the
+//     conformance suite gates the ordering assertion behind the
+//     exact-selection option).
+//   - Claim inputs are validated: reservation must be non-empty and the
+//     [Scope] fully specified (UserID > 0, Basket != "", valid Tier). An
+//     empty reservation would make reserved rows indistinguishable from free
+//     ones, so it is rejected as a programmer error (plain error, not part
+//     of the state-outcome taxonomy).
+package utxostore
