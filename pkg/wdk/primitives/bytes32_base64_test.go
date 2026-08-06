@@ -3,10 +3,12 @@ package primitives_test
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
@@ -106,4 +108,40 @@ func TestEncodeBytes32Base64_AllZerosEncodesFullArray(t *testing.T) {
 	got := primitives.EncodeBytes32Base64(zeros)
 	require.Equal(t, base64.StdEncoding.EncodeToString(zeros[:]), got)
 	require.NotEmpty(t, got)
+}
+
+func TestWalletCertificate_ToSDKCertificate_AcceptsShortTypeAndSerial(t *testing.T) {
+	t.Parallel()
+
+	// Storage layer may hold TS-ecosystem short base64 (fixtures use short forms too).
+	shortSerial := "c2VyaWFsMTIz" // "serial123"
+	cert := wdk.WalletCertificate{
+		Type:               primitives.Base64String(commonSourceIdentityB64),
+		SerialNumber:       primitives.Base64String(shortSerial),
+		Subject:            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		Certifier:          "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+		RevocationOutpoint: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890.0",
+		// 64-byte signature as 128 hex chars
+		Signature: primitives.HexString(
+			"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" +
+				"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		),
+	}
+
+	sdkCert, err := cert.ToSDKCertificate()
+	require.NoError(t, err)
+	require.Equal(t, commonSourceIdentityB64, primitives.EncodeBytes32Base64([32]byte(sdkCert.Type)))
+	require.Equal(t, shortSerial, primitives.EncodeBytes32Base64([32]byte(sdkCert.SerialNumber)))
+}
+
+func TestListCertificatesArgs_JSON_AcceptsShortTypesAsBase64String(t *testing.T) {
+	t.Parallel()
+
+	// wdk storage args use opaque Base64String (not Bytes32Base64), so short types must work.
+	raw := []byte(`{"certifiers":[],"types":["Q29tbW9uU291cmNlIGlkZW50aXR5"],"limit":100}`)
+	var args wdk.ListCertificatesArgs
+	require.NoError(t, json.Unmarshal(raw, &args))
+	require.Len(t, args.Types, 1)
+	require.Equal(t, primitives.Base64String(commonSourceIdentityB64), args.Types[0])
+	require.NoError(t, args.Types[0].Validate())
 }
