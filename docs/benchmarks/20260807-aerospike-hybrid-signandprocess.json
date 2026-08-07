@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-07T03:57:09.257190561-04:00",
+  "label": "Aerospike + Postgres hybrid Mode B (split stores) — bounded perf run",
+  "backend": "aerospike-hybrid",
+  "mode": "signandprocess",
+  "environment": {
+    "hostname": "fedora",
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "7.1.5-100.fc43.x86_64",
+    "cpuModel": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "logicalCores": 32,
+    "ramBytes": 67164336128,
+    "goVersion": "go1.26.3",
+    "podmanVersion": "podman version 5.8.4"
+  },
+  "config": {
+    "workers": 64,
+    "targetTps": 0,
+    "durationSec": 60,
+    "warmupSec": 15,
+    "poolSize": 4000,
+    "denomination": 1000000,
+    "paymentSats": 1000,
+    "maxDbConns": 72,
+    "network": "test"
+  },
+  "throughput": {
+    "sustainedTps": 153.583,
+    "totalOps": 9215,
+    "windowSeconds": 60,
+    "targetTps": 1000,
+    "pctOfTarget": 15.358,
+    "bucketWidthSec": 10,
+    "buckets": [
+      {
+        "startSec": 0,
+        "tps": 179.8
+      },
+      {
+        "startSec": 10,
+        "tps": 180.5
+      },
+      {
+        "startSec": 20,
+        "tps": 177.2
+      },
+      {
+        "startSec": 30,
+        "tps": 150.9
+      },
+      {
+        "startSec": 40,
+        "tps": 112.9
+      },
+      {
+        "startSec": 50,
+        "tps": 120.2
+      },
+      {
+        "startSec": 60,
+        "tps": 0
+      }
+    ]
+  },
+  "phases": {
+    "e2e": {
+      "count": 9215,
+      "minMs": 115.101,
+      "p50Ms": 388.149,
+      "p95Ms": 631.443,
+      "p99Ms": 800.38,
+      "maxMs": 1115.472,
+      "meanMs": 416.593
+    }
+  },
+  "contention": {
+    "attempted": 11741,
+    "succeeded": 11677,
+    "contentionRetries": 0,
+    "deadlockRetries": 0,
+    "contentionFails": 0,
+    "deadlockFails": 0,
+    "otherErrors": 64
+  },
+  "monitor": {
+    "enabled": true,
+    "mining": true,
+    "minedEmitted": 11677,
+    "actionsTotal": 11695,
+    "actionsCompleted": 10000,
+    "maturationPct": 100
+  },
+  "poolDepth": [
+    {
+      "atSec": 9.416,
+      "balanceSats": 3996503089
+    },
+    {
+      "atSec": 18.79,
+      "balanceSats": 3987800340
+    },
+    {
+      "atSec": 28.173,
+      "balanceSats": 3986064983
+    },
+    {
+      "atSec": 37.557,
+      "balanceSats": 3980336759
+    },
+    {
+      "atSec": 46.926,
+      "balanceSats": 3980718587
+    },
+    {
+      "atSec": 56.306,
+      "balanceSats": 3986270588
+    },
+    {
+      "atSec": 65.753,
+      "balanceSats": 3986266873
+    },
+    {
+      "atSec": 75.063,
+      "balanceSats": 3977180619
+    }
+  ],
+  "notes": [
+    "TIERED PATH ONLY: these numbers measure the bounded tiered (privacy) funding path. Plain wallet.CreateAction always funds from the change basket with Denomination=0; the denominated fuel-pool ClaimExact fast path that the 1000-TPS design targets is NOT YET wired to CreateAction (tracked as a follow-up) and is expected to be substantially higher. Do not read this sustained TPS as the design ceiling — the Aerospike hybrid here already shows 0 claim contention.",
+    "Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
+    "Recycling is implicit: each payment's change re-enters the change basket ('default') and is re-selected by subsequent claims (mined-first, then unproven). This exercises real claim contention.",
+    "Contention counts are HIGH-VARIANCE run to run (SKIP-LOCKED collisions depend on scheduling); observed anywhere from ~0 to tens of thousands of retries at near-identical config. Do not over-read a single run's contention figure.",
+    "otherErrors is the residual bucket: write-path errors not matched as contention (contention/conflict/not-enough-funds/insufficient) or deadlock (deadlock/serialization/40001/40P01) — e.g. transient BEEF-assembly or reference/timeout errors, including ops interrupted at shutdown. Typically \u003c0.5% of ops here and not individually root-caused.",
+    "The monitor daemon runs the real SSE apply pipeline; the auto-miner emits status-SSE MINED frames (with proof headers) so change matures unproven-\u003emined through the async loop under load (best-effort: frames may drop when the pipeline is behind). The auto-miner does NOT advance the chaintracks tip stream.",
+    "Single-call mode: one CreateAction does create+sign+process+broadcast; only the end-to-end phase is timed (fewest round trips). Fewer round trips is only plausibly ~2x on the SQL/hybrid backends; on write-serialized SQLite it can be marginally slower."
+  ]
+}

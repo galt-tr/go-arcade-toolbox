@@ -52,7 +52,6 @@ func (h wireHeader) MarshalJSON() ([]byte, error) {
 // root. It implements GET /height, /header/height/{n}, /tip and the SSE
 // /tip/stream and /reorg/stream. Safe for concurrent use.
 type ChainTracks struct {
-	tb     testing.TB
 	server *httptest.Server
 
 	mu      sync.Mutex
@@ -67,8 +66,23 @@ type ChainTracks struct {
 // NewChainTracks starts a mock ChainTracks server and registers cleanup on tb.
 func NewChainTracks(tb testing.TB) *ChainTracks {
 	tb.Helper()
+	c := newChainTracks()
+	tb.Cleanup(c.server.Close)
+	return c
+}
+
+// NewChainTracksServer starts a mock ChainTracks server without a [testing.TB],
+// for use from non-test binaries (notably cmd/perfrunner). The caller MUST
+// invoke the returned close function to shut the server down.
+func NewChainTracksServer() (*ChainTracks, func()) {
+	c := newChainTracks()
+	return c, c.server.Close
+}
+
+// newChainTracks builds and starts the mock ChainTracks server. Shared by the
+// test and non-test constructors.
+func newChainTracks() *ChainTracks {
 	c := &ChainTracks{
-		tb:       tb,
 		headers:  make(map[uint32]wireHeader),
 		tipSubs:  make(map[chan sseFrame]struct{}),
 		reorgSub: make(map[chan sseFrame]struct{}),
@@ -80,7 +94,6 @@ func NewChainTracks(tb testing.TB) *ChainTracks {
 	mux.HandleFunc("GET /tip/stream", c.handleTipStream)
 	mux.HandleFunc("GET /reorg/stream", c.handleReorgStream)
 	c.server = httptest.NewServer(mux)
-	tb.Cleanup(c.server.Close)
 	return c
 }
 

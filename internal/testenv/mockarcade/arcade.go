@@ -35,7 +35,6 @@ type Broadcast struct {
 // four routes pkg/arcade.Client hits: POST /tx, GET /tx/{txid}, GET /health,
 // and the SSE GET /events. It is safe for concurrent use.
 type Arcade struct {
-	tb     testing.TB
 	server *httptest.Server
 
 	mu          sync.Mutex
@@ -62,8 +61,23 @@ type sseFrame struct {
 // NewArcade starts a mock Arcade server and registers cleanup on tb.
 func NewArcade(tb testing.TB) *Arcade {
 	tb.Helper()
+	a := newArcade()
+	tb.Cleanup(a.server.Close)
+	return a
+}
+
+// NewArcadeServer starts a mock Arcade server without a [testing.TB], for use
+// from non-test binaries (notably cmd/perfrunner). The caller MUST invoke the
+// returned close function to shut the server down.
+func NewArcadeServer() (*Arcade, func()) {
+	a := newArcade()
+	return a, a.server.Close
+}
+
+// newArcade builds and starts the mock Arcade server. Shared by the test and
+// non-test constructors.
+func newArcade() *Arcade {
 	a := &Arcade{
-		tb:          tb,
 		records:     make(map[string]map[string]any),
 		earlyStatus: "SEEN_ON_NETWORK",
 		echoTxID:    "",
@@ -75,7 +89,6 @@ func NewArcade(tb testing.TB) *Arcade {
 	mux.HandleFunc("GET /health", a.handleHealth)
 	mux.HandleFunc("GET /events", a.handleEvents)
 	a.server = httptest.NewServer(mux)
-	tb.Cleanup(a.server.Close)
 	return a
 }
 

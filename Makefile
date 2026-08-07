@@ -42,9 +42,18 @@ bench:
 		go test -bench . -benchmem -run '^$$' ./...; \
 	fi
 
-# Placeholder for the future cmd/perfrunner-based report generator.
+# Run a benchmark via cmd/perfrunner and render its Markdown report into
+# docs/benchmarks/. SQLite is self-contained; for postgres/aerospike-hybrid pass
+# connection flags via PERF_ARGS. Override any knob on the command line, e.g.:
+#   make perf-report PERF_BACKEND=postgres PERF_DURATION=5m \
+#     PERF_ARGS='-pg-dsn postgres://user:pass@localhost:5432/db -max-db-conns 72'
+PERF_BACKEND ?= sqlite
+PERF_WORKERS ?= 32
+PERF_DURATION ?= 60s
+PERF_WARMUP ?= 15s
 perf-report:
-	@echo "perf-report: not yet implemented (will invoke cmd/perfrunner)"
+	go run ./cmd/perfrunner -backend $(PERF_BACKEND) -workers $(PERF_WORKERS) \
+		-duration $(PERF_DURATION) -warmup $(PERF_WARMUP) $(PERF_ARGS)
 
 # Run golangci-lint if available, otherwise print install instructions.
 # Guarded: golangci-lint errors on a module with zero go files, which is the

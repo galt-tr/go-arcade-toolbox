@@ -37,3 +37,6 @@ coverage.out
 
 # OSX
 .DS_Store
+
+# built cmd binaries
+/perfrunner

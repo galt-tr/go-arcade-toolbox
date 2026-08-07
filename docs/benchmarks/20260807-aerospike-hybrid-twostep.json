@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-07T03:55:50.727714973-04:00",
+  "label": "Aerospike + Postgres hybrid Mode B (split stores) — bounded perf run",
+  "backend": "aerospike-hybrid",
+  "mode": "twostep",
+  "environment": {
+    "hostname": "fedora",
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "7.1.5-100.fc43.x86_64",
+    "cpuModel": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "logicalCores": 32,
+    "ramBytes": 67164336128,
+    "goVersion": "go1.26.3",
+    "podmanVersion": "podman version 5.8.4"
+  },
+  "config": {
+    "workers": 64,
+    "targetTps": 0,
+    "durationSec": 60,
+    "warmupSec": 15,
+    "poolSize": 4000,
+    "denomination": 1000000,
+    "paymentSats": 1000,
+    "maxDbConns": 72,
+    "network": "test"
+  },
+  "throughput": {
+    "sustainedTps": 152.717,
+    "totalOps": 9163,
+    "windowSeconds": 60,
+    "targetTps": 1000,
+    "pctOfTarget": 15.272,
+    "bucketWidthSec": 10,
+    "buckets": [
+      {
+        "startSec": 0,
+        "tps": 178.9
+      },
+      {
+        "startSec": 10,
+        "tps": 179.2
+      },
+      {
+        "startSec": 20,
+        "tps": 146.6
+      },
+      {
+        "startSec": 30,
+        "tps": 153
+      },
+      {
+        "startSec": 40,
+        "tps": 130.2
+      },
+      {
+        "startSec": 50,
+        "tps": 128.4
+      },
+      {
+        "startSec": 60,
+        "tps": 0
+      }
+    ]
+  },
+  "phases": {
+    "create": {
+      "count": 9163,
+      "minMs": 60.132,
+      "p50Ms": 319.031,
+      "p95Ms": 548.031,
+      "p99Ms": 712.793,
+      "maxMs": 1078.769,
+      "meanMs": 349.824
+    },
+    "e2e": {
+      "count": 9163,
+      "minMs": 126.768,
+      "p50Ms": 377.905,
+      "p95Ms": 620.848,
+      "p99Ms": 779.982,
+      "maxMs": 2195.64,
+      "meanMs": 417.949
+    },
+    "sign_process": {
+      "count": 9163,
+      "minMs": 35.069,
+      "p50Ms": 54.002,
+      "p95Ms": 96.823,
+      "p99Ms": 281.724,
+      "maxMs": 1399.48,
+      "meanMs": 68.124
+    }
+  },
+  "contention": {
+    "attempted": 11728,
+    "succeeded": 11664,
+    "contentionRetries": 0,
+    "deadlockRetries": 0,
+    "contentionFails": 0,
+    "deadlockFails": 0,
+    "otherErrors": 64
+  },
+  "monitor": {
+    "enabled": true,
+    "mining": true,
+    "minedEmitted": 11664,
+    "actionsTotal": 11682,
+    "actionsCompleted": 9986,
+    "maturationPct": 99.86
+  },
+  "poolDepth": [
+    {
+      "atSec": 9.42,
+      "balanceSats": 3987487804
+    },
+    {
+      "atSec": 18.787,
+      "balanceSats": 3990726972
+    },
+    {
+      "atSec": 28.159,
+      "balanceSats": 3989017090
+    },
+    {
+      "atSec": 37.545,
+      "balanceSats": 3990282752
+    },
+    {
+      "atSec": 46.911,
+      "balanceSats": 3982031420
+    },
+    {
+      "atSec": 56.323,
+      "balanceSats": 3984583421
+    },
+    {
+      "atSec": 65.701,
+      "balanceSats": 3984325975
+    }
+  ],
+  "notes": [
+    "TIERED PATH ONLY: these numbers measure the bounded tiered (privacy) funding path. Plain wallet.CreateAction always funds from the change basket with Denomination=0; the denominated fuel-pool ClaimExact fast path that the 1000-TPS design targets is NOT YET wired to CreateAction (tracked as a follow-up) and is expected to be substantially higher. Do not read this sustained TPS as the design ceiling — the Aerospike hybrid here already shows 0 claim contention.",
+    "Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
+    "Recycling is implicit: each payment's change re-enters the change basket ('default') and is re-selected by subsequent claims (mined-first, then unproven). This exercises real claim contention.",
+    "Contention counts are HIGH-VARIANCE run to run (SKIP-LOCKED collisions depend on scheduling); observed anywhere from ~0 to tens of thousands of retries at near-identical config. Do not over-read a single run's contention figure.",
+    "otherErrors is the residual bucket: write-path errors not matched as contention (contention/conflict/not-enough-funds/insufficient) or deadlock (deadlock/serialization/40001/40P01) — e.g. transient BEEF-assembly or reference/timeout errors, including ops interrupted at shutdown. Typically \u003c0.5% of ops here and not individually root-caused.",
+    "The monitor daemon runs the real SSE apply pipeline; the auto-miner emits status-SSE MINED frames (with proof headers) so change matures unproven-\u003emined through the async loop under load (best-effort: frames may drop when the pipeline is behind). The auto-miner does NOT advance the chaintracks tip stream.",
+    "Two-step mode: 'create' = CreateAction (fund+reserve+persist); 'sign_process' = SignAction (sign+broadcast+commit). Finer broadcast/commit split is not separable at the wallet API boundary."
+  ]
+}
