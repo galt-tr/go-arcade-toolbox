@@ -283,7 +283,21 @@ func (p *Provider) commitAccepted(ctx context.Context, userID int, txid string, 
 
 	txRow := p.firstTxByTxID(ctx, userID, txid)
 
-	err := p.meta.Do(ctx, func(ctx context.Context) error {
+	if err := p.applyAcceptedBroadcast(ctx, userID, txid, tx, txRow); err != nil {
+		return swr, nil, err
+	}
+	return swr, rar, nil
+}
+
+// applyAcceptedBroadcast commits the wallet-state transition for a
+// broadcast-accepted transaction, atomically: transaction rows → unproven,
+// known tx → unconfirmed, reserved inputs → spent, change coins → TierUnproven,
+// and the local input spend-history recorded. It is shared by the synchronous
+// broadcast path ([Provider.commitAccepted]) and the monitor's SendWaiting
+// sweep. txRow (the transaction row carrying userID/reference/transaction-id)
+// may be nil, in which case only the status transitions are applied.
+func (p *Provider) applyAcceptedBroadcast(ctx context.Context, userID int, txid string, tx *transaction.Transaction, txRow *wdk.TableTransaction) error {
+	return p.meta.Do(ctx, func(ctx context.Context) error {
 		if err := p.meta.Transactions().UpdateStatusByTxID(ctx, txid, wdk.TxStatusUnproven,
 			wdk.TxStatusSending, wdk.TxStatusNoSend, wdk.TxStatusUnproven, wdk.TxStatusUnprocessed); err != nil &&
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) {
@@ -308,10 +322,6 @@ func (p *Provider) commitAccepted(ctx context.Context, userID int, txid string, 
 		}
 		return nil
 	})
-	if err != nil {
-		return swr, nil, err
-	}
-	return swr, rar, nil
 }
 
 // commitRejected commits a final 4xx rejection: mark the tx failed and the

@@ -57,6 +57,23 @@ func (p *Provider) AbortAction(ctx context.Context, auth wdk.AuthID, args wdk.Ab
 		return nil, fmt.Errorf("storage: transaction %q has status %q: %w", reference, txRow.Status, wdk.ErrNotAbortableAction)
 	}
 
+	if err := p.abortTxRow(ctx, userID, txRow); err != nil {
+		if errors.Is(err, wdk.ErrNotAbortableAction) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("storage: abort action: %w", err)
+	}
+	return &wdk.AbortActionResult{Aborted: true}, nil
+}
+
+// abortTxRow is the transactional core of aborting a pre-broadcast
+// transaction, shared by [Provider.AbortAction] (user-initiated) and the
+// monitor's AbortAbandoned sweep. It CAS-transitions the row to aborted (from
+// an abortable status), releases the funding reservation, removes any minted
+// change, and restores the spend-history flag on its inputs — all atomically.
+// It returns [wdk.ErrNotAbortableAction] when the CAS finds the row already
+// past an abortable status (a concurrent transition won).
+func (p *Provider) abortTxRow(ctx context.Context, userID int, txRow *wdk.TableTransaction) error {
 	// Compute the change outpoints (to remove) before the write, using the
 	// reservation token stored on the row.
 	var txid string
@@ -64,7 +81,7 @@ func (p *Provider) AbortAction(ctx context.Context, auth wdk.AuthID, args wdk.Ab
 		txid = *txRow.TxID
 	}
 
-	err = p.meta.Do(ctx, func(ctx context.Context) error {
+	return p.meta.Do(ctx, func(ctx context.Context) error {
 		// CAS the status first so a concurrent transition wins and rolls back.
 		if err := p.meta.Transactions().UpdateStatus(ctx, txRow.TransactionID, wdk.TxStatusAborted,
 			wdk.TxStatusUnsigned, wdk.TxStatusNoSend, wdk.TxStatusUnprocessed, wdk.TxStatusNonFinal); err != nil {
@@ -99,11 +116,4 @@ func (p *Provider) AbortAction(ctx context.Context, auth wdk.AuthID, args wdk.Ab
 		}
 		return nil
 	})
-	if err != nil {
-		if errors.Is(err, wdk.ErrNotAbortableAction) {
-			return nil, err
-		}
-		return nil, fmt.Errorf("storage: abort action: %w", err)
-	}
-	return &wdk.AbortActionResult{Aborted: true}, nil
 }

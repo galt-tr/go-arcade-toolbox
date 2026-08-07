@@ -43,6 +43,7 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/memstore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
@@ -66,6 +67,14 @@ type e2eStack struct {
 	arc          *mockarcade.Arcade
 	ct           *mockarcade.ChainTracks
 	recipientHex string
+
+	// Exposed for the M4 monitor SSE-MINED e2e (monitor_e2e_test.go): the real
+	// arcade oracle + chaintracks subscriber to drive a monitor.Daemon, and the
+	// underlying stores for direct proof/tier assertions.
+	oracle   arcade.TxOracle
+	chainSub headers.ChainSubscriber
+	meta     *metastore.Store
+	utxo     utxostore.Store
 }
 
 func newE2EStack(t *testing.T) *e2eStack {
@@ -106,7 +115,11 @@ func newE2EStack(t *testing.T) *e2eStack {
 	pub, err := w.GetPublicKey(ctx, sdk.GetPublicKeyArgs{IdentityKey: true}, e2eOriginator)
 	require.NoError(t, err)
 
-	return &e2eStack{t: t, wallet: w, provider: provider, arc: arc, ct: ct, recipientHex: pub.PublicKey.ToDERHex()}
+	return &e2eStack{
+		t: t, wallet: w, provider: provider, arc: arc, ct: ct,
+		recipientHex: pub.PublicKey.ToDERHex(),
+		oracle:       oracle, chainSub: hdrs, meta: meta, utxo: utxo,
+	}
 }
 
 // buildMinedWalletPaymentBEEF builds a single-transaction, single-leaf-proven
