@@ -61,6 +61,7 @@ func runBench(argv []string) error {
 		denom      = fs.Uint64("denomination", 1_000_000, "satoshis per pre-minted coin")
 		payment    = fs.Uint64("payment", 1000, "satoshis of the payment output per op")
 		mode       = fs.String("mode", "twostep", "op mode: twostep|signandprocess")
+		throughput = fs.Bool("throughput", false, "throughput mode: fund via the denominated fuel-pool ClaimExact fast path (Strategy=throughput) instead of the tiered privacy claim")
 		maxDBConns = fs.Int("max-db-conns", 0, "cap the shared SQL connection pool (0=driver default)")
 		noMonitor  = fs.Bool("no-monitor", false, "disable the monitor daemon")
 		noMine     = fs.Bool("no-mine", false, "disable the auto-miner (SSE MINED maturation)")
@@ -95,6 +96,7 @@ func runBench(argv []string) error {
 	cfg.Denomination = *denom
 	cfg.PaymentSats = *payment
 	cfg.Mode = perf.Mode(*mode)
+	cfg.Throughput = *throughput
 	cfg.MaxDBConns = *maxDBConns
 	cfg.RunMonitor = !*noMonitor
 	cfg.Mine = !*noMine && cfg.RunMonitor
@@ -139,17 +141,22 @@ func runBench(argv []string) error {
 		return err
 	}
 
-	jsonName := perf.DefaultResultFilename(string(be), string(cfg.Mode), start)
+	suffix := ""
+	if cfg.Throughput {
+		suffix = "-throughput"
+	}
+
+	jsonName := perf.DefaultResultFilename(string(be), string(cfg.Mode)+suffix, start)
 	jsonPath := filepath.Join(*outDir, jsonName)
 	if err := perf.WriteJSON(result, jsonPath); err != nil {
 		return err
 	}
-	fmt.Printf("perfrunner: sustained %.1f TPS (%.1f%% of %.0f target)\n",
-		result.Throughput.SustainedTPS, result.Throughput.PctOfTarget, perf.TargetTPS)
+	fmt.Printf("perfrunner: [%s] sustained %.1f TPS (%.1f%% of %.0f target)\n",
+		result.Config.FundingPath, result.Throughput.SustainedTPS, result.Throughput.PctOfTarget, perf.TargetTPS)
 	fmt.Printf("perfrunner: wrote %s\n", jsonPath)
 
 	if *renderMD {
-		mdName := fmt.Sprintf("%s-%s.md", start.Format("20060102"), be)
+		mdName := fmt.Sprintf("%s-%s-%s%s.md", start.Format("20060102"), be, cfg.Mode, suffix)
 		mdPath := filepath.Join(*mdDir, mdName)
 		if err := writeMarkdown(result, mdPath); err != nil {
 			return err

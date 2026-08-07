@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-07T04:38:23.496467689-04:00",
+  "label": "Aerospike + Postgres hybrid Mode B (split stores) — bounded perf run",
+  "backend": "aerospike-hybrid",
+  "mode": "twostep",
+  "environment": {
+    "hostname": "fedora",
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "7.1.5-100.fc43.x86_64",
+    "cpuModel": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "logicalCores": 32,
+    "ramBytes": 67164336128,
+    "goVersion": "go1.26.3",
+    "podmanVersion": "podman version 5.8.4"
+  },
+  "config": {
+    "workers": 64,
+    "targetTps": 0,
+    "durationSec": 60,
+    "warmupSec": 5,
+    "poolSize": 36000,
+    "denomination": 1000000,
+    "paymentSats": 1000,
+    "maxDbConns": 72,
+    "network": "test",
+    "fundingPath": "throughput (ClaimExact fuel pool)"
+  },
+  "throughput": {
+    "sustainedTps": 200.55,
+    "totalOps": 12033,
+    "windowSeconds": 60,
+    "targetTps": 1000,
+    "pctOfTarget": 20.055,
+    "bucketWidthSec": 10,
+    "buckets": [
+      {
+        "startSec": 0,
+        "tps": 64.1
+      },
+      {
+        "startSec": 10,
+        "tps": 62.9
+      },
+      {
+        "startSec": 20,
+        "tps": 62.1
+      },
+      {
+        "startSec": 30,
+        "tps": 211.2
+      },
+      {
+        "startSec": 40,
+        "tps": 426.4
+      },
+      {
+        "startSec": 50,
+        "tps": 376.6
+      },
+      {
+        "startSec": 60,
+        "tps": 0
+      }
+    ]
+  },
+  "phases": {
+    "create": {
+      "count": 12033,
+      "minMs": 21.933,
+      "p50Ms": 81.253,
+      "p95Ms": 1048.81,
+      "p99Ms": 1808.663,
+      "maxMs": 5440.671,
+      "meanMs": 238.305
+    },
+    "e2e": {
+      "count": 12033,
+      "minMs": 64.67,
+      "p50Ms": 157.29,
+      "p95Ms": 1164.094,
+      "p99Ms": 1988.262,
+      "maxMs": 5570.133,
+      "meanMs": 322.25
+    },
+    "sign_process": {
+      "count": 12033,
+      "minMs": 31.428,
+      "p50Ms": 66.571,
+      "p95Ms": 150.468,
+      "p99Ms": 401.475,
+      "maxMs": 1285.975,
+      "meanMs": 83.946
+    }
+  },
+  "contention": {
+    "attempted": 12397,
+    "succeeded": 12333,
+    "contentionRetries": 0,
+    "deadlockRetries": 0,
+    "contentionFails": 0,
+    "deadlockFails": 0,
+    "otherErrors": 64
+  },
+  "monitor": {
+    "enabled": true,
+    "mining": true,
+    "minedEmitted": 12333,
+    "actionsTotal": 12427,
+    "actionsCompleted": 4966,
+    "maturationPct": 49.66
+  },
+  "poolDepth": [
+    {
+      "atSec": 8.193,
+      "balanceSats": 35998471139
+    },
+    {
+      "atSec": 16.331,
+      "balanceSats": 35996956544
+    },
+    {
+      "atSec": 24.456,
+      "balanceSats": 35996435835
+    },
+    {
+      "atSec": 32.586,
+      "balanceSats": 35996925316
+    },
+    {
+      "atSec": 40.694,
+      "balanceSats": 35933266023
+    },
+    {
+      "atSec": 48.848,
+      "balanceSats": 35990951216
+    },
+    {
+      "atSec": 56.938,
+      "balanceSats": 35959433628
+    }
+  ],
+  "notes": [
+    "FUEL-POOL PATH: the provider runs with UTXOManagement.Strategy=throughput, so each worker's wallet.CreateAction funds via the funder's closed-form ClaimExact fast path (FundArgs.Denomination\u003e0) over a denominated pool — no tiered SKIP-LOCKED best-fit scan. This is the 1000-TPS design's funding route (Task 27 wiring).",
+    "POOL BASKET = 'default' (a measurement choice, not the production layout): the pool must hold wallet-SIGNABLE coins so every op can sign+broadcast through the real wallet, and the only public API that mints BRC-29-signable coins (InternalizeAction wallet-payment) books them into the default basket. ClaimExact selects strictly by (basket, tier, satoshis==denomination), so the non-denominated change that also lands in 'default' is invisible to the fast path. A dedicated 'fuel' basket would need shaped-change minting (FanOutFuel/FuelShape) which storage does not yet implement — see the benchmark README gap analysis.",
+    "NO RECYCLING: unlike the tiered path, each op's change is NOT re-claimed (it is not denomination-sized), so the pool strictly drains ~1 coin per op. The pool is sized to outlast warmup+duration; if ClaimExact ever underflowed it would fall back to the tiered walk over 'default' (visible as a contention/not-enough-funds spike). A clean run shows ~0 contention and ~0 not-enough-funds.",
+    "Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
+    "otherErrors is the residual bucket: write-path errors not matched as contention or deadlock — e.g. transient BEEF-assembly or reference/timeout errors, including the one in-flight op per worker interrupted at shutdown. Typically \u003c0.5% of ops and not individually root-caused.",
+    "The monitor daemon runs the real SSE apply pipeline; the auto-miner emits status-SSE MINED frames (with proof headers) so change matures unproven-\u003emined through the async loop under load (best-effort: frames may drop when the pipeline is behind). The auto-miner does NOT advance the chaintracks tip stream.",
+    "Two-step mode: 'create' = CreateAction (fund+reserve+persist); 'sign_process' = SignAction (sign+broadcast+commit). Finer broadcast/commit split is not separable at the wallet API boundary."
+  ]
+}

@@ -112,9 +112,19 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		return nil, err
 	}
 
+	// Resolve the funding source. Under the throughput strategy the action funds
+	// from the denominated fuel pool via the funder's closed-form ClaimExact fast
+	// path (Denomination > 0, Basket = the pool); otherwise it takes the default
+	// bounded tiered claim from the change basket (Denomination stays 0). Change
+	// computation, tiers, and existingBasketCount are unchanged on both paths.
+	fundBasket, denomination, err := p.fundingSource()
+	if err != nil {
+		return nil, err
+	}
+
 	fundArgs := funder.FundArgs{
 		UserID:                  int64(userID),
-		Basket:                  p.changeBasketName(),
+		Basket:                  fundBasket,
 		Reservation:             reference,
 		TargetSat:               targetSat,
 		CurrentTxSize:           currentTxSize,
@@ -124,6 +134,7 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		MinimumDesiredUTXOValue: p.changeBasket.MinimumDesiredUTXOValue,
 		MaxChangeOutputsPerTx:   p.maxChangeOutputsPerTx(),
 		ExistingBasketCount:     existingCount,
+		Denomination:            denomination,
 	}
 
 	var result *wdk.StorageCreateActionResult
@@ -362,6 +373,30 @@ func distributeChange(total satoshi.Value, count uint64) []uint64 {
 	}
 	out[count-1] += rem
 	return out
+}
+
+// fundingSource resolves which basket a create-action funds from and, under the
+// throughput strategy, the fuel denomination that enables the funder's
+// closed-form ClaimExact fast path.
+//
+// Throughput ON: fund from Throughput.PoolBasket with the resolved denomination
+// (> 0). The funder claims denomination coins from the pool in a single
+// ClaimExact and, on a short pool, tops up via the bounded walk over the SAME
+// pool basket — a non-pool payment is never routed to some other basket. A
+// truly empty pool surfaces as ErrNotEnoughFunds, which is the correct
+// throughput-mode outcome (deposits fund the pool, not ad-hoc change).
+//
+// Throughput OFF: fund from the change basket ("default") with denomination 0,
+// i.e. the unchanged bounded tiered (privacy) claim.
+func (p *Provider) fundingSource() (basket string, denomination uint64, err error) {
+	if !p.utxoMgmt.Enabled() {
+		return p.changeBasketName(), 0, nil
+	}
+	denomination, err = p.utxoMgmt.Throughput.Denomination(p.feeModel, p.commission)
+	if err != nil {
+		return "", 0, fmt.Errorf("storage: resolve fuel denomination: %w", err)
+	}
+	return p.utxoMgmt.Throughput.PoolBasket, denomination, nil
 }
 
 // spendTiers resolves the status-tier walk for funding.

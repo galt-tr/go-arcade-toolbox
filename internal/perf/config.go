@@ -32,11 +32,25 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/perfprovider"
 )
 
 // TargetTPS is the headline throughput target the report compares against.
 const TargetTPS = 1000.0
+
+// throughputPoolBasket is the basket the throughput-mode harness funds from.
+//
+// It is the DEFAULT change basket, not a dedicated "fuel" basket, on purpose:
+// the pool must hold wallet-SIGNABLE coins so every worker op can sign+broadcast
+// through the real wallet, and the only public API that mints signable
+// (BRC-29-derivable) coins — InternalizeAction's wallet-payment protocol — books
+// them into the default basket (see the throughput notes in report.go and the
+// Task-27 gap analysis). The funder's ClaimExact selects strictly by
+// (basket, tier, satoshis == denomination), so the non-denominated change that
+// also lands here is invisible to the fast path; a generously-sized pool keeps
+// ClaimExact from ever underflowing into the tiered fallback during the window.
+const throughputPoolBasket = "default"
 
 // Mode selects how each worker op drives the write path.
 type Mode string
@@ -82,6 +96,13 @@ type Config struct {
 
 	// Mode selects single-call vs two-step timing.
 	Mode Mode
+	// Throughput enables the denominated fuel-pool funding route: the provider
+	// runs with UTXOManagement.Strategy=throughput so each worker's
+	// wallet.CreateAction funds via the funder's closed-form ClaimExact fast
+	// path over the denominated pool (Denomination>0), rather than the bounded
+	// tiered (privacy) claim. The pre-minted pool doubles as the fuel pool. When
+	// false, the harness drives the tiered path exactly as before.
+	Throughput bool
 	// RunMonitor starts the monitor daemon (SSE apply pipeline).
 	RunMonitor bool
 	// Mine runs the auto-miner that emits MINED frames for broadcast txids so
@@ -149,6 +170,13 @@ func (c *Config) Validate() error {
 	if c.PaymentSats+50_000 >= c.Denomination {
 		return fmt.Errorf("perf: denomination %d too small for payment %d (leave fee headroom)", c.Denomination, c.PaymentSats)
 	}
+	if c.Throughput {
+		// ClaimExact requires the denomination to exceed the marginal fuel-input
+		// fee; the 50k headroom check above already guarantees this comfortably.
+		if floor := defs.MarginalFuelInputFee(defs.DefaultFeeModel()); c.Denomination <= floor {
+			return fmt.Errorf("perf: throughput denomination %d must exceed the marginal fuel input fee %d", c.Denomination, floor)
+		}
+	}
 	switch c.Mode {
 	case ModeSignAndProcess, ModeTwoStep:
 	default:
@@ -160,9 +188,11 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// perfproviderConfig maps the run config onto a perfprovider.Config.
+// perfproviderConfig maps the run config onto a perfprovider.Config. In
+// throughput mode it wires the provider's UTXOManagement to the throughput
+// strategy so CreateAction funds via the ClaimExact fast path.
 func (c *Config) perfproviderConfig() perfprovider.Config {
-	return perfprovider.Config{
+	pc := perfprovider.Config{
 		Backend:       c.Backend,
 		SQLitePath:    c.SQLitePath,
 		PostgresDSN:   c.PostgresDSN,
@@ -173,5 +203,26 @@ func (c *Config) perfproviderConfig() perfprovider.Config {
 		MaxDBConns:    c.MaxDBConns,
 		Network:       c.Network,
 		StorageName:   "perf",
+	}
+	if c.Throughput {
+		um := c.throughputUTXOMgmt()
+		pc.ExtraOptions = []storage.Option{storage.WithUTXOManagement(um)}
+	}
+	return pc
+}
+
+// throughputUTXOMgmt builds the provider UTXOManagement for a throughput run:
+// strategy=throughput, an explicit denomination matching the pre-minted pool,
+// funding from throughputPoolBasket, and the prefer-mined spend policy (so the
+// ClaimExact fast path targets the mined pool coins the harness seeds).
+func (c *Config) throughputUTXOMgmt() defs.UTXOManagement {
+	return defs.UTXOManagement{
+		Strategy: defs.StrategyThroughput,
+		Throughput: defs.Throughput{
+			DenominationSatoshis: c.Denomination,
+			SpendPolicy:          defs.SpendPolicyPreferMined,
+			PoolBasket:           throughputPoolBasket,
+			ReserveBasket:        "reserve",
+		},
 	}
 }

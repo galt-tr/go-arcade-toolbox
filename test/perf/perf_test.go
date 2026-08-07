@@ -48,6 +48,11 @@ func baseConfig(t *testing.T, backend perfprovider.Backend) perf.Config {
 	cfg.Denomination = uint64(envInt("PERF_DENOM", 1_000_000))
 	cfg.PaymentSats = uint64(envInt("PERF_PAYMENT", 1000))
 	cfg.MaxDBConns = envInt("PERF_MAX_DB_CONNS", cfg.Workers+8)
+	// PERF_THROUGHPUT=1 drives the denominated fuel-pool ClaimExact fast path
+	// (Strategy=throughput) instead of the tiered privacy claim. The pool must be
+	// sized (PERF_POOL) to outlast warmup+duration because throughput change is
+	// not recycled — see internal/perf notes.
+	cfg.Throughput = envInt("PERF_THROUGHPUT", 0) != 0
 	return cfg
 }
 
@@ -122,7 +127,11 @@ func runAndAssert(t *testing.T, cfg perf.Config, floorTPS float64) {
 	require.NotNil(t, result)
 
 	root := repoRoot(t)
-	jsonPath := filepath.Join(root, "perf-results", perf.DefaultResultFilename(string(cfg.Backend), string(cfg.Mode), result.GeneratedAt))
+	modeTag := string(cfg.Mode)
+	if cfg.Throughput {
+		modeTag += "-throughput"
+	}
+	jsonPath := filepath.Join(root, "perf-results", perf.DefaultResultFilename(string(cfg.Backend), modeTag, result.GeneratedAt))
 	require.NoError(t, perf.WriteJSON(result, jsonPath))
 	t.Logf("wrote %s", jsonPath)
 

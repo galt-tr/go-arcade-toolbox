@@ -66,6 +66,7 @@ func snapshot(ctx context.Context, cfg Config, st *stack, coll *collector, measu
 			PaymentSats:  cfg.PaymentSats,
 			MaxDBConns:   cfg.MaxDBConns,
 			Network:      string(cfg.Network),
+			FundingPath:  fundingPath(cfg),
 		},
 		Throughput: Throughput{
 			SustainedTPS:  round3(sustained),
@@ -131,14 +132,33 @@ func monitorStats(ctx context.Context, cfg Config, st *stack, c *counters) Monit
 	return m
 }
 
+// fundingPath names the funding route the run exercised, for the report header.
+func fundingPath(cfg Config) string {
+	if cfg.Throughput {
+		return "throughput (ClaimExact fuel pool)"
+	}
+	return "tiered (privacy)"
+}
+
 // notes documents the harness model + any run-specific caveats in the result.
 func notes(cfg Config) []string {
-	out := []string{
-		"TIERED PATH ONLY: these numbers measure the bounded tiered (privacy) funding path. Plain wallet.CreateAction always funds from the change basket with Denomination=0; the denominated fuel-pool ClaimExact fast path that the 1000-TPS design targets is NOT YET wired to CreateAction (tracked as a follow-up) and is expected to be substantially higher. Do not read this sustained TPS as the design ceiling — the Aerospike hybrid here already shows 0 claim contention.",
-		"Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
-		"Recycling is implicit: each payment's change re-enters the change basket ('default') and is re-selected by subsequent claims (mined-first, then unproven). This exercises real claim contention.",
-		"Contention counts are HIGH-VARIANCE run to run (SKIP-LOCKED collisions depend on scheduling); observed anywhere from ~0 to tens of thousands of retries at near-identical config. Do not over-read a single run's contention figure.",
-		"otherErrors is the residual bucket: write-path errors not matched as contention (contention/conflict/not-enough-funds/insufficient) or deadlock (deadlock/serialization/40001/40P01) — e.g. transient BEEF-assembly or reference/timeout errors, including ops interrupted at shutdown. Typically <0.5% of ops here and not individually root-caused.",
+	var out []string
+	if cfg.Throughput {
+		out = []string{
+			"FUEL-POOL PATH: the provider runs with UTXOManagement.Strategy=throughput, so each worker's wallet.CreateAction funds via the funder's closed-form ClaimExact fast path (FundArgs.Denomination>0) over a denominated pool — no tiered SKIP-LOCKED best-fit scan. This is the 1000-TPS design's funding route (Task 27 wiring).",
+			"POOL BASKET = 'default' (a measurement choice, not the production layout): the pool must hold wallet-SIGNABLE coins so every op can sign+broadcast through the real wallet, and the only public API that mints BRC-29-signable coins (InternalizeAction wallet-payment) books them into the default basket. ClaimExact selects strictly by (basket, tier, satoshis==denomination), so the non-denominated change that also lands in 'default' is invisible to the fast path. A dedicated 'fuel' basket would need shaped-change minting (FanOutFuel/FuelShape) which storage does not yet implement — see the benchmark README gap analysis.",
+			"NO RECYCLING: unlike the tiered path, each op's change is NOT re-claimed (it is not denomination-sized), so the pool strictly drains ~1 coin per op. The pool is sized to outlast warmup+duration; if ClaimExact ever underflowed it would fall back to the tiered walk over 'default' (visible as a contention/not-enough-funds spike). A clean run shows ~0 contention and ~0 not-enough-funds.",
+			"Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
+			"otherErrors is the residual bucket: write-path errors not matched as contention or deadlock — e.g. transient BEEF-assembly or reference/timeout errors, including the one in-flight op per worker interrupted at shutdown. Typically <0.5% of ops and not individually root-caused.",
+		}
+	} else {
+		out = []string{
+			"TIERED PATH: these numbers measure the bounded tiered (privacy) funding path — plain wallet.CreateAction funding from the change basket with Denomination=0. Compare against the sibling -throughput run for the denominated fuel-pool ClaimExact fast path.",
+			"Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
+			"Recycling is implicit: each payment's change re-enters the change basket ('default') and is re-selected by subsequent claims (mined-first, then unproven). This exercises real claim contention.",
+			"Contention counts are HIGH-VARIANCE run to run (SKIP-LOCKED collisions depend on scheduling); observed anywhere from ~0 to tens of thousands of retries at near-identical config. Do not over-read a single run's contention figure.",
+			"otherErrors is the residual bucket: write-path errors not matched as contention (contention/conflict/not-enough-funds/insufficient) or deadlock (deadlock/serialization/40001/40P01) — e.g. transient BEEF-assembly or reference/timeout errors, including ops interrupted at shutdown. Typically <0.5% of ops here and not individually root-caused.",
+		}
 	}
 	if cfg.RunMonitor {
 		out = append(out, "The monitor daemon runs the real SSE apply pipeline; the auto-miner emits status-SSE MINED frames (with proof headers) so change matures unproven->mined through the async loop under load (best-effort: frames may drop when the pipeline is behind). The auto-miner does NOT advance the chaintracks tip stream.")

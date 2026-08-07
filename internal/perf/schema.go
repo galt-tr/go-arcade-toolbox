@@ -55,6 +55,8 @@ type ConfigEcho struct {
 	PaymentSats  uint64  `json:"paymentSats"`
 	MaxDBConns   int     `json:"maxDbConns"`
 	Network      string  `json:"network"`
+	// FundingPath is "throughput (ClaimExact fuel pool)" or "tiered (privacy)".
+	FundingPath string `json:"fundingPath"`
 }
 
 // Throughput is the headline throughput result.

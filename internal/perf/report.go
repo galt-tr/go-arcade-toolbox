@@ -10,6 +10,9 @@ func Render(r *RunResult) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "# Benchmark: %s (%s, %s mode)\n\n", title(r.Backend), r.Backend, r.Mode)
+	if r.Config.FundingPath != "" {
+		fmt.Fprintf(&b, "**Funding path: %s**\n\n", r.Config.FundingPath)
+	}
 	if r.Label != "" {
 		fmt.Fprintf(&b, "_%s_\n\n", r.Label)
 	}
@@ -103,6 +106,9 @@ func Render(r *RunResult) string {
 	cfg := r.Config
 	fmt.Fprintf(&b, "## Run configuration\n\n")
 	fmt.Fprintf(&b, "| Knob | Value |\n|---|---|\n")
+	if cfg.FundingPath != "" {
+		fmt.Fprintf(&b, "| Funding path | %s |\n", cfg.FundingPath)
+	}
 	fmt.Fprintf(&b, "| Workers | %d |\n", cfg.Workers)
 	fmt.Fprintf(&b, "| Target TPS | %s |\n", tpsLabel(cfg.TargetTPS))
 	fmt.Fprintf(&b, "| Duration | %.0fs (+%.0fs warmup) |\n", cfg.DurationSec, cfg.WarmupSec)

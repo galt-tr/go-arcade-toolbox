@@ -1,15 +1,25 @@
 # Benchmarks — write-path throughput
 
-> **Read this first.** These numbers measure the **TIERED (privacy) funding
-> path** — the only path a plain `wallet.CreateAction` takes today, funding from
-> the change basket with `Denomination=0` via the bounded tiered claim. **The
-> denominated fuel-pool `ClaimExact` fast path that the 1000-TPS design targets
-> is NOT YET wired to `CreateAction`** (`pkg/storage/create.go` never sets
-> `FundArgs.Denomination`); that wiring is a tracked follow-up. So **~200 TPS is
-> not the design ceiling** — the fuel-pool path is expected to be substantially
-> higher (the Aerospike hybrid already shows *zero* claim contention here, i.e.
-> its ceiling is latency, not the tiered-claim hotspot). Do not read these
-> figures as the toolbox's throughput limit.
+> **Read this first.** Two funding paths are now measured side by side:
+>
+> - **Tiered (privacy)** — a plain `wallet.CreateAction` funding from the change
+>   basket with `Denomination=0` via the bounded tiered `SKIP LOCKED` claim.
+> - **Throughput (fuel-pool)** — `UTXOManagement.Strategy=throughput`, so
+>   `CreateAction` funds via the funder's closed-form **`ClaimExact`** fast path
+>   over a denominated pool (`FundArgs.Denomination>0`). This is the 1000-TPS
+>   design's route, wired in Task 27 (`pkg/storage/create.go` `fundingSource()`).
+>
+> **Verdict: 1000 TPS is NOT reached on this box on either path.** The fuel-pool
+> path sustains **~175–210 TPS single-call** (Postgres 209.8, hybrid 175.0). What
+> it *does* deliver is **deterministic zero claim contention** — every throughput
+> run shows `0` contention retries and ~0.5% op-failure, versus the tiered
+> Postgres path's high-variance **0–117k** retries and up to **18%** op-failure.
+> With claim contention gone, the bottleneck **moves to the `create` phase**
+> (fund + reserve + persist DB round trips and their long tail), *not* to
+> sign/broadcast. See [Fuel-pool path](#fuel-pool-path-claimexact--task-27) and
+> [Gap analysis](#gap-analysis--path-to-1000-tps) below. A fully clean fuel-pool
+> ceiling is blocked by a deeper gap (a dedicated, wallet-signable pool basket is
+> unreachable through the public API — see the gap analysis).
 
 Captured throughput of the full BRC-100 wallet write path
 (`CreateAction → SignAction → ProcessAction/broadcast`), produced by the
@@ -20,7 +30,7 @@ per-run report renders deterministically from its sibling JSON:
 go run ./cmd/perfrunner render docs/benchmarks/20260807-postgres-twostep.json
 ```
 
-## Results (this box: i9-13900K, 32 logical cores, 62.6 GiB, Fedora 7.1.5, Go 1.26.3)
+## Tiered-path results (this box: i9-13900K, 32 logical cores, 62.6 GiB, Fedora 7.1.5, Go 1.26.3)
 
 Bounded 60 s measured window (15 s warmup discarded), 64 workers, 4000-coin
 pool, unbounded rate. Broadcasts hit the in-process mockarcade, so these measure
@@ -50,6 +60,59 @@ sqlite
 i.e. ops that exhausted all retries or hit a non-retryable error. (E.g. the
 Postgres two-step run: (310 + 0 + 56) / 17230 ≈ **2.1%**.)
 
+## Fuel-pool path (ClaimExact) — Task 27
+
+Same harness, `-throughput` (`PERF_THROUGHPUT=1`): the provider runs
+`Strategy=throughput`, so each `wallet.CreateAction` funds via the funder's
+closed-form `ClaimExact` over a denominated pool instead of the tiered claim.
+Bounded **60 s** window (5 s warmup), 64 workers, 72 DB conns, **36 000-coin**
+pool, unbounded rate. (The larger pool is required because throughput change is
+*not* recycled — the pool drains ~1 coin/op — so it must outlast the window; a
+harness measurement choice, see the [gap analysis](#gap-analysis--path-to-1000-tps).)
+
+| Backend | Mode | Sustained TPS | e2e p50 | e2e p95 | e2e p99 | create p50 | sign p50 | claim-contention retries | op-failure rate | maturation |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PostgreSQL Mode A (shared SQL) | two-step | **183.5** | 172 ms | 1282 ms | 1982 ms | 85 ms | 73 ms | **0** | 0.56% | 50% |
+| PostgreSQL Mode A (shared SQL) | single-call | **209.8** | 173 ms | 1146 ms | 1918 ms | — | — | **0** | 0.49% | 56% |
+| Aerospike + PostgreSQL Mode B (split) | two-step | **200.6** | 157 ms | 1164 ms | 1988 ms | 81 ms | 67 ms | **0** | 0.52% | 50% |
+| Aerospike + PostgreSQL Mode B (split) | single-call | **175.0** | 164 ms | 1338 ms | 2311 ms | — | — | **0** | 0.59% | 49% |
+
+Reports: postgres
+[two-step](20260807-postgres-twostep-throughput.md) /
+[single-call](20260807-postgres-signandprocess-throughput.md) ·
+aerospike-hybrid
+[two-step](20260807-aerospike-hybrid-twostep-throughput.md) /
+[single-call](20260807-aerospike-hybrid-signandprocess-throughput.md).
+
+### Tiered vs fuel-pool, side by side (single-call)
+
+| Path | Postgres TPS | Postgres op-fail | Postgres claim-retries | Hybrid TPS | Hybrid op-fail |
+|---|---:|---:|---:|---:|---:|
+| Tiered (pool 4000) | 211.2 | **18.2%** | **117,585** | 153.6 | 0.55% |
+| Fuel-pool (pool 36000) | 209.8 | 0.49% | **0** | 175.0 | 0.59% |
+
+- **The `ClaimExact` wiring works and eliminates claim contention — deterministically.**
+  Every fuel-pool run (5+ captured, both backends, both modes) shows **exactly 0**
+  claim-contention retries and ~0.5% op-failure (the residual is the one in-flight
+  op per worker cancelled at shutdown). The tiered Postgres single-call path, by
+  contrast, collapsed to **117k retries and 18% op-failure** at pool 4000. This is
+  the structural win: the uniform denomination makes every pool coin interchangeable,
+  so the `FOR UPDATE SKIP LOCKED` claim never collides — 64 workers grab 64
+  different coins instead of fighting over the smallest-sufficient one.
+- **1000 TPS is not reached; the real ceiling here is ~175–210 TPS single-call.**
+  With claim contention removed, raw sustained TPS is *create-phase bound* and lands
+  in the same ~150–230 band as the tiered path.
+- **Equal-pool isolation (pool 8000, single-call, 15 s):** tiered **219.8** vs
+  fuel-pool **230.4 TPS** (both `0` retries in that pair — tiered contention is
+  high-variance and happened not to fire). At equal pool the two paths are within
+  ~5%: on this box both are limited by the same create-phase DB work, so removing
+  claim contention shifts *reliability* (no 18% collapse) far more than it shifts
+  median TPS.
+- **Hybrid (Mode B) gains most:** fuel-pool cuts the `create` p50 from **319 ms**
+  (tiered) to **81 ms** — the single `ClaimExact` replaces the multi-tier
+  best-fit walk across the Aerospike inventory — lifting two-step from 152.7 → 200.6
+  TPS (+31%).
+
 ## Reading the numbers
 
 - **Single-call is NOT ~2× on the tiered path — it is backend-dependent, and
@@ -71,8 +134,12 @@ Postgres two-step run: (310 + 0 + 56) / 17230 ≈ **2.1%**.)
   inventory and the PostgreSQL metadata — two coordinated writes per op. It is
   latency-bound, so single-call barely helps.
 - **The bottleneck phase is `create` (fund + reserve + persist)** on every
-  backend; `sign_process` is 3–6× cheaper. The cost is DB round trips in the
-  funding/claim/persist path, not signing or the (instant, in-process) broadcast.
+  backend and on **both** funding paths; `sign_process` is 3–6× cheaper at the
+  median and its tail is far tighter (create p95 ≈ 1.1–1.3 s vs sign p95 ≈ 0.18 s
+  on the fuel-pool runs). The cost is DB round trips in the funding/claim/persist
+  path, not signing or the (instant, in-process) broadcast. On the fuel-pool path
+  the *claim* part of `create` is no longer the culprit (0 contention) — it is the
+  change-basket `COUNT(*)` + persist + input-BEEF assembly. See the gap analysis.
 - **Contention counts are HIGH-VARIANCE.** Across near-identical configs, the
   Postgres claim-retry count has been observed anywhere from ~0 to >100k
   (scheduling-dependent `SKIP LOCKED` collisions). Do not over-read a single
@@ -96,25 +163,65 @@ Postgres two-step run: (310 + 0 + 56) / 17230 ≈ **2.1%**.)
 
 ## Gap analysis — path to 1000+ TPS
 
-Neither backend reaches 1000 TPS on the tiered path. What closes the gap,
-roughly in order of leverage:
+Task 27 wired the fuel-pool `ClaimExact` route and it works, but **neither path
+reaches 1000 TPS on this box** — the ceiling is ~175–210 TPS single-call. With
+claim contention removed, the bottleneck has moved off the claim and onto the
+`create` phase. What now stands between here and 1000, roughly in order of
+leverage:
 
-1. **Wire the denominated fuel-pool `ClaimExact` funding path to `CreateAction`
-   (tracked follow-up).** This is the *designed* high-throughput route: a single
-   closed-form exact claim over a denominated pool, with no tiered `SKIP LOCKED`
-   scan — which is exactly the Postgres contention hotspot above. This is the
-   structural win for both TPS and contention and is why ~200 is not the ceiling.
-2. **More workers + connection-pool tuning + a larger pool-to-worker coin
-   ratio.** Latency-bound throughput scales with concurrency until the store
-   saturates; the hybrid has contention headroom to add workers now, and
-   Postgres needs a bigger pool relative to workers to stop the claim collisions
-   from worsening.
-3. **Delayed-broadcast / batched processing** to cut per-op synchronous DB work.
-4. **Denomination sizing** so one claim funds one payment (minimal change, no
-   multi-input gather), shortening the funding path.
-5. **Single-call mode** helps only where the claim path is *not* the bottleneck
-   — a modest lever on the tiered path (see above), potentially larger once the
-   fuel-pool path removes the contention ceiling.
+1. **The `create` phase is the wall, and it is not the claim anymore.** In the
+   two-step split, `create` (fund + reserve + persist) still dominates
+   `sign_process`, and its *tail* is what caps throughput: create p95 ≈ 1.1–1.3 s
+   and p99 ≈ 1.9 s even at create p50 ≈ 85 ms and **0 claim contention**. The cost
+   is DB round trips — the change-basket `COUNT(*)` (see #2), the metadata persist
+   (tx + output rows + input-BEEF assembly), and the monitor daemon competing for
+   the same connection pool — not signing and not the (instant, in-process)
+   broadcast. The task's prior guess that the next bottleneck would be
+   sign/commit/broadcast does **not** hold: it is squarely the funding/persist
+   create path.
+2. **Give the fuel pool a dedicated basket (this is the biggest single lever, and
+   it is currently *blocked* — see [Known gap](#known-gap-a-dedicated-signable-fuel-basket-is-unreachable)).**
+   `CreateAction` calls `changeBasketCount` — a `SELECT COUNT(*)` over the funding
+   basket — on *every* op (`create.go`). Because the harness pool lives in the
+   `default` basket, that COUNT scans the whole pool per op, and its cost grows
+   with pool size (measured A/B on SQLite: pool 2000→16000 dropped 116.8→79.2 TPS
+   at identical workload). A dedicated `fuel` basket keeps the pool out of that
+   scan entirely. Independently, making `changeBasketCount` O(1) (a cached/maintained
+   basket counter instead of a per-op `COUNT(*)`) removes the cost on both paths.
+3. **More workers + connection-pool tuning.** Throughput is now latency/round-trip
+   bound with contention headroom (0 retries), so it should scale with concurrency
+   until Postgres saturates; the shared 72-connection pool (workers + monitor)
+   and the create tail are the current limiters to profile next.
+4. **Delayed-broadcast / batched processing** to cut per-op synchronous DB work
+   and shorten the create tail.
+5. **Denomination sizing** so one `ClaimExact` claims exactly one coin per payment
+   (it already does here: `n=1`), keeping change minimal.
+
+### Known gap: a dedicated, signable fuel basket is unreachable
+
+The fuel-pool captures fund from the **`default`** basket, not a dedicated `fuel`
+basket, because **no public wallet API can put a wallet-*signable* coin into a
+non-default basket today**:
+
+- `FanOutFuel` / `Options.FuelShape` (the intended pool-minting primitive) is
+  **dead in storage** — `pkg/storage/create.go` never reads `FuelShape`, so a
+  fan-out mints ordinary change into `default`, not shaped denominations into the
+  pool basket. (Confirmed: `FuelShape` is referenced only by `wallet.FanOutFuel`
+  and the wdk type; storage ignores it.)
+- `InternalizeAction`'s **wallet-payment** protocol (the only one that records the
+  BRC-29 derivation material the signer needs) hardcodes the `default` basket; its
+  **basket-insertion** protocol can target any basket but records no derivation
+  material, and the assembler's fallback derivation uses an *empty* key ID, which
+  `brc29` rejects (`KeyID.Validate`) — so basket-insertion coins are unspendable.
+
+Net: to spend from a **dedicated** pool basket via the real wallet you must first
+implement `FuelShape` (shaped change into the pool basket, carrying derivation
+material) and mine those fan-out txs so `ClaimExact`'s mined-tier fast path can
+see them. Until then the pool lives in `default`, which is a faithful end-to-end
+exercise of `ClaimExact` (change there is non-denominated and invisible to the
+exact claim) but pays the `changeBasketCount` cost of #2 and forces a large,
+non-recycling pool. This is a larger change than Task 27's funding-route wiring
+and is called out here rather than hacked into the harness.
 
 ## How these were produced
 
@@ -126,10 +233,20 @@ PERF_MODES="twostep signandprocess" \
 PERF_DURATION=60s PERF_WARMUP=15s PERF_WORKERS=64 PERF_POOL=4000 PERF_MAX_DB_CONNS=72 \
   go test -tags perf -run TestPerf_PostgresModeA -timeout 25m -v ./test/perf/...
 
-# Or a full-length run via the CLI (SQLite self-contained; PG/Aero via flags):
+# Fuel-pool (ClaimExact) capture: add PERF_THROUGHPUT=1 and a pool large enough
+# to outlast the window (throughput change is not recycled — the pool drains
+# ~1 coin/op, so pool > peak_TPS × (warmup+duration); underflow shows up as a
+# claim-contention/not-enough-funds spike):
+DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock TESTCONTAINERS_RYUK_DISABLED=true \
+PERF_THROUGHPUT=1 PERF_MODES="twostep signandprocess" \
+PERF_DURATION=60s PERF_WARMUP=5s PERF_WORKERS=64 PERF_POOL=36000 PERF_MAX_DB_CONNS=72 \
+  go test -tags perf -run TestPerf_PostgresModeA -timeout 30m -v ./test/perf/...
+
+# Or a full-length run via the CLI (SQLite self-contained; PG/Aero via flags).
+# Add -throughput for the fuel-pool path:
 go run ./cmd/perfrunner -backend postgres -pg-dsn "postgres://..." \
-  -workers 64 -duration 5m -warmup 30s -pool-size 4000 -max-db-conns 72 \
-  -mode signandprocess
+  -workers 64 -duration 5m -warmup 30s -pool-size 36000 -max-db-conns 72 \
+  -mode signandprocess -throughput
 
 # Render any result JSON to Markdown:
 go run ./cmd/perfrunner render -o report.md perf-results/<run>.json
