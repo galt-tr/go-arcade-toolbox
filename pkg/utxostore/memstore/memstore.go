@@ -553,7 +553,10 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	b := utxostore.Balance{Claimable: make(map[utxostore.Tier]uint64)}
+	b := utxostore.Balance{
+		Claimable:      make(map[utxostore.Tier]uint64),
+		ClaimableCount: make(map[utxostore.Tier]int),
+	}
 	if s.closed {
 		return b, errClosed
 	}
@@ -566,8 +569,10 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 		switch {
 		case u.ReservedBy != "":
 			b.Reserved += u.Satoshis
+			b.ReservedCount++
 		case !u.Frozen:
 			b.Claimable[u.Tier] += u.Satoshis
+			b.ClaimableCount[u.Tier]++
 		}
 	}
 	return b, nil

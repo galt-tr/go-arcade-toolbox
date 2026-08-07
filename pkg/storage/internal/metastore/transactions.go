@@ -19,6 +19,31 @@ type TransactionsRepo struct{ s *Store }
 // Transactions returns the transactions repository.
 func (s *Store) Transactions() TransactionsRepo { return TransactionsRepo{s} }
 
+// CountByStatus returns the number of the user's transactions in each status
+// (the wallet-side lifecycle: unsigned/unprocessed/sending/nosend/unproven/
+// completed/failed/…). Absent statuses are omitted. For observability.
+func (r TransactionsRepo) CountByStatus(ctx context.Context, userID int) (map[string]int, error) {
+	q := r.s.rebind("SELECT status, COUNT(*) FROM transactions WHERE user_id = ? GROUP BY status")
+	rows, err := r.s.execer(ctx).QueryContext(ctx, q, userID)
+	if err != nil {
+		return nil, fmt.Errorf("metastore: count transactions by status: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var (
+			status string
+			n      int
+		)
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, fmt.Errorf("metastore: scan transaction status count: %w", err)
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
 const txCols = "transaction_id, user_id, proven_tx_id, status, reference, txid, " +
 	"is_outgoing, satoshis, description, version, lock_time, input_beef, created_at, updated_at"
 

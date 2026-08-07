@@ -1114,15 +1114,29 @@ func (s *suite) balance(t *testing.T, store utxostore.Store) {
 	require.Equal(t, uint64(150), b.Reserved,
 		"reserved-but-unspent counts frozen or not (70 plain + 80 frozen); unreserved-frozen and spent count nowhere")
 
+	// The COUNT partition mirrors the satoshi partition: two claimable mined
+	// coins (100, 200), one each unproven/sending, and two reserved (70 + 80).
+	require.Equal(t, 2, b.ClaimableCount[utxostore.TierMined])
+	require.Equal(t, 1, b.ClaimableCount[utxostore.TierUnproven])
+	require.Equal(t, 1, b.ClaimableCount[utxostore.TierSending])
+	require.Equal(t, 2, b.ReservedCount,
+		"two reserved-but-unspent coins (70 plain + 80 frozen)")
+
 	// An empty (user, basket) has a zero balance.
 	b, err = store.Balance(ctx, user, "empty-basket")
 	require.NoError(t, err)
 	require.Zero(t, b.Reserved)
+	require.Zero(t, b.ReservedCount)
 	var total uint64
 	for _, v := range b.Claimable {
 		total += v
 	}
 	require.Zero(t, total)
+	var totalCount int
+	for _, v := range b.ClaimableCount {
+		totalCount += v
+	}
+	require.Zero(t, totalCount)
 }
 
 // clockedStore provisions the store for timestamp-sensitive subtests: the

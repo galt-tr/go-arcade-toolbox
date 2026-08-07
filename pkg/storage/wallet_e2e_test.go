@@ -414,6 +414,37 @@ func TestE2E_WritePath_ImmediateBroadcastOverridesDelayed(t *testing.T) {
 	require.NotEmpty(t, s.arc.Broadcasts()[0].EF)
 }
 
+// TestE2E_StateReport verifies the observability read surfaced to the dashboard:
+// after seeding a mined payment, StateReport shows it in the "default" basket's
+// mined tier (count + sats), tiers ordered sending → unproven → mined, and the
+// status maps initialized. It resolves the user from the identity key alone (no
+// pre-resolved numeric UserID), which is what a UI caller has.
+func TestE2E_StateReport(t *testing.T) {
+	ctx := context.Background()
+	s := newE2EStack(t)
+	s.seedMinedPayment(e2eSeedSatoshis, e2eBlockHeight)
+
+	rep, err := s.provider.StateReport(ctx, wdk.AuthID{IdentityKey: s.recipientHex}, []string{"default"})
+	require.NoError(t, err)
+	require.Len(t, rep.Baskets, 1)
+	require.Equal(t, "default", rep.Baskets[0].Basket)
+
+	tiers := rep.Baskets[0].Tiers
+	require.Equal(t, []string{"sending", "unproven", "mined"},
+		[]string{tiers[0].Tier, tiers[1].Tier, tiers[2].Tier}, "tiers ordered sending → unproven → mined")
+
+	mined := tiers[2]
+	require.GreaterOrEqual(t, mined.ClaimableCount, 1, "the seeded mined coin is counted in the mined tier")
+	require.GreaterOrEqual(t, mined.ClaimableSats, e2eSeedSatoshis)
+
+	require.NotNil(t, rep.TxStatuses)
+	require.NotNil(t, rep.ArcadeStatuses)
+
+	// A bad identity key is an authorization error, not a silent empty report.
+	_, err = s.provider.StateReport(ctx, wdk.AuthID{IdentityKey: "not-a-user"}, []string{"default"})
+	require.ErrorIs(t, err, storage.ErrAuthorization)
+}
+
 // TestE2E_InternalizeTrustAnchor_Negative proves the header-verified-proof trust
 // anchor is genuinely consulted end to end: with the BUMP's merkle root NOT
 // registered in the mock chaintracks, the real headers.Client's VerifyMerkleRoot

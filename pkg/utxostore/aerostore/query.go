@@ -16,7 +16,10 @@ import (
 // (unspent, unreserved, not frozen); Reserved is reserved-but-unspent (frozen
 // or not). Frozen unreserved rows and spent rows count in neither bucket.
 func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxostore.Balance, error) {
-	b := utxostore.Balance{Claimable: make(map[utxostore.Tier]uint64)}
+	b := utxostore.Balance{
+		Claimable:      make(map[utxostore.Tier]uint64),
+		ClaimableCount: make(map[utxostore.Tier]int),
+	}
 	if s.closed.Load() {
 		return b, errClosed
 	}
@@ -31,7 +34,10 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 	}
 	for res := range rs.Results() {
 		if res.Err != nil {
-			return utxostore.Balance{Claimable: make(map[utxostore.Tier]uint64)},
+			return utxostore.Balance{
+					Claimable:      make(map[utxostore.Tier]uint64),
+					ClaimableCount: make(map[utxostore.Tier]int),
+				},
 				fmt.Errorf("aerostore: balance query result: %w", res.Err)
 		}
 		u, cerr := recordToUTXO(res.Record)
@@ -43,8 +49,10 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 			continue // defensive: invKey index should already exclude spent rows
 		case u.ReservedBy != "":
 			b.Reserved += u.Satoshis
+			b.ReservedCount++
 		case !u.Frozen:
 			b.Claimable[u.Tier] += u.Satoshis
+			b.ClaimableCount[u.Tier]++
 		}
 	}
 	return b, nil

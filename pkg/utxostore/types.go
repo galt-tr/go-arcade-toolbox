@@ -139,9 +139,16 @@ type SpendOp struct {
 // the sum of coins that are unspent, unreserved, and not frozen; absent keys
 // mean zero. Reserved is the sum of reserved-but-unspent coins across all
 // tiers. Frozen unreserved coins and spent coins appear in neither bucket.
+//
+// ClaimableCount and ReservedCount carry the same partition by coin COUNT
+// (rather than satoshis), for observability/reporting: ClaimableCount[t] is the
+// number of claimable coins in tier t, and ReservedCount is the number of
+// reserved-but-unspent coins across all tiers.
 type Balance struct {
-	Claimable map[Tier]uint64
-	Reserved  uint64
+	Claimable      map[Tier]uint64
+	Reserved       uint64
+	ClaimableCount map[Tier]int
+	ReservedCount  int
 }
 
 // ReservationRef describes one reservation: its token, owner, age, and the

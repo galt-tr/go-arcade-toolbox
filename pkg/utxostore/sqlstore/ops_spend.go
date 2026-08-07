@@ -283,7 +283,10 @@ func (s *Store) setFrozen(ctx context.Context, ops []utxostore.Outpoint, frozen 
 
 // Balance implements [utxostore.Store].
 func (s *Store) Balance(ctx context.Context, userID int64, basket string) (utxostore.Balance, error) {
-	b := utxostore.Balance{Claimable: make(map[utxostore.Tier]uint64)}
+	b := utxostore.Balance{
+		Claimable:      make(map[utxostore.Tier]uint64),
+		ClaimableCount: make(map[utxostore.Tier]int),
+	}
 	if s.isClosed() {
 		return b, errClosed
 	}
@@ -291,7 +294,9 @@ func (s *Store) Balance(ctx context.Context, userID int64, basket string) (utxos
 	q := s.rebind(`
 		SELECT tier,
 			COALESCE(SUM(CASE WHEN reserved_by IS NULL AND NOT frozen THEN satoshis ELSE 0 END), 0) AS claimable,
-			COALESCE(SUM(CASE WHEN reserved_by IS NOT NULL THEN satoshis ELSE 0 END), 0) AS reserved
+			COALESCE(SUM(CASE WHEN reserved_by IS NOT NULL THEN satoshis ELSE 0 END), 0) AS reserved,
+			COALESCE(SUM(CASE WHEN reserved_by IS NULL AND NOT frozen THEN 1 ELSE 0 END), 0) AS claimable_count,
+			COALESCE(SUM(CASE WHEN reserved_by IS NOT NULL THEN 1 ELSE 0 END), 0) AS reserved_count
 		FROM utxos
 		WHERE user_id=? AND basket=? AND spent_by IS NULL
 		GROUP BY tier`)
@@ -305,17 +310,23 @@ func (s *Store) Balance(ctx context.Context, userID int64, basket string) (utxos
 
 	for rows.Next() {
 		var (
-			tier      utxostore.Tier
-			claimable uint64
-			reserved  uint64
+			tier           utxostore.Tier
+			claimable      uint64
+			reserved       uint64
+			claimableCount int
+			reservedCount  int
 		)
-		if err := rows.Scan(&tier, &claimable, &reserved); err != nil {
+		if err := rows.Scan(&tier, &claimable, &reserved, &claimableCount, &reservedCount); err != nil {
 			return b, err
 		}
 		if claimable > 0 {
 			b.Claimable[tier] = claimable
 		}
+		if claimableCount > 0 {
+			b.ClaimableCount[tier] = claimableCount
+		}
 		b.Reserved += reserved
+		b.ReservedCount += reservedCount
 	}
 	if err := rows.Err(); err != nil {
 		return b, err

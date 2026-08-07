@@ -62,6 +62,33 @@ type KnownTxRepo struct{ s *Store }
 // KnownTx returns the known-transactions repository.
 func (s *Store) KnownTx() KnownTxRepo { return KnownTxRepo{s} }
 
+// CountByArcadeStatus returns the number of known transactions in each
+// arcade-reported status (SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES / MINED /
+// REJECTED / …). Rows with no arcade status yet are grouped under "" (not yet
+// broadcast / no status received). known_txs is not user-scoped, so this is a
+// deployment-wide count. For observability.
+func (r KnownTxRepo) CountByArcadeStatus(ctx context.Context) (map[string]int, error) {
+	q := r.s.rebind("SELECT COALESCE(arcade_status, ''), COUNT(*) FROM known_txs GROUP BY arcade_status")
+	rows, err := r.s.execer(ctx).QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("metastore: count known txs by arcade status: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var (
+			status string
+			n      int
+		)
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, fmt.Errorf("metastore: scan known tx arcade status count: %w", err)
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
 const knownTxCols = "txid, status, arcade_status, attempts, rebroadcast_attempts, " +
 	"was_broadcast, notified, batch, notify, raw_tx, input_beef, block_height, " +
 	"block_hash, merkle_path, merkle_root, competing_txs, suspect_since, created_at, updated_at, " +
