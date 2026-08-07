@@ -40,8 +40,11 @@
 // GET /tx for any transaction that may have reached a terminal state while
 // they were disconnected.
 //
-// This package contains only types, interfaces, and their contract
-// documentation. The concrete HTTP/SSE [TxOracle] implementation lands in a
-// later task; a multi-instance HA router is expected to implement the same
-// interface behind the scenes.
+// This package provides the wire types, the [TxOracle] contract, and its
+// concrete single-instance HTTP/SSE implementation, [Client] (see New). REST
+// calls (Broadcast, GetTx, Health) go through a resty client and a
+// single-target circuit breaker; the long-lived status stream (StreamStatus)
+// uses a dedicated net/http client with auto-reconnect and a read-liveness
+// watchdog. A multi-instance HA router is expected to implement the same
+// [TxOracle] interface behind the scenes in a follow-up.
 package arcade
