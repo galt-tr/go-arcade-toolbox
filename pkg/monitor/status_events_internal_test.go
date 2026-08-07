@@ -134,6 +134,14 @@ func (m *modelStorage) AbortAbandoned(context.Context, time.Time, int) error    
 func (m *modelStorage) SynchronizeTransactionStatuses(context.Context, int) error { return nil }
 func (m *modelStorage) CheckProofs(context.Context, int) error                    { return nil }
 func (m *modelStorage) DemoteReorgedProofs(context.Context, uint32) error         { return nil }
+func (m *modelStorage) VerifyAndReleaseSuspects(context.Context, time.Duration, time.Duration, int) (defs.ReconcilerReport, error) {
+	return defs.ReconcilerReport{}, nil
+}
+
+func (m *modelStorage) DrainOutbox(context.Context, int) (defs.OutboxDrainReport, error) {
+	return defs.OutboxDrainReport{}, nil
+}
+
 func (m *modelStorage) GetKeyValue(_ context.Context, k string) ([]byte, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

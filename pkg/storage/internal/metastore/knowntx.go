@@ -18,6 +18,16 @@ import (
 // returns rows whose window has elapsed.
 const KnownTxStatusSuspectFailed wdk.ProvenTxReqStatus = "suspectFailed"
 
+// KnownTxStatusStuck is an arcade-specific terminal ProvenTxReqStatus the
+// reject→release reconciler (Task 19) escalates a suspect to once it has sat
+// unresolved past the max-quarantine window without ever becoming provably dead
+// (e.g. a double spend whose competitor never won, or a tx GetTx could never
+// re-verify). A stuck tx is operator-visible and, unlike a provably-dead tx, its
+// inputs are NEVER auto-released — resurrecting a possibly-live input is the one
+// thing the reconciler must never do. It is deliberately outside the suspect
+// scan, so the reconciler never re-processes it.
+const KnownTxStatusStuck wdk.ProvenTxReqStatus = "stuck"
+
 // KnownTx is the storage-wide record for a transaction the wallet knows about,
 // keyed by txid. It merges the wdk ProvenTxReq processing state, the retained
 // rawtx / input-BEEF / proof material, and arcade-specific broadcast bookkeeping
@@ -41,6 +51,7 @@ type KnownTx struct {
 	MerkleRoot          []byte
 	CompetingTxs        []string
 	SuspectSince        *time.Time
+	VerifiedRejectedAt  *time.Time
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
@@ -53,7 +64,8 @@ func (s *Store) KnownTx() KnownTxRepo { return KnownTxRepo{s} }
 
 const knownTxCols = "txid, status, arcade_status, attempts, rebroadcast_attempts, " +
 	"was_broadcast, notified, batch, notify, raw_tx, input_beef, block_height, " +
-	"block_hash, merkle_path, merkle_root, competing_txs, suspect_since, created_at, updated_at"
+	"block_hash, merkle_path, merkle_root, competing_txs, suspect_since, created_at, updated_at, " +
+	"verified_rejected_at"
 
 func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 	var (
@@ -71,13 +83,14 @@ func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 		suspectSince tsScan
 		createdAt    tsScan
 		updatedAt    tsScan
+		verifiedRej  tsScan
 	)
 	dest := []any{
 		&txidBytes, &status, &arcadeStatus, &attempts, &rebroadcast,
 		r.s.boolDest(&wasBroadcast), r.s.boolDest(&notified), &batch, &kt.Notify,
 		&kt.RawTx, &kt.InputBEEF, &blockHeight, &kt.BlockHash, &kt.MerklePath,
 		&kt.MerkleRoot, &competing, r.s.tsDest(&suspectSince),
-		r.s.tsDest(&createdAt), r.s.tsDest(&updatedAt),
+		r.s.tsDest(&createdAt), r.s.tsDest(&updatedAt), r.s.tsDest(&verifiedRej),
 	}
 	if err := sc.Scan(dest...); err != nil {
 		return nil, err
@@ -106,6 +119,7 @@ func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 	kt.SuspectSince = r.s.tsTimePtr(suspectSince)
 	kt.CreatedAt = r.s.tsTime(createdAt)
 	kt.UpdatedAt = r.s.tsTime(updatedAt)
+	kt.VerifiedRejectedAt = r.s.tsTimePtr(verifiedRej)
 	return &kt, nil
 }
 
@@ -159,7 +173,7 @@ func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...
 		"block_height = EXCLUDED.block_height, block_hash = EXCLUDED.block_hash, " +
 		"merkle_path = EXCLUDED.merkle_path, merkle_root = EXCLUDED.merkle_root, " +
 		"competing_txs = EXCLUDED.competing_txs, suspect_since = EXCLUDED.suspect_since, " +
-		"updated_at = EXCLUDED.updated_at"
+		"updated_at = EXCLUDED.updated_at, verified_rejected_at = EXCLUDED.verified_rejected_at"
 	var guardArgs []any
 	if len(skipForStatuses) > 0 {
 		conflict += " WHERE known_txs.status NOT IN (" + inPlaceholders(len(skipForStatuses)) + ")"
@@ -170,14 +184,15 @@ func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...
 
 	q := r.s.rebind(
 		`INSERT INTO known_txs (` + knownTxCols + `)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ` + conflict)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ` + conflict,
+	)
 	args := []any{
 		//nolint:gosec // attempt counters are small, well within int64.
 		raw, string(kt.Status), strPtrArg(kt.ArcadeStatus), int64(kt.Attempts), int64(kt.RebroadcastAttempts),
 		r.s.boolVal(wasBroadcast), r.s.boolVal(kt.Notified), strPtrArg(kt.Batch), notify,
 		bytesArg(kt.RawTx), bytesArg(kt.InputBEEF), blockHeight, bytesArg(kt.BlockHash),
 		bytesArg(kt.MerklePath), bytesArg(kt.MerkleRoot), competing, r.s.encTimePtr(kt.SuspectSince),
-		now, now,
+		now, now, r.s.encTimePtr(kt.VerifiedRejectedAt),
 	}
 	args = append(args, guardArgs...)
 
@@ -270,13 +285,14 @@ func (s *Store) boolTrueLiteral() string {
 }
 
 // MarkSuspectFailed moves a known tx into the suspect-failed grace window,
-// recording suspectSince.
+// recording suspectSince and resetting verified_rejected_at to NULL so the
+// reconciler's two-pass guard starts fresh for this suspect cycle.
 func (r KnownTxRepo) MarkSuspectFailed(ctx context.Context, txid string, suspectSince time.Time) error {
 	raw, err := encTxID(txid)
 	if err != nil {
 		return err
 	}
-	q := r.s.rebind("UPDATE known_txs SET status = ?, suspect_since = ?, updated_at = ? WHERE txid = ?")
+	q := r.s.rebind("UPDATE known_txs SET status = ?, suspect_since = ?, verified_rejected_at = NULL, updated_at = ? WHERE txid = ?")
 	res, err := r.s.execer(ctx).ExecContext(ctx, q,
 		string(KnownTxStatusSuspectFailed), r.s.encTime(suspectSince), r.s.encTime(r.s.now()), raw)
 	if err != nil {
@@ -292,6 +308,65 @@ func (r KnownTxRepo) MarkSuspectFailed(ctx context.Context, txid string, suspect
 	return nil
 }
 
+// StampVerifiedRejected records the FIRST authoritative re-verification that a
+// suspect tx is still REJECTED (the reconciler's two-pass guard, pass 1). It
+// only stamps while the row is still suspectFailed and has no stamp yet, so it
+// is idempotent (a re-run does not move the timestamp) and never resurrects a
+// stamp on a tx that has since recovered or been finalized. A no-op (already
+// stamped, no longer suspect, or unknown txid) returns nil — the caller reads
+// the current VerifiedRejectedAt to decide pass 1 vs pass 2.
+func (r KnownTxRepo) StampVerifiedRejected(ctx context.Context, txid string, at time.Time) error {
+	raw, err := encTxID(txid)
+	if err != nil {
+		return err
+	}
+	q := r.s.rebind(
+		`UPDATE known_txs SET verified_rejected_at = ?, updated_at = ?
+		 WHERE txid = ? AND status = ? AND verified_rejected_at IS NULL`,
+	)
+	if _, err := r.s.execer(ctx).ExecContext(ctx, q,
+		r.s.encTime(at), r.s.encTime(r.s.now()), raw, string(KnownTxStatusSuspectFailed)); err != nil {
+		return fmt.Errorf("metastore: stamp verified rejected: %w", err)
+	}
+	return nil
+}
+
+// TransitionSuspect performs the positive-CAS terminal transition of a
+// suspect-failed known tx to newStatus, applying ONLY while the row is currently
+// suspectFailed. This is the reconciler's no-double-release gate: the first
+// release wins and flips the row off suspectFailed; any re-entry (a crash re-run
+// or a racing pass) sees a non-suspect status and is refused with
+// [ErrStatusUpdateSkipped]. [ErrNotFound] means the txid vanished. It is used
+// for both the provably-dead terminal transition (invalidTx / doubleSpend) and
+// the stuck escalation.
+func (r KnownTxRepo) TransitionSuspect(ctx context.Context, txid string, newStatus wdk.ProvenTxReqStatus) error {
+	raw, err := encTxID(txid)
+	if err != nil {
+		return err
+	}
+	q := r.s.rebind("UPDATE known_txs SET status = ?, updated_at = ? WHERE txid = ? AND status = ?")
+	res, err := r.s.execer(ctx).ExecContext(ctx, q,
+		string(newStatus), r.s.encTime(r.s.now()), raw, string(KnownTxStatusSuspectFailed))
+	if err != nil {
+		return fmt.Errorf("metastore: transition suspect: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	exists, err := r.existsByTxID(ctx, raw)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("metastore: transition suspect: %s: %w", txid, ErrNotFound)
+	}
+	return ErrStatusUpdateSkipped
+}
+
 // SetProof records a mined transaction's proof and marks it completed/notified.
 func (r KnownTxRepo) SetProof(ctx context.Context, txid string, height uint32, blockHash, merklePath, merkleRoot []byte) error {
 	raw, err := encTxID(txid)
@@ -302,7 +377,8 @@ func (r KnownTxRepo) SetProof(ctx context.Context, txid string, height uint32, b
 		`UPDATE known_txs
 		 SET status = ?, was_broadcast = ` + r.s.boolTrueLiteral() + `, notified = ` + r.s.boolTrueLiteral() + `,
 		     block_height = ?, block_hash = ?, merkle_path = ?, merkle_root = ?, updated_at = ?
-		 WHERE txid = ?`)
+		 WHERE txid = ?`,
+	)
 	res, err := r.s.execer(ctx).ExecContext(ctx, q,
 		string(wdk.ProvenTxStatusCompleted), int64(height),
 		bytesArg(blockHash), bytesArg(merklePath), bytesArg(merkleRoot),

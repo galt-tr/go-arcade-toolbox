@@ -34,6 +34,7 @@ type fakeOracle struct {
 	calls     int
 	lastEF    []byte
 	broadcast func(ctx context.Context, txid string, ef []byte) (*arcade.BroadcastResult, error)
+	getTx     func(ctx context.Context, txid string) (*arcade.TxRecord, error)
 }
 
 func (f *fakeOracle) Broadcast(ctx context.Context, txid string, ef []byte) (*arcade.BroadcastResult, error) {
@@ -45,7 +46,10 @@ func (f *fakeOracle) Broadcast(ctx context.Context, txid string, ef []byte) (*ar
 	return f.broadcast(ctx, txid, ef)
 }
 
-func (f *fakeOracle) GetTx(context.Context, string) (*arcade.TxRecord, error) {
+func (f *fakeOracle) GetTx(ctx context.Context, txid string) (*arcade.TxRecord, error) {
+	if f.getTx != nil {
+		return f.getTx(ctx, txid)
+	}
 	return nil, arcade.ErrTxNotFound
 }
 

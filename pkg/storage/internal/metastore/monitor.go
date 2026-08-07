@@ -41,14 +41,16 @@ func (r LeaseRepo) Acquire(ctx context.Context, job, owner string, leaseUntil, n
 	ins := r.s.rebind(
 		`INSERT INTO monitor_job_locks (job_name, owner, lease_until)
 		 VALUES (?, ?, ?)
-		 ON CONFLICT (job_name) DO NOTHING`)
+		 ON CONFLICT (job_name) DO NOTHING`,
+	)
 	if _, err := r.s.execer(ctx).ExecContext(ctx, ins, job, owner, leaseUntil); err != nil {
 		return false, fmt.Errorf("metastore: lease ensure-row %s: %w", job, err)
 	}
 
 	upd := r.s.rebind(
 		`UPDATE monitor_job_locks SET owner = ?, lease_until = ?
-		 WHERE job_name = ? AND (owner = ? OR lease_until < ?)`)
+		 WHERE job_name = ? AND (owner = ? OR lease_until < ?)`,
+	)
 	res, err := r.s.execer(ctx).ExecContext(ctx, upd, owner, leaseUntil, job, owner, now)
 	if err != nil {
 		return false, fmt.Errorf("metastore: lease claim %s: %w", job, err)
@@ -99,11 +101,14 @@ func (r KnownTxRepo) SetArcadeStatus(ctx context.Context, txid, arcadeStatus str
 }
 
 // MarkSuspect moves a known tx into the suspect-failed grace window recording
-// everything the M4.2 reject reconciler will read back via FindSuspectFailed:
+// everything the reject reconciler will read back via FindSuspectFailed:
 // status = suspectFailed, suspect_since, the competing txids, and the arcade
-// wire status. This is the ASYNC-reject writer; unlike the synchronous 4xx path
-// it does NOT release the reserved inputs (that is the reconciler's job). It
-// leaves raw_tx / input_beef intact so the reconciler can re-verify.
+// wire status. It resets verified_rejected_at to NULL so the reconciler's
+// two-pass guard starts fresh for this suspect cycle (a stale stamp from an
+// earlier cycle must never let a re-suspected tx skip the second pass). This is
+// the ASYNC-reject writer; unlike the synchronous 4xx path it does NOT release
+// the reserved inputs (that is the reconciler's job). It leaves raw_tx /
+// input_beef intact so the reconciler can re-verify.
 func (r KnownTxRepo) MarkSuspect(ctx context.Context, txid string, suspectSince time.Time, competingTxs []string, arcadeStatus string) error {
 	raw, err := encTxID(txid)
 	if err != nil {
@@ -119,8 +124,10 @@ func (r KnownTxRepo) MarkSuspect(ctx context.Context, txid string, suspectSince 
 	}
 	q := r.s.rebind(
 		`UPDATE known_txs
-		 SET status = ?, arcade_status = ?, competing_txs = ?, suspect_since = ?, updated_at = ?
-		 WHERE txid = ?`)
+		 SET status = ?, arcade_status = ?, competing_txs = ?, suspect_since = ?,
+		     verified_rejected_at = NULL, updated_at = ?
+		 WHERE txid = ?`,
+	)
 	res, err := r.s.execer(ctx).ExecContext(ctx, q,
 		string(KnownTxStatusSuspectFailed), arcadeStatus, competing,
 		r.s.encTime(suspectSince), r.s.encTime(r.s.now()), raw)
@@ -150,7 +157,8 @@ func (r KnownTxRepo) ClearProof(ctx context.Context, txid string, newStatus wdk.
 		`UPDATE known_txs
 		 SET status = ?, arcade_status = NULL, block_height = NULL, block_hash = NULL,
 		     merkle_path = NULL, merkle_root = NULL, updated_at = ?
-		 WHERE txid = ?`)
+		 WHERE txid = ?`,
+	)
 	res, err := r.s.execer(ctx).ExecContext(ctx, q, string(newStatus), r.s.encTime(r.s.now()), raw)
 	if err != nil {
 		return fmt.Errorf("metastore: clear proof: %w", err)

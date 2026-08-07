@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// maxOutboxAttempts is the ceiling past which an outbox row is no longer
+// MaxOutboxAttempts is the ceiling past which an outbox row is no longer
 // handed out by FetchPending (it drops out of the pending partial index). It
-// matches the idx_utxo_ops_outbox_pending predicate (attempts < 10).
-const maxOutboxAttempts = 10
+// matches the idx_utxo_ops_outbox_pending predicate (attempts < 10). Exported so
+// the drain worker can report a row as parked once it crosses the ceiling.
+const MaxOutboxAttempts = 10
 
 // OutboxRepo is the crash-recovery outbox for utxostore operations that must be
 // replayed after a metadata-side commit (the durable half of the two-store
@@ -66,7 +67,7 @@ func (r OutboxRepo) FetchPending(ctx context.Context, limit int) ([]OutboxEntry,
 		 WHERE attempts < ?
 		 ORDER BY created_at ASC, op_type ASC, chunk ASC
 		 LIMIT ?` + r.s.forUpdateSkipLocked())
-	rows, err := r.s.execer(ctx).QueryContext(ctx, q, maxOutboxAttempts, limit)
+	rows, err := r.s.execer(ctx).QueryContext(ctx, q, MaxOutboxAttempts, limit)
 	if err != nil {
 		return nil, fmt.Errorf("metastore: outbox fetch: %w", err)
 	}
@@ -116,7 +117,7 @@ func (r OutboxRepo) RecordError(ctx context.Context, txid []byte, opType string,
 func (r OutboxRepo) CountPending(ctx context.Context) (int, error) {
 	q := r.s.rebind("SELECT COUNT(*) FROM utxo_ops_outbox WHERE attempts < ?")
 	var n int
-	if err := r.s.execer(ctx).QueryRowContext(ctx, q, maxOutboxAttempts).Scan(&n); err != nil {
+	if err := r.s.execer(ctx).QueryRowContext(ctx, q, MaxOutboxAttempts).Scan(&n); err != nil {
 		return 0, fmt.Errorf("metastore: outbox count: %w", err)
 	}
 	return n, nil

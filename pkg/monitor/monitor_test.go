@@ -87,6 +87,14 @@ func (m *mockStorage) AbortAbandoned(context.Context, time.Time, int) error     
 func (m *mockStorage) SynchronizeTransactionStatuses(context.Context, int) error { return nil }
 func (m *mockStorage) CheckProofs(context.Context, int) error                    { return nil }
 
+func (m *mockStorage) VerifyAndReleaseSuspects(context.Context, time.Duration, time.Duration, int) (defs.ReconcilerReport, error) {
+	return defs.ReconcilerReport{}, nil
+}
+
+func (m *mockStorage) DrainOutbox(context.Context, int) (defs.OutboxDrainReport, error) {
+	return defs.OutboxDrainReport{}, nil
+}
+
 func (m *mockStorage) DemoteReorgedProofs(_ context.Context, forkHeight uint32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

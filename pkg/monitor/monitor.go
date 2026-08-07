@@ -32,10 +32,11 @@ const (
 
 // limits holds the per-run row cap for each sweep task.
 type limits struct {
-	sendWaiting int
-	abort       int
-	sync        int
-	proof       int
+	sendWaiting   int
+	abort         int
+	sync          int
+	proof         int
+	rejectRelease int
 }
 
 // Daemon is the background monitor: a gocron scheduler running leased fallback
@@ -59,6 +60,8 @@ type Daemon struct {
 	now              func() time.Time
 	limits           limits
 	failAbandonedAge time.Duration
+	suspectGrace     time.Duration
+	maxQuarantine    time.Duration
 
 	startLock sync.Mutex
 	started   bool
@@ -94,8 +97,10 @@ func NewDaemon(
 		cfg:              cfg,
 		distributedLock:  true,
 		now:              time.Now,
-		limits:           limits{sendWaiting: defaultBatchLimit, abort: defaultBatchLimit, sync: defaultBatchLimit, proof: defaultBatchLimit},
+		limits:           limits{sendWaiting: defaultBatchLimit, abort: defaultBatchLimit, sync: defaultBatchLimit, proof: defaultBatchLimit, rejectRelease: defaultBatchLimit},
 		failAbandonedAge: defaultFailAbandonedAge,
+		suspectGrace:     cfg.Reconciler.SuspectGrace(),
+		maxQuarantine:    cfg.Reconciler.MaxQuarantine(),
 	}
 	for _, o := range opts {
 		o(d)
@@ -143,10 +148,6 @@ func (d *Daemon) Start(ctx context.Context, tasks map[defs.MonitorTask]defs.Task
 			return err
 		}
 	}
-
-	// TODO(M4.2): register the RejectReleaseReconciler task here once the
-	// verified-release reconciler (FindSuspectFailed → RemoveByMintTx / release)
-	// lands. ApplyStatusUpdate already writes exactly what it will read.
 
 	if d.oracle != nil {
 		d.wg.Add(1)
@@ -223,6 +224,11 @@ func (d *Daemon) taskRunner(ctx context.Context, name defs.MonitorTask) (func(),
 		// Repurposed as the status poll fallback (the arcade analog of the old
 		// "un-fail" re-verify sweep): re-poll stale non-terminal txs via GetTx.
 		run = func() error { return d.storage.SynchronizeTransactionStatuses(ctx, d.limits.sync) }
+	case defs.RejectReleaseMonitorTask:
+		// The reject→release reconciler. Each pass first drains the utxo-ops outbox
+		// (Mode B crash recovery for a release that crashed mid-inline-execute),
+		// then re-verifies and releases provably-dead suspects.
+		run = func() error { return d.runRejectRelease(ctx) }
 	default:
 		return nil, false
 	}
@@ -231,6 +237,35 @@ func (d *Daemon) taskRunner(ctx context.Context, name defs.MonitorTask) (func(),
 			d.logger.ErrorContext(ctx, "monitor task failed", slog.String("task", string(name)), slog.String("error", err.Error()))
 		}
 	}, true
+}
+
+// runRejectRelease runs one reject→release reconciler pass: drain the outbox
+// (heal any Mode B release that crashed mid-execute), then re-verify and release
+// provably-dead suspects. The report counters are logged as the reconciler's
+// metrics (reconciler_released_total / reconciler_false_positive_total /
+// reconciler_stuck_total). A drain error does not abort the reconcile.
+func (d *Daemon) runRejectRelease(ctx context.Context) error {
+	if drain, err := d.storage.DrainOutbox(ctx, d.limits.rejectRelease); err != nil {
+		d.logger.WarnContext(ctx, "reconciler: outbox drain failed", slog.String("error", err.Error()))
+	} else if drain.Drained > 0 || drain.Parked > 0 {
+		d.logger.InfoContext(ctx, "reconciler: outbox drained",
+			slog.Int("drained", drain.Drained), slog.Int("failed", drain.Failed), slog.Int("parked", drain.Parked))
+	}
+
+	report, err := d.storage.VerifyAndReleaseSuspects(ctx, d.suspectGrace, d.maxQuarantine, d.limits.rejectRelease)
+	if err != nil {
+		return err
+	}
+	if report.Scanned > 0 {
+		d.logger.InfoContext(ctx, "reconciler pass complete",
+			slog.Int("scanned", report.Scanned),
+			slog.Int("reconciler_released_total", report.Released),
+			slog.Int("reconciler_false_positive_total", report.FalsePositive),
+			slog.Int("reconciler_stuck_total", report.Stuck),
+			slog.Int("ambiguous", report.Ambiguous),
+			slog.Int("cascaded", report.Cascaded))
+	}
+	return nil
 }
 
 // handleTips tracks the chain-tip watermark from the tip stream. Best-effort

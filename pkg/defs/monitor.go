@@ -25,11 +25,18 @@ const (
 
 	// UnFailMonitorTask is a monitoring task that checks for failed transactions and reverifies failed tx statuses.
 	UnFailMonitorTask MonitorTask = "un_fail"
+
+	// RejectReleaseMonitorTask is the reject→release reconciler (Task 19): it
+	// re-verifies suspect-failed transactions against arcade and, only when one is
+	// provably dead, releases its inputs — the automatic, verified loop that
+	// replaces the old manual unfail. Each pass also drains the utxo-ops outbox
+	// (Mode B crash recovery) before scanning suspects.
+	RejectReleaseMonitorTask MonitorTask = "reject_release"
 )
 
 // ParseMonitorTaskStr parses a string to a MonitorTask or returns an error
 func ParseMonitorTaskStr(task string) (MonitorTask, error) {
-	return parseEnumCaseInsensitive(task, CheckForProofsMonitorTask, SendWaitingMonitorTask, FailAbandonedMonitorTask, UnFailMonitorTask)
+	return parseEnumCaseInsensitive(task, CheckForProofsMonitorTask, SendWaitingMonitorTask, FailAbandonedMonitorTask, UnFailMonitorTask, RejectReleaseMonitorTask)
 }
 
 // TaskConfig defines configuration parameters for a monitoring task
@@ -52,6 +59,7 @@ type TasksConfig struct {
 	SendWaiting    TaskConfig `mapstructure:"send_waiting"`
 	FailAbandoned  TaskConfig `mapstructure:"fail_abandoned"`
 	UnFail         TaskConfig `mapstructure:"un_fail"`
+	RejectRelease  TaskConfig `mapstructure:"reject_release"`
 }
 
 func (t *TasksConfig) all() iter.Seq2[MonitorTask, TaskConfig] {
@@ -122,9 +130,10 @@ type EventsConfig struct {
 
 // Monitor represents a monitoring system configuration with tasks
 type Monitor struct {
-	Enabled bool         `mapstructure:"enabled"`
-	Tasks   TasksConfig  `mapstructure:"tasks"`
-	Events  EventsConfig `mapstructure:"events"`
+	Enabled    bool             `mapstructure:"enabled"`
+	Tasks      TasksConfig      `mapstructure:"tasks"`
+	Events     EventsConfig     `mapstructure:"events"`
+	Reconciler ReconcilerConfig `mapstructure:"reconciler"`
 }
 
 // Validate verifies the monitor configuration, including its tasks.
@@ -157,6 +166,14 @@ func DefaultMonitorConfig() Monitor {
 				Enabled:         true,
 				IntervalSeconds: must.ConvertToUInt((10 * time.Minute).Seconds()),
 			},
+			RejectRelease: TaskConfig{
+				Enabled:         true,
+				IntervalSeconds: must.ConvertToUInt(DefaultRejectReleaseInterval.Seconds()),
+			},
+		},
+		Reconciler: ReconcilerConfig{
+			SuspectGraceSeconds:  must.ConvertToUInt(DefaultSuspectGrace.Seconds()),
+			MaxQuarantineSeconds: must.ConvertToUInt(DefaultMaxQuarantine.Seconds()),
 		},
 		Events: EventsConfig{
 			// Note: Disabled by default because it requires event listeners to be registered to avoid blocking.

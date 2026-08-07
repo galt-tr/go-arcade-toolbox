@@ -1,0 +1,892 @@
+package storage
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/transaction"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+)
+
+// This file is the reject→release reconciler (Task 19): the automatic, verified
+// loop that replaces the old manual `unfail`. Phase 1 (ApplyStatusUpdate, done
+// elsewhere) marks an async-rejected tx suspectFailed WITHOUT releasing its
+// inputs; this file is Phase 2 — a leased pass that re-verifies each suspect
+// against arcade and, ONLY when a tx is provably dead, releases its inputs back
+// to the claimable pool. Under the arcade async model a rejection can be a
+// transient false positive, so releasing eagerly risks resurrecting a still-live
+// input into a real double spend; the whole design is built around never doing
+// that.
+//
+// Safety cores:
+//
+//   - Two-pass false-positive guard (pure REJECTED): a suspect is released only
+//     after GetTx has returned REJECTED on TWO passes separated by the grace
+//     window (verified_rejected_at stamped on the first, checked on the second).
+//     A transient REJECTED that recovers in between is caught by the recovered
+//     branch and never released.
+//   - Double-spend winner rule (DOUBLE_SPEND_ATTEMPTED): inputs are released only
+//     once some competing tx is itself terminal-successful (MINED/IMMUTABLE) — i.e.
+//     our inputs are provably consumed by the winner. Inputs the winner consumed
+//     are left recorded as spent (out of the pool); only the inputs the winner did
+//     NOT take are released.
+//   - No-double-release: the terminal status flip is a positive CAS
+//     (suspectFailed → invalidTx/doubleSpend) so a crash re-run or a racing pass
+//     is refused; the release ops themselves are idempotent (Unspend's
+//     spent_by==txid guard, ReleaseOutpoints' reservation guard, RemoveByMintTx's
+//     already-gone skip), so even if two passes both got past the gate no input is
+//     released twice — and critically, an input another tx has since reclaimed is
+//     never stomped (Unspend's guard no longer matches it).
+//
+// Mode A (shared DB) applies the release atomically in one metastore.Do. Mode B
+// (split stores) writes the terminal statuses + enqueues the utxo ops to the
+// crash-recovery outbox in one Do, then inline-executes them; a crash between the
+// two is healed by DrainOutbox, which replays the pending rows idempotently.
+
+const (
+	// outbox op_type discriminators for the release path.
+	opUnspend       = "UNSPEND"        // release inputs recorded spent_by the dead tx
+	opReleaseResv   = "RELEASE"        // release inputs still reserved by the dead tx
+	opRemovePhantom = "REMOVE_PHANTOM" // remove inputs whose source tx is itself dead
+	opRemoveMinted  = "REMOVE_MINTED"  // remove the dead tx's phantom change + cascade
+)
+
+// errAlreadyHandled is returned internally by the release gate when the suspect
+// is no longer suspectFailed (a concurrent pass or crash re-run already
+// finalized it). It rolls back the gate's (empty) transaction and signals the
+// caller to treat the release as a no-op — the no-double-release short-circuit.
+var errAlreadyHandled = errors.New("storage: suspect already finalized")
+
+// txStatusesToFail are the pre-terminal transaction statuses a release CAS-flips
+// to failed. A suspect whose transaction is already failed (the synchronous 4xx
+// path did that) is tolerated as an idempotent skip.
+var txStatusesToFail = []wdk.TxStatus{
+	wdk.TxStatusUnproven, wdk.TxStatusSending, wdk.TxStatusUnprocessed, wdk.TxStatusNoSend,
+}
+
+// VerifyAndReleaseSuspects is the reconciler pass. It scans up to limit suspect-
+// failed known txs past the grace window (oldest first), re-verifies each against
+// the arcade oracle, and releases the inputs of the provably-dead ones. grace is
+// both the minimum age before a suspect is considered and the minimum separation
+// between the two rejected-verification passes; maxQuarantine is the age past
+// which an unresolved suspect is escalated to the terminal stuck state (never
+// auto-released). It returns a [defs.ReconcilerReport] of the pass's outcomes.
+//
+// It is idempotent and safe to re-run (a crashed pass re-runs cleanly), and is
+// meant to be driven by the monitor's leased reject_release task (exactly one
+// instance at a time).
+func (p *Provider) VerifyAndReleaseSuspects(ctx context.Context, grace, maxQuarantine time.Duration, limit int) (defs.ReconcilerReport, error) {
+	if limit <= 0 {
+		limit = defaultMonitorBatchLimit
+	}
+	var report defs.ReconcilerReport
+	if p.oracle == nil {
+		return report, fmt.Errorf("storage: reconciler requires an arcade oracle")
+	}
+
+	suspects, err := p.meta.KnownTx().FindSuspectFailed(ctx, grace, limit)
+	if err != nil {
+		return report, fmt.Errorf("storage: find suspect failed: %w", err)
+	}
+	for i := range suspects {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		report.Scanned++
+		sub, serr := p.reconcileSuspect(ctx, &suspects[i], grace, maxQuarantine)
+		if serr != nil {
+			// One suspect's failure never aborts the pass; the next pass retries it.
+			p.logger.WarnContext(ctx, "reconciler: suspect reconcile failed",
+				slog.String("txid", suspects[i].TxID), slog.String("error", serr.Error()))
+			continue
+		}
+		report.Add(sub)
+	}
+	return report, nil
+}
+
+// reconcileSuspect re-verifies one suspect and branches per the design. It
+// returns a single-suspect report (the counters it incremented). Every branch
+// builds its report by value, so there is no shared accumulator to alias.
+func (p *Provider) reconcileSuspect(ctx context.Context, kt *metastore.KnownTx, grace, maxQuarantine time.Duration) (defs.ReconcilerReport, error) {
+	txid := kt.TxID
+
+	rec, err := p.oracle.GetTx(ctx, txid)
+	switch {
+	case errors.Is(err, arcade.ErrTxNotFound):
+		// Arcade has no verdict: indistinguishable from propagation lag or a
+		// genuinely-gone tx. SAFE: leave suspect; escalate only past quarantine.
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "not_found")
+	case err != nil:
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "getx_error")
+	case rec == nil:
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "nil_record")
+	}
+	if rec.TxID == "" {
+		rec.TxID = txid
+	}
+
+	switch {
+	case isRecovered(rec.Status):
+		return p.handleRecovered(ctx, kt, rec)
+	case rec.Status == arcade.StatusRejected:
+		return p.handleRejected(ctx, kt, grace)
+	case rec.Status == arcade.StatusDoubleSpendAttempted:
+		return p.handleDoubleSpend(ctx, kt, rec, maxQuarantine)
+	default:
+		// PENDING_RETRY / RECEIVED / SENT_TO_NETWORK / STUMP_PROCESSING / UNKNOWN /
+		// any future non-terminal status: still ambiguous, re-check next pass.
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, string(rec.Status))
+	}
+}
+
+// isRecovered reports whether an arcade status means the suspect actually made
+// it onto the network after all (a false positive) — a broadcast-accepted or
+// mined state.
+func isRecovered(s arcade.Status) bool {
+	switch s {
+	case arcade.StatusSeenOnNetwork, arcade.StatusSeenMultipleNodes,
+		arcade.StatusAcceptedByNetwork, arcade.StatusMined, arcade.StatusImmutable:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleRecovered clears the quarantine hold and routes the recovered record
+// back through the normal lifecycle (ApplyStatusUpdate) — a MINED gets its
+// header-verified proof, a SEEN goes unproven. Nothing was ever released.
+func (p *Provider) handleRecovered(ctx context.Context, kt *metastore.KnownTx, rec *arcade.TxRecord) (defs.ReconcilerReport, error) {
+	// Unfreeze BEFORE routing: applySeen/applyMined only Promote the change
+	// (which leaves a frozen coin frozen and invisible to claims), so the hold
+	// must be lifted here for the recovered change to become spendable again.
+	p.unfreezeChange(ctx, kt.TxID)
+	if err := p.ApplyStatusUpdate(ctx, *rec); err != nil {
+		return defs.ReconcilerReport{}, fmt.Errorf("storage: reconciler route recovered %s: %w", kt.TxID, err)
+	}
+	p.logger.InfoContext(ctx, "reconciler: suspect recovered (false positive), no release",
+		slog.String("txid", kt.TxID), slog.String("status", string(rec.Status)))
+	return defs.ReconcilerReport{FalsePositive: 1}, nil
+}
+
+// handleRejected runs the two-pass false-positive guard for a still-REJECTED
+// suspect. Pass 1 (no prior stamp) records verified_rejected_at and freezes the
+// change; pass 2 (stamp older than grace) releases. In between it stays suspect.
+func (p *Provider) handleRejected(ctx context.Context, kt *metastore.KnownTx, grace time.Duration) (defs.ReconcilerReport, error) {
+	switch {
+	case kt.VerifiedRejectedAt == nil:
+		// Pass 1: first authoritative REJECTED re-verification.
+		if err := p.meta.KnownTx().StampVerifiedRejected(ctx, kt.TxID, p.now()); err != nil {
+			return defs.ReconcilerReport{}, err
+		}
+		p.freezeChange(ctx, kt.TxID)
+		p.logger.DebugContext(ctx, "reconciler: rejected pass 1, stamped verified_rejected_at",
+			slog.String("txid", kt.TxID))
+		return defs.ReconcilerReport{Ambiguous: 1}, nil
+	case p.now().Sub(*kt.VerifiedRejectedAt) >= grace:
+		// Pass 2: still rejected after the grace separation — provably dead.
+		inputs, err := p.txInputs(kt)
+		if err != nil {
+			return defs.ReconcilerReport{}, err
+		}
+		plan := p.buildReleasePlan(ctx, kt, wdk.ProvenTxStatusInvalid, inputs)
+		cascaded, released, err := p.releaseVerifiedDead(ctx, plan)
+		if err != nil {
+			return defs.ReconcilerReport{}, err
+		}
+		if !released {
+			return defs.ReconcilerReport{}, nil // already finalized (no-double-release)
+		}
+		p.logger.InfoContext(ctx, "reconciler: released provably-dead rejected tx",
+			slog.String("txid", kt.TxID), slog.Int("inputs", len(inputs)), slog.Int("cascaded", cascaded))
+		return defs.ReconcilerReport{Released: 1, Cascaded: cascaded}, nil
+	default:
+		// Stamped, but the two passes are not yet grace apart: wait.
+		p.freezeChange(ctx, kt.TxID)
+		return defs.ReconcilerReport{Ambiguous: 1}, nil
+	}
+}
+
+// handleDoubleSpend applies the winner rule for a DOUBLE_SPEND_ATTEMPTED suspect.
+// It releases inputs only once some competing tx is provably terminal-successful,
+// and then releases only the inputs the winner did NOT consume. With no winner
+// yet it stays suspect (escalating past quarantine).
+func (p *Provider) handleDoubleSpend(ctx context.Context, kt *metastore.KnownTx, rec *arcade.TxRecord, maxQuarantine time.Duration) (defs.ReconcilerReport, error) {
+	winnerInputs, found := p.findWinnerInputs(ctx, rec.CompetingTxs)
+	if !found {
+		// No competitor has won (or a winner whose inputs we cannot read): SAFE —
+		// never release on ambiguity. Freeze and wait; escalate past quarantine.
+		p.freezeChange(ctx, kt.TxID)
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "double_spend_no_winner")
+	}
+
+	allInputs, err := p.txInputs(kt)
+	if err != nil {
+		return defs.ReconcilerReport{}, err
+	}
+	// Release only the inputs the winner did NOT take. Winner-consumed inputs are
+	// left recorded as spent (they are genuinely gone to the winner) — excluding
+	// them from the release set keeps them out of the claimable pool.
+	var releaseInputs []utxostore.Outpoint
+	winnerTaken := 0
+	for _, op := range allInputs {
+		if winnerInputs[op] {
+			winnerTaken++
+			continue
+		}
+		releaseInputs = append(releaseInputs, op)
+	}
+
+	plan := p.buildReleasePlan(ctx, kt, wdk.ProvenTxStatusDoubleSpend, releaseInputs)
+	cascaded, released, err := p.releaseVerifiedDead(ctx, plan)
+	if err != nil {
+		return defs.ReconcilerReport{}, err
+	}
+	if !released {
+		return defs.ReconcilerReport{}, nil // already finalized (no-double-release)
+	}
+	p.logger.InfoContext(ctx, "reconciler: released double-spent tx (winner confirmed)",
+		slog.String("txid", kt.TxID),
+		slog.Int("releasedInputs", len(releaseInputs)),
+		slog.Int("winnerConsumed", winnerTaken),
+		slog.Int("cascaded", cascaded))
+	return defs.ReconcilerReport{Released: 1, Cascaded: cascaded}, nil
+}
+
+// leaveOrEscalate leaves an unresolved suspect for the next pass, unless it has
+// sat past maxQuarantine, in which case it is escalated to the terminal stuck
+// state (operator-visible, never auto-released).
+func (p *Provider) leaveOrEscalate(ctx context.Context, kt *metastore.KnownTx, maxQuarantine time.Duration, reason string) (defs.ReconcilerReport, error) {
+	if kt.SuspectSince != nil && p.now().Sub(*kt.SuspectSince) >= maxQuarantine {
+		if err := p.escalateStuck(ctx, kt.TxID); err != nil {
+			if errors.Is(err, metastore.ErrStatusUpdateSkipped) || errors.Is(err, metastore.ErrNotFound) {
+				return defs.ReconcilerReport{}, nil // already finalized/vanished
+			}
+			return defs.ReconcilerReport{}, err
+		}
+		p.logger.WarnContext(ctx, "reconciler: suspect escalated to stuck (max quarantine, never auto-released)",
+			slog.String("txid", kt.TxID), slog.String("reason", reason))
+		return defs.ReconcilerReport{Stuck: 1}, nil
+	}
+	p.logger.DebugContext(ctx, "reconciler: suspect left in quarantine",
+		slog.String("txid", kt.TxID), slog.String("reason", reason))
+	return defs.ReconcilerReport{Ambiguous: 1}, nil
+}
+
+// failTransactions CAS-flips a tx's pre-terminal transaction rows to failed,
+// tolerating an already-failed row (the synchronous 4xx path already failed it)
+// as a benign skip. Shared by the release finalizer and the stuck escalation.
+func (p *Provider) failTransactions(ctx context.Context, txid string) error {
+	if err := p.meta.Transactions().UpdateStatusByTxID(ctx, txid, wdk.TxStatusFailed, txStatusesToFail...); err != nil &&
+		!errors.Is(err, metastore.ErrStatusUpdateSkipped) {
+		return fmt.Errorf("storage: mark tx failed %s: %w", txid, err)
+	}
+	return nil
+}
+
+// escalateStuck flips a suspect to the terminal stuck known-tx status and fails
+// its transaction rows. It NEVER touches the inputs.
+func (p *Provider) escalateStuck(ctx context.Context, txid string) error {
+	return p.meta.Do(ctx, func(ctx context.Context) error {
+		if err := p.meta.KnownTx().TransitionSuspect(ctx, txid, metastore.KnownTxStatusStuck); err != nil {
+			return err
+		}
+		return p.failTransactions(ctx, txid)
+	})
+}
+
+// --- release plan ----------------------------------------------------------
+
+// refUser pairs a transaction's reservation token with its owner.
+type refUser struct {
+	reference string
+	userID    int
+}
+
+// releasePlan is everything the release path needs, gathered once outside the
+// write transaction. The inputs to release are partitioned:
+//
+//   - realInputs: coins whose SOURCE tx is not (yet) known-dead — returned to
+//     the claimable pool (funding coins that genuinely predate the dead tx).
+//   - phantomInputs: coins whose SOURCE tx is itself terminal-dead (invalidTx /
+//     doubleSpend / stuck) — these coins never existed on-chain, so they are
+//     REMOVED from inventory, never resurrected into Claimable. This is the
+//     multi-hop-cascade case (a dead parent's change spent by a now-dying child)
+//     and restores the old MarkCreatedOutputsAsNotSpendable "remove phantom
+//     change" invariant.
+type releasePlan struct {
+	txid          string
+	spendingTxID  chainhash.Hash
+	terminalKnown wdk.ProvenTxReqStatus
+	refs          []refUser
+	realInputs    []utxostore.Outpoint
+	phantomInputs []utxostore.Outpoint
+	changeOps     []utxostore.Outpoint
+}
+
+// buildReleasePlan assembles the plan for a provably-dead suspect: the inputs to
+// release (partitioned real vs. phantom), the change to remove, and the
+// references whose reservations to lift.
+func (p *Provider) buildReleasePlan(ctx context.Context, kt *metastore.KnownTx, terminal wdk.ProvenTxReqStatus, releaseInputs []utxostore.Outpoint) releasePlan {
+	plan := releasePlan{txid: kt.TxID, terminalKnown: terminal}
+	if h, err := chainhash.NewHashFromHex(kt.TxID); err == nil {
+		plan.spendingTxID = *h
+	}
+	if rows, err := p.meta.Transactions().FindByTxIDAllUsers(ctx, kt.TxID); err == nil {
+		for i := range rows {
+			plan.refs = append(plan.refs, refUser{reference: string(rows[i].Reference), userID: rows[i].UserID})
+		}
+	}
+	for _, op := range releaseInputs {
+		if p.sourceTxDead(ctx, op) {
+			plan.phantomInputs = append(plan.phantomInputs, op)
+		} else {
+			plan.realInputs = append(plan.realInputs, op)
+		}
+	}
+	if ops, err := p.changeOutpointsByTxID(ctx, kt.TxID); err == nil {
+		plan.changeOps = ops
+	}
+	return plan
+}
+
+// sourceTxDead reports whether an input's SOURCE transaction is itself a known
+// terminal-dead tx (invalidTx / doubleSpend / stuck). Such a coin is phantom —
+// created by a tx that provably never confirmed — so on release it must be
+// REMOVED from inventory, not returned to the claimable pool. A source that is
+// merely still-suspect (not yet terminal) is treated as real for now; if it
+// later dies, its own release/cascade cleans up any coins it created.
+func (p *Provider) sourceTxDead(ctx context.Context, op utxostore.Outpoint) bool {
+	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, op.TxID.String())
+	if err != nil || !found {
+		return false
+	}
+	return kt.Status.IsTerminalFailure() || kt.Status == metastore.KnownTxStatusStuck
+}
+
+// releaseVerifiedDead applies a release plan. It returns the number of descendant
+// txs cascaded into the suspect queue and whether the release actually ran (false
+// when the suspect was already finalized — the no-double-release short-circuit).
+func (p *Provider) releaseVerifiedDead(ctx context.Context, plan releasePlan) (cascaded int, released bool, err error) {
+	if p.modeA {
+		return p.releaseDirect(ctx, plan)
+	}
+	return p.releaseViaOutbox(ctx, plan)
+}
+
+// releaseDirect (Mode A) flips the statuses and applies every utxo op inside a
+// single metastore.Do — atomic across both stores over the shared database.
+func (p *Provider) releaseDirect(ctx context.Context, plan releasePlan) (cascaded int, released bool, err error) {
+	err = p.meta.Do(ctx, func(ctx context.Context) error {
+		if gerr := p.gateAndFinalizeStatuses(ctx, plan); gerr != nil {
+			return gerr
+		}
+		c, aerr := p.applyReleaseOpsDirect(ctx, plan)
+		cascaded = c
+		return aerr
+	})
+	if errors.Is(err, errAlreadyHandled) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return cascaded, true, nil
+}
+
+// releaseViaOutbox (Mode B) commits the terminal statuses and durably enqueues
+// the utxo ops in one Do, then inline-executes them. A crash between the commit
+// and the inline execution is healed by DrainOutbox replaying the pending rows.
+func (p *Provider) releaseViaOutbox(ctx context.Context, plan releasePlan) (cascaded int, released bool, err error) {
+	rawTxid, herr := encodeTxidToRaw(plan.txid)
+	if herr != nil {
+		return 0, false, herr
+	}
+	ops := plan.outboxOps()
+
+	// Phase 1: durable intent (statuses + enqueue), atomic on the metadata side.
+	err = p.meta.Do(ctx, func(ctx context.Context) error {
+		if gerr := p.gateAndFinalizeStatuses(ctx, plan); gerr != nil {
+			return gerr
+		}
+		for _, op := range ops {
+			if eerr := p.meta.Outbox().Enqueue(ctx, rawTxid, op.opType, op.chunk, op.payload); eerr != nil {
+				return eerr
+			}
+		}
+		return nil
+	})
+	if errors.Is(err, errAlreadyHandled) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+
+	// Phase 2: inline execute (best-effort; the drain worker heals any that fail).
+	_ = p.meta.Do(ctx, func(ctx context.Context) error {
+		for _, op := range ops {
+			c, xerr := p.executeOutboxOp(ctx, metastore.OutboxEntry{TxID: rawTxid, OpType: op.opType, Chunk: op.chunk, Payload: op.payload})
+			if xerr != nil {
+				_ = p.meta.Outbox().RecordError(ctx, rawTxid, op.opType, op.chunk, xerr.Error())
+				p.logger.WarnContext(ctx, "reconciler: inline outbox op failed, left for drain worker",
+					slog.String("txid", plan.txid), slog.String("op", op.opType), slog.String("error", xerr.Error()))
+				continue
+			}
+			cascaded += c
+			if derr := p.meta.Outbox().MarkDone(ctx, rawTxid, op.opType, op.chunk); derr != nil {
+				return derr
+			}
+		}
+		return nil
+	})
+	return cascaded, true, nil
+}
+
+// gateAndFinalizeStatuses is the no-double-release gate plus the terminal status
+// flips. The known-tx CAS (suspectFailed → terminal) is the arbiter: a second
+// entry finds a non-suspect row and returns errAlreadyHandled.
+func (p *Provider) gateAndFinalizeStatuses(ctx context.Context, plan releasePlan) error {
+	if err := p.meta.KnownTx().TransitionSuspect(ctx, plan.txid, plan.terminalKnown); err != nil {
+		if errors.Is(err, metastore.ErrStatusUpdateSkipped) || errors.Is(err, metastore.ErrNotFound) {
+			return errAlreadyHandled
+		}
+		return fmt.Errorf("storage: release gate %s: %w", plan.txid, err)
+	}
+	return p.failTransactions(ctx, plan.txid)
+}
+
+// applyReleaseOpsDirect applies the utxo half of a release directly (Mode A, in
+// the ambient transaction). Every op is idempotent.
+func (p *Provider) applyReleaseOpsDirect(ctx context.Context, plan releasePlan) (cascaded int, err error) {
+	if err = p.doUnspend(ctx, plan.spendingTxID, plan.realInputs); err != nil {
+		return 0, err
+	}
+	for _, r := range plan.refs {
+		if err = p.doReleaseOutpoints(ctx, r.reference, plan.realInputs); err != nil {
+			return 0, err
+		}
+	}
+	if err = p.doRemovePhantom(ctx, plan.phantomInputs); err != nil {
+		return 0, err
+	}
+	return p.doRemoveMinted(ctx, plan.spendingTxID, plan.changeOps)
+}
+
+// --- utxo op primitives (shared by direct + outbox execution) --------------
+
+func (p *Provider) doUnspend(ctx context.Context, spendingTxID chainhash.Hash, ops []utxostore.Outpoint) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	if _, err := p.utxo.Unspend(ctx, spendingTxID, ops); err != nil {
+		return fmt.Errorf("storage: unspend inputs: %w", err)
+	}
+	// A released input must return FULLY to the claimable pool. When the input
+	// was itself a parent suspect's change (the cascade case), the parent's
+	// quarantine freeze is still on it — Unspend clears spent+reserved but not the
+	// hold — so lift it here (idempotent; a NotFound/not-frozen op is a no-op).
+	if err := p.utxo.Unfreeze(ctx, ops); err != nil && !errors.Is(err, &utxostore.NotFoundError{}) {
+		p.logger.DebugContext(ctx, "reconciler: unfreeze released inputs (best-effort)",
+			slog.String("error", err.Error()))
+	}
+	return nil
+}
+
+func (p *Provider) doReleaseOutpoints(ctx context.Context, reservation string, ops []utxostore.Outpoint) error {
+	if reservation == "" || len(ops) == 0 {
+		return nil
+	}
+	if err := p.utxo.ReleaseOutpoints(ctx, reservation, ops); err != nil {
+		return fmt.Errorf("storage: release outpoints: %w", err)
+	}
+	return nil
+}
+
+// doRemovePhantom force-removes inputs whose source tx is itself terminal-dead:
+// their coins never existed on-chain, so they must leave inventory rather than
+// return to the claimable pool. force=true so a currently-spent (spent_by the
+// dying tx) or frozen phantom coin is still removed; a missing coin is an
+// idempotent no-op.
+func (p *Provider) doRemovePhantom(ctx context.Context, ops []utxostore.Outpoint) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	if err := p.utxo.Remove(ctx, ops, true); err != nil {
+		return fmt.Errorf("storage: remove phantom inputs: %w", err)
+	}
+	return nil
+}
+
+// doRemoveMinted removes the dead tx's phantom change and cascades: any child tx
+// that had spent that change is re-marked suspect so the next pass re-verifies
+// it (the iterative cascade that converges without a conflicting-children graph).
+func (p *Provider) doRemoveMinted(ctx context.Context, mintTxID chainhash.Hash, ops []utxostore.Outpoint) (cascaded int, err error) {
+	if len(ops) == 0 {
+		return 0, nil
+	}
+	report, err := p.utxo.RemoveByMintTx(ctx, mintTxID, ops)
+	if err != nil {
+		return 0, fmt.Errorf("storage: remove minted change: %w", err)
+	}
+	return p.cascadeChildren(ctx, report.AlreadySpentBy)
+}
+
+// cascadeChildren re-marks each child tx (that spent a now-removed phantom
+// change coin) suspect, unless it is already terminal or proven — never
+// clobbering a completed tx. Returns how many it (re-)marked.
+func (p *Provider) cascadeChildren(ctx context.Context, children []chainhash.Hash) (int, error) {
+	n := 0
+	for i := range children {
+		childTxid := children[i].String()
+		kt, found, err := p.meta.KnownTx().FindByTxID(ctx, childTxid)
+		if err != nil {
+			return n, fmt.Errorf("storage: cascade load child %s: %w", childTxid, err)
+		}
+		if !found {
+			continue // not ours / arcade-only
+		}
+		switch kt.Status {
+		case wdk.ProvenTxStatusCompleted, metastore.KnownTxStatusSuspectFailed, metastore.KnownTxStatusStuck:
+			continue // proven, already queued, or already terminal-stuck
+		}
+		if kt.Status.IsTerminalFailure() {
+			continue // already invalidTx/doubleSpend
+		}
+		if err := p.meta.KnownTx().MarkSuspect(ctx, childTxid, p.now(), nil, "cascade"); err != nil &&
+			!errors.Is(err, metastore.ErrNotFound) {
+			return n, fmt.Errorf("storage: cascade mark child suspect %s: %w", childTxid, err)
+		}
+		n++
+	}
+	return n, nil
+}
+
+// --- outbox executor + drain worker ----------------------------------------
+
+// outboxOp is one enqueued release op, pre-serialized.
+type outboxOp struct {
+	opType  string
+	chunk   int
+	payload []byte
+}
+
+// outboxOps serializes a plan into its outbox ops (Mode B). Empty sub-ops are
+// skipped so the outbox only carries work that exists.
+func (plan releasePlan) outboxOps() []outboxOp {
+	var ops []outboxOp
+	if len(plan.realInputs) > 0 {
+		ops = append(ops, outboxOp{opType: opUnspend, payload: mustJSON(unspendPayload{
+			SpendingTxID: plan.spendingTxID.String(),
+			Ops:          encodeOutpoints(plan.realInputs),
+		})})
+		for i, r := range plan.refs {
+			ops = append(ops, outboxOp{opType: opReleaseResv, chunk: i, payload: mustJSON(releasePayload{
+				Reservation: r.reference,
+				Ops:         encodeOutpoints(plan.realInputs),
+			})})
+		}
+	}
+	if len(plan.phantomInputs) > 0 {
+		ops = append(ops, outboxOp{opType: opRemovePhantom, payload: mustJSON(removePhantomPayload{
+			Ops: encodeOutpoints(plan.phantomInputs),
+		})})
+	}
+	if len(plan.changeOps) > 0 {
+		ops = append(ops, outboxOp{opType: opRemoveMinted, payload: mustJSON(removeMintedPayload{
+			MintTxID: plan.spendingTxID.String(),
+			Ops:      encodeOutpoints(plan.changeOps),
+		})})
+	}
+	return ops
+}
+
+type unspendPayload struct {
+	SpendingTxID string   `json:"spendingTxId"`
+	Ops          []string `json:"ops"`
+}
+type releasePayload struct {
+	Reservation string   `json:"reservation"`
+	Ops         []string `json:"ops"`
+}
+type removePhantomPayload struct {
+	Ops []string `json:"ops"`
+}
+type removeMintedPayload struct {
+	MintTxID string   `json:"mintTxId"`
+	Ops      []string `json:"ops"`
+}
+
+// DrainOutbox replays pending utxo_ops_outbox rows against the utxostore, oldest
+// first, idempotently — the Mode B crash-recovery half of the release. Each op
+// that succeeds is MarkDone-d; each that fails has its attempt counter bumped and
+// is left for a later pass, parking once it crosses the attempts ceiling. It is a
+// no-op in Mode A (that path never enqueues). Fetch + execute + mark share one
+// transaction so the SKIP-LOCKED row locks are held across the batch.
+func (p *Provider) DrainOutbox(ctx context.Context, limit int) (defs.OutboxDrainReport, error) {
+	if limit <= 0 {
+		limit = defaultMonitorBatchLimit
+	}
+	var rep defs.OutboxDrainReport
+	err := p.meta.Do(ctx, func(ctx context.Context) error {
+		pending, err := p.meta.Outbox().FetchPending(ctx, limit)
+		if err != nil {
+			return err
+		}
+		for i := range pending {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			e := pending[i]
+			if _, xerr := p.executeOutboxOp(ctx, e); xerr != nil {
+				if rerr := p.meta.Outbox().RecordError(ctx, e.TxID, e.OpType, e.Chunk, xerr.Error()); rerr != nil {
+					return rerr
+				}
+				rep.Failed++
+				if e.Attempts+1 >= metastore.MaxOutboxAttempts {
+					rep.Parked++
+				}
+				continue
+			}
+			if derr := p.meta.Outbox().MarkDone(ctx, e.TxID, e.OpType, e.Chunk); derr != nil {
+				return derr
+			}
+			rep.Drained++
+		}
+		return nil
+	})
+	if err != nil {
+		return rep, fmt.Errorf("storage: drain outbox: %w", err)
+	}
+	return rep, nil
+}
+
+// executeOutboxOp applies one outbox op idempotently against the utxostore (and,
+// for REMOVE_MINTED, cascades children in the ambient metadata transaction). It
+// returns the number of children cascaded. Shared by the inline Mode B release
+// and the background drain worker so both heal identically.
+func (p *Provider) executeOutboxOp(ctx context.Context, e metastore.OutboxEntry) (cascaded int, err error) {
+	switch e.OpType {
+	case opUnspend:
+		var pl unspendPayload
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			return 0, fmt.Errorf("storage: decode unspend op: %w", err)
+		}
+		spendingTxID, herr := chainhash.NewHashFromHex(pl.SpendingTxID)
+		if herr != nil {
+			return 0, fmt.Errorf("storage: decode unspend spendingTxId: %w", herr)
+		}
+		ops, derr := decodeOutpoints(pl.Ops)
+		if derr != nil {
+			return 0, derr
+		}
+		return 0, p.doUnspend(ctx, *spendingTxID, ops)
+	case opReleaseResv:
+		var pl releasePayload
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			return 0, fmt.Errorf("storage: decode release op: %w", err)
+		}
+		ops, derr := decodeOutpoints(pl.Ops)
+		if derr != nil {
+			return 0, derr
+		}
+		return 0, p.doReleaseOutpoints(ctx, pl.Reservation, ops)
+	case opRemovePhantom:
+		var pl removePhantomPayload
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			return 0, fmt.Errorf("storage: decode remove-phantom op: %w", err)
+		}
+		ops, derr := decodeOutpoints(pl.Ops)
+		if derr != nil {
+			return 0, derr
+		}
+		return 0, p.doRemovePhantom(ctx, ops)
+	case opRemoveMinted:
+		var pl removeMintedPayload
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			return 0, fmt.Errorf("storage: decode remove-minted op: %w", err)
+		}
+		mintTxID, herr := chainhash.NewHashFromHex(pl.MintTxID)
+		if herr != nil {
+			return 0, fmt.Errorf("storage: decode remove-minted mintTxId: %w", herr)
+		}
+		ops, derr := decodeOutpoints(pl.Ops)
+		if derr != nil {
+			return 0, derr
+		}
+		return p.doRemoveMinted(ctx, *mintTxID, ops)
+	default:
+		return 0, fmt.Errorf("storage: unknown outbox op type %q", e.OpType)
+	}
+}
+
+// --- winner rule + input parsing -------------------------------------------
+
+// findWinnerInputs unions the inputs consumed by EVERY competing tx that is
+// itself terminal-successful (MINED/IMMUTABLE) with a readable raw tx, and
+// returns that union. found is true when at least one competitor has provably
+// won AND the consumption set of every confirmed winner is known.
+//
+// Unioning ALL winners is load-bearing, not an optimization: two competitors can
+// each mine a DISJOINT subset of our inputs (they conflict with us but not with
+// each other) — e.g. our tx spends {X,Y}, c1 mines {X}, c2 mines {Y}. Stopping
+// at the first winner would leave the other winner's input outside the consumed
+// set and release it back to Claimable, resurrecting a coin provably spent
+// on-chain. Only an input taken by NONE of the confirmed winners is safe to
+// release.
+//
+// If ANY confirmed winner's inputs are unreadable (missing or unparseable
+// rawTx) we cannot prove which of our inputs it consumed, so no input can be
+// proven safe: DEFER the whole release (return found=false → the suspect is left
+// for a later pass / eventually stuck). This is the SAFE choice — never release
+// on an unknown winner consumption set.
+func (p *Provider) findWinnerInputs(ctx context.Context, competingTxs []string) (map[utxostore.Outpoint]bool, bool) {
+	consumed := make(map[utxostore.Outpoint]bool)
+	anyWinner := false
+	for _, competitor := range competingTxs {
+		if competitor == "" {
+			continue
+		}
+		crec, err := p.oracle.GetTx(ctx, competitor)
+		if err != nil || crec == nil {
+			continue
+		}
+		if crec.Status != arcade.StatusMined && crec.Status != arcade.StatusImmutable {
+			continue // not a winner yet
+		}
+		// A confirmed winner: its consumption set MUST be known, or we cannot prove
+		// any input safe to release — defer the entire release.
+		if len(crec.RawTx) == 0 {
+			p.logger.DebugContext(ctx, "reconciler: winner confirmed but rawTx unavailable; deferring release",
+				slog.String("winner", competitor))
+			return nil, false
+		}
+		wtx, perr := transaction.NewTransactionFromBytes(crec.RawTx)
+		if perr != nil {
+			p.logger.DebugContext(ctx, "reconciler: winner rawTx unparseable; deferring release",
+				slog.String("winner", competitor), slog.String("error", perr.Error()))
+			return nil, false
+		}
+		anyWinner = true
+		for _, in := range wtx.Inputs {
+			if in.SourceTXID == nil {
+				continue
+			}
+			consumed[utxostore.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex}] = true
+		}
+	}
+	return consumed, anyWinner
+}
+
+// txInputs parses the suspect's retained raw tx into its input outpoints. An
+// absent raw tx yields no inputs (nothing to release via Unspend/ReleaseOutpoints)
+// — logged, not an error.
+func (p *Provider) txInputs(kt *metastore.KnownTx) ([]utxostore.Outpoint, error) {
+	if len(kt.RawTx) == 0 {
+		p.logger.Warn("reconciler: suspect has no retained raw tx; cannot enumerate inputs to release",
+			slog.String("txid", kt.TxID))
+		return nil, nil
+	}
+	tx, err := transaction.NewTransactionFromBytes(kt.RawTx)
+	if err != nil {
+		return nil, fmt.Errorf("storage: parse suspect raw tx %s: %w", kt.TxID, err)
+	}
+	ops := make([]utxostore.Outpoint, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		if in.SourceTXID == nil {
+			continue
+		}
+		ops = append(ops, utxostore.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex})
+	}
+	return ops, nil
+}
+
+// --- freeze holds ----------------------------------------------------------
+
+// freezeChange places a reversible hold on a confirmed-bad suspect's change so
+// no new funding selects a coin that is about to be removed. Best-effort: a
+// missing coin (no change, or already removed) is not an error.
+func (p *Provider) freezeChange(ctx context.Context, txid string) {
+	ops, err := p.changeOutpointsByTxID(ctx, txid)
+	if err != nil || len(ops) == 0 {
+		return
+	}
+	if err := p.utxo.Freeze(ctx, ops); err != nil {
+		p.logger.DebugContext(ctx, "reconciler: freeze change (best-effort) failed",
+			slog.String("txid", txid), slog.String("error", err.Error()))
+	}
+}
+
+// unfreezeChange lifts the freezeChange hold (recovered branch).
+func (p *Provider) unfreezeChange(ctx context.Context, txid string) {
+	ops, err := p.changeOutpointsByTxID(ctx, txid)
+	if err != nil || len(ops) == 0 {
+		return
+	}
+	if err := p.utxo.Unfreeze(ctx, ops); err != nil {
+		p.logger.DebugContext(ctx, "reconciler: unfreeze change (best-effort) failed",
+			slog.String("txid", txid), slog.String("error", err.Error()))
+	}
+}
+
+// --- small codecs ----------------------------------------------------------
+
+func encodeOutpoints(ops []utxostore.Outpoint) []string {
+	out := make([]string, len(ops))
+	for i, op := range ops {
+		out[i] = op.String()
+	}
+	return out
+}
+
+func decodeOutpoints(ss []string) ([]utxostore.Outpoint, error) {
+	out := make([]utxostore.Outpoint, 0, len(ss))
+	for _, s := range ss {
+		idx := strings.LastIndex(s, ":")
+		if idx < 0 {
+			return nil, fmt.Errorf("storage: bad outpoint %q", s)
+		}
+		h, err := chainhash.NewHashFromHex(s[:idx])
+		if err != nil {
+			return nil, fmt.Errorf("storage: bad outpoint txid %q: %w", s, err)
+		}
+		vout, err := strconv.ParseUint(s[idx+1:], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("storage: bad outpoint vout %q: %w", s, err)
+		}
+		out = append(out, utxostore.Outpoint{TxID: *h, Vout: uint32(vout)})
+	}
+	return out, nil
+}
+
+func encodeTxidToRaw(txid string) ([]byte, error) {
+	// Match the metastore's txid encoding (a plain hex decode of the display
+	// string) so the outbox PK txid equals the known_txs txid byte-for-byte.
+	b, err := hex.DecodeString(txid)
+	if err != nil {
+		return nil, fmt.Errorf("storage: decode txid %s: %w", txid, err)
+	}
+	return b, nil
+}
+
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// The payloads are all plain structs of strings; marshal cannot fail.
+		panic(fmt.Sprintf("storage: marshal outbox payload: %v", err))
+	}
+	return b
+}

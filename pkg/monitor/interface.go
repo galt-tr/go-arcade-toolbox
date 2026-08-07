@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 )
 
 // MonitoredStorage is everything the daemon needs from the storage layer. It is
@@ -57,6 +58,18 @@ type MonitoredStorage interface {
 	// merkle root no longer matches the header, re-entering it into the proof
 	// pipeline. Best-effort; the poll path is the authority.
 	DemoteReorgedProofs(ctx context.Context, forkHeight uint32) error
+
+	// VerifyAndReleaseSuspects is the reject→release reconciler pass: it
+	// re-verifies suspect-failed transactions against the oracle and releases the
+	// inputs of the provably-dead ones (two-pass rejected guard + double-spend
+	// winner rule + max-quarantine stuck escalation). grace is the suspect age /
+	// two-pass separation; maxQuarantine is the escalate-to-stuck ceiling. Idempotent.
+	VerifyAndReleaseSuspects(ctx context.Context, grace, maxQuarantine time.Duration, limit int) (defs.ReconcilerReport, error)
+
+	// DrainOutbox replays pending utxo-ops outbox rows against the inventory
+	// store, idempotently — the Mode B crash-recovery half of a release. A no-op
+	// in Mode A. Run before each reconciler pass to heal a crashed release.
+	DrainOutbox(ctx context.Context, limit int) (defs.OutboxDrainReport, error)
 
 	// GetKeyValue / SetKeyValue expose the small key-value store where the SSE
 	// replay cursor lives.

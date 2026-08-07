@@ -12,12 +12,27 @@ func WithClock(now func() time.Time) Option {
 }
 
 // WithBatchLimit sets the per-run row limit shared by every sweep task
-// (send-waiting, abort-abandoned, status/proof polling). A non-positive value
-// is ignored.
+// (send-waiting, abort-abandoned, status/proof polling, reject-release). A
+// non-positive value is ignored.
 func WithBatchLimit(n int) Option {
 	return func(d *Daemon) {
 		if n > 0 {
-			d.limits = limits{sendWaiting: n, abort: n, sync: n, proof: n}
+			d.limits = limits{sendWaiting: n, abort: n, sync: n, proof: n, rejectRelease: n}
+		}
+	}
+}
+
+// WithReconcilerWindows overrides the reject→release reconciler's grace window
+// (suspect age / two-pass separation) and max-quarantine ceiling
+// (escalate-to-stuck). Non-positive values are ignored. Intended for
+// deterministic tests; production reads these from [defs.Monitor.Reconciler].
+func WithReconcilerWindows(grace, maxQuarantine time.Duration) Option {
+	return func(d *Daemon) {
+		if grace > 0 {
+			d.suspectGrace = grace
+		}
+		if maxQuarantine > 0 {
+			d.maxQuarantine = maxQuarantine
 		}
 	}
 }
