@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/memstore"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 )
 
 // TestProviderConformance_MemstoreSQLite runs the exported provider-level
@@ -24,10 +25,10 @@ import (
 func TestProviderConformance_MemstoreSQLite(t *testing.T) {
 	conformance.RunProviderSuite(
 		t,
-		func(t *testing.T) *storage.Provider {
+		func(t *testing.T) wdk.WalletStorageProvider {
 			return newMemstoreSQLiteProvider(t, &conformance.FakeHeaders{})
 		},
-		conformance.WithRejectingHeadersProvider(func(t *testing.T) *storage.Provider {
+		conformance.WithRejectingHeadersProvider(func(t *testing.T) wdk.WalletStorageProvider {
 			return newMemstoreSQLiteProvider(t, conformance.RejectingHeaders())
 		}),
 	)

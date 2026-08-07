@@ -46,6 +46,13 @@ import (
 // own tests; here we only need the interface-satisfaction guarantee.
 var _ wdk.WalletStorageProvider = (*storagepkg.Provider)(nil)
 
+// Task 22 growth: the REST remote-storage client — the drop-in provider a
+// wallet uses to talk to a hosted storage.Server over HTTP — also satisfies
+// wdk.WalletStorageProvider end to end. storage.NewClient returns it as the
+// interface; the round-trip conformance suite (pkg/storage) drives the FULL
+// suite through client -> HTTP -> server -> provider.
+var _ wdk.WalletStorageProvider = (*storagepkg.Client)(nil)
+
 // ===========================================================================
 // 1. wdk.WalletStorageProvider — the 21-method write-capable storage
 // interface. This is the single most important assertion in this file: if a

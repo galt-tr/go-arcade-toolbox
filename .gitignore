@@ -40,3 +40,4 @@ coverage.out
 
 # built cmd binaries
 /perfrunner
+/storage-server

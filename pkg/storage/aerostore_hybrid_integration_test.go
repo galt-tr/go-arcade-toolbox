@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/aerostore"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 )
 
 var hybridSetCounter atomic.Int64
@@ -41,11 +42,11 @@ func TestProviderConformance_AerospikePGHybridModeB(t *testing.T) {
 
 	conformance.RunProviderSuite(
 		t,
-		func(t *testing.T) *storage.Provider {
+		func(t *testing.T) wdk.WalletStorageProvider {
 			return newHybridModeBProvider(t, pg, aero, &conformance.FakeHeaders{})
 		},
 		conformance.WithApproximateSelection(),
-		conformance.WithRejectingHeadersProvider(func(t *testing.T) *storage.Provider {
+		conformance.WithRejectingHeadersProvider(func(t *testing.T) wdk.WalletStorageProvider {
 			return newHybridModeBProvider(t, pg, aero, conformance.RejectingHeaders())
 		}),
 	)

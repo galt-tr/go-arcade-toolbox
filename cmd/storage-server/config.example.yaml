@@ -1,0 +1,57 @@
+# Example configuration for the go-arcade-toolbox storage-server.
+#
+# Run with:  storage-server -config config.yaml
+#
+# A few fields can also be set via environment variables (they override the
+# file): STORAGE_HTTP_ADDRESS, STORAGE_SQLITE_PATH, STORAGE_POSTGRES_DSN,
+# STORAGE_IDENTITY_KEY, STORAGE_ARCADE_URL, STORAGE_CHAINTRACKS_URL.
+
+# BSV network: main | test | stn | teratestnet
+network: test
+
+# REST server listen address.
+http_address: ":8100"
+
+# Storage instance identity (written into the settings row on migrate).
+storage_name: arcade-storage
+storage_identity_key: ""   # hex identity key of this storage; set in production
+
+# Store backend: sqlite | postgres | aerospike-hybrid
+backend: sqlite
+
+# --- sqlite backend ---
+sqlite_path: ./storage.db
+
+# --- postgres backend (and metastore for aerospike-hybrid) ---
+postgres_dsn: ""           # e.g. postgres://user:pass@localhost:5432/storage?sslmode=disable
+max_db_conns: 0            # 0 = driver default
+
+# --- aerospike inventory (aerospike-hybrid backend only) ---
+aerospike:
+  host: ""
+  port: 3000
+  namespace: test
+  set: ""
+
+# Tx oracle (Arcade). Required: the provider broadcasts through it.
+arcade:
+  enabled: true
+  url: "https://arcade.example.com"
+  events_url: ""           # defaults to url
+
+# Headers source (ChainTracks). Required: the provider verifies merkle roots.
+chaintracks:
+  enabled: true
+  url: "https://chaintracks.example.com"
+
+# Run the background monitor daemon (SSE apply pipeline + tip/reorg consumers +
+# reject->release reconciler + scheduled tasks) alongside the REST server.
+monitor_enabled: true
+
+# Logging: level = debug|info|warn|error ; handler = text|json
+log_level: info
+log_handler: text
+
+# HTTP limits and shutdown.
+max_request_body_bytes: 0        # 0 = default (1 MiB)
+shutdown_timeout_seconds: 15

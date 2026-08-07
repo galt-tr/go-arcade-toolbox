@@ -6,14 +6,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 )
 
 // config holds suite options.
 type config struct {
 	approximateSelection bool
-	rejectingProvider    func(t *testing.T) *storage.Provider
+	rejectingProvider    func(t *testing.T) wdk.WalletStorageProvider
 }
 
 // Option configures [RunProviderSuite].
@@ -42,7 +41,7 @@ func WithApproximateSelection() Option {
 // this: it costs nothing beyond wiring a second headers fake alongside the
 // primary one, the same way the primary [FakeHeaders] is wired. Without it,
 // that specific assertion is skipped (not failed).
-func WithRejectingHeadersProvider(newProvider func(t *testing.T) *storage.Provider) Option {
+func WithRejectingHeadersProvider(newProvider func(t *testing.T) wdk.WalletStorageProvider) Option {
 	return func(c *config) { c.rejectingProvider = newProvider }
 }
 
@@ -57,7 +56,7 @@ func WithRejectingHeadersProvider(newProvider func(t *testing.T) *storage.Provid
 // ProcessAction, AbortAction, ListOutputs, FindOutputsAuth, ListTransactions,
 // GetBalance, …) — never metastore/utxostore internals — so the suite runs
 // unmodified against any backend combination.
-func RunProviderSuite(t *testing.T, newProvider func(t *testing.T) *storage.Provider, opts ...Option) {
+func RunProviderSuite(t *testing.T, newProvider func(t *testing.T) wdk.WalletStorageProvider, opts ...Option) {
 	cfg := config{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -90,13 +89,13 @@ func RunProviderSuite(t *testing.T, newProvider func(t *testing.T) *storage.Prov
 
 // suite holds the shared configuration every subtest method reads.
 type suite struct {
-	newProvider func(t *testing.T) *storage.Provider
+	newProvider func(t *testing.T) wdk.WalletStorageProvider
 	cfg         config
 }
 
 // freshProvider builds and migrates a fresh provider for one subtest, using
 // the suite's primary constructor.
-func (s *suite) freshProvider(t *testing.T) *storage.Provider {
+func (s *suite) freshProvider(t *testing.T) wdk.WalletStorageProvider {
 	t.Helper()
 	return s.freshProviderFrom(t, s.newProvider)
 }
@@ -104,7 +103,7 @@ func (s *suite) freshProvider(t *testing.T) *storage.Provider {
 // freshProviderFrom is freshProvider parameterized over the constructor, so
 // subtests needing an alternate wiring (e.g. [WithRejectingHeadersProvider])
 // can reuse the same migrate-and-return plumbing.
-func (s *suite) freshProviderFrom(t *testing.T, newProvider func(t *testing.T) *storage.Provider) *storage.Provider {
+func (s *suite) freshProviderFrom(t *testing.T, newProvider func(t *testing.T) wdk.WalletStorageProvider) wdk.WalletStorageProvider {
 	t.Helper()
 	p := newProvider(t)
 	_, err := p.Migrate(context.Background(), "conformance", "conformance-identity-key")
@@ -114,7 +113,7 @@ func (s *suite) freshProviderFrom(t *testing.T, newProvider func(t *testing.T) *
 
 // newAuth provisions a fresh user on p via FindOrInsertUser and returns its
 // resolved [wdk.AuthID].
-func (s *suite) newAuth(t *testing.T, p *storage.Provider, identityKey string) wdk.AuthID {
+func (s *suite) newAuth(t *testing.T, p wdk.WalletStorageProvider, identityKey string) wdk.AuthID {
 	t.Helper()
 	resp, err := p.FindOrInsertUser(context.Background(), identityKey)
 	require.NoError(t, err)

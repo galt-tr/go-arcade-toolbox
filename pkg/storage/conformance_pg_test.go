@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/sqlstore"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 )
 
 // TestProviderConformance_PostgresModeA runs the exported provider-level
@@ -29,10 +30,10 @@ func TestProviderConformance_PostgresModeA(t *testing.T) {
 
 	conformance.RunProviderSuite(
 		t,
-		func(t *testing.T) *storage.Provider {
+		func(t *testing.T) wdk.WalletStorageProvider {
 			return newPostgresModeAProvider(t, pg, &conformance.FakeHeaders{})
 		},
-		conformance.WithRejectingHeadersProvider(func(t *testing.T) *storage.Provider {
+		conformance.WithRejectingHeadersProvider(func(t *testing.T) wdk.WalletStorageProvider {
 			return newPostgresModeAProvider(t, pg, conformance.RejectingHeaders())
 		}),
 	)

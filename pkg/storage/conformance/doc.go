@@ -11,16 +11,20 @@
 // # Usage
 //
 //	func TestProviderConformance(t *testing.T) {
-//		conformance.RunProviderSuite(t, func(t *testing.T) *storage.Provider {
+//		conformance.RunProviderSuite(t, func(t *testing.T) wdk.WalletStorageProvider {
 //			// build a fresh metastore + utxostore + funder + Provider here.
 //			return p
 //		})
 //	}
 //
-// newProvider MUST return a freshly constructed, unmigrated [storage.Provider]
-// backed by an isolated metastore/utxostore pair every time it is called — the
-// suite calls it once per subtest (mirroring the utxostoretest pattern) and
-// migrates it itself.
+// newProvider MUST return a freshly constructed, unmigrated
+// [wdk.WalletStorageProvider] backed by an isolated metastore/utxostore pair
+// every time it is called — the suite calls it once per subtest (mirroring the
+// utxostoretest pattern) and migrates it itself. The suite is typed to the
+// interface (not the concrete [storage.Provider]) so it validates any faithful
+// implementation, including the REST remote client (pkg/storage.Client) driven
+// through client -> HTTP -> server -> provider — see pkg/storage's
+// conformance_remote_test.go.
 //
 // # Layout and import direction
 //
