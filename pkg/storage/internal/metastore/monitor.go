@@ -183,6 +183,32 @@ func (r KnownTxRepo) FindUnsent(ctx context.Context, limit int) ([]KnownTx, erro
 	return r.queryList(ctx, q, args)
 }
 
+// FindResendable returns known txs that hold a stored raw tx, were never
+// broadcast (was_broadcast=0), and are re-drivable: the delayed queue (status
+// 'unsent') PLUS txs stranded pre-broadcast (status 'unprocessed') — e.g. a
+// broadcast the arcade circuit breaker short-circuited while open. Only rows
+// older than grace are returned, so a freshly-created 'unprocessed' tx whose
+// own ProcessAction is about to broadcast it is not stolen by the sweep.
+// Oldest first, up to limit. This is the SendWaiting sweep's work list; it
+// makes stranded transactions self-heal once arcade is reachable again.
+func (r KnownTxRepo) FindResendable(ctx context.Context, grace time.Duration, limit int) ([]KnownTx, error) {
+	cutoff := r.s.encTime(r.s.now().Add(-grace))
+	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
+	// The delayed queue ('unsent') sends promptly; the stranded set ('unprocessed')
+	// is gated by grace so a freshly-created tx whose own ProcessAction is about
+	// to broadcast it is not double-sent by the sweep.
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
+		"WHERE was_broadcast = ? AND raw_tx IS NOT NULL " +
+		"AND (status = ? OR (status = ? AND updated_at <= ?)) " +
+		"ORDER BY created_at ASC, txid ASC" + clause)
+	args := append([]any{
+		r.s.boolVal(false),
+		string(wdk.ProvenTxStatusUnsent),
+		string(wdk.ProvenTxStatusUnprocessed), cutoff,
+	}, pageArgs...)
+	return r.queryList(ctx, q, args)
+}
+
 // FindByStatusOlderThan returns known txs whose status is in statuses and whose
 // updated_at is at or before cutoff, oldest first, up to limit. It powers the
 // poll fallbacks (stale in-flight txs to re-poll; unproven txs to re-check for

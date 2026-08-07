@@ -45,6 +45,11 @@ type MonitoredStorage interface {
 	// olderThan (released reservation, removed change, status → aborted).
 	AbortAbandoned(ctx context.Context, olderThan time.Time, limit int) error
 
+	// SweepStaleReservations reclaims funding reservations older than olderThan
+	// whose transaction can no longer be sent (leaked inputs), skipping any that
+	// SendWaitingTransactions will still re-drive.
+	SweepStaleReservations(ctx context.Context, olderThan time.Time, limit int) error
+
 	// SynchronizeTransactionStatuses is the poll fallback: it re-polls stale
 	// non-terminal transactions via the oracle and routes them through
 	// ApplyStatusUpdate (covers SSE outages and the cold-start terminal gap).

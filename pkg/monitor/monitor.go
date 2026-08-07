@@ -23,6 +23,10 @@ const (
 	// defaultFailAbandonedAge is how old a never-broadcast tx must be before the
 	// abort-abandoned sweep reaps it.
 	defaultFailAbandonedAge = 5 * time.Minute
+	// defaultStaleReservationTTL is how old a funding reservation must be before
+	// the stale-reservation sweep reclaims it (well beyond the re-drive window,
+	// so a tx that can still be re-broadcast keeps its inputs).
+	defaultStaleReservationTTL = 15 * time.Minute
 	// minLeaseTTL floors a job's lease TTL (max(2*interval, minLeaseTTL)) so a
 	// short interval cannot expire a lease mid-run and admit a second instance.
 	minLeaseTTL = 5 * time.Minute
@@ -57,11 +61,12 @@ type Daemon struct {
 	owner           string
 	distributedLock bool
 
-	now              func() time.Time
-	limits           limits
-	failAbandonedAge time.Duration
-	suspectGrace     time.Duration
-	maxQuarantine    time.Duration
+	now                 func() time.Time
+	limits              limits
+	failAbandonedAge    time.Duration
+	staleReservationTTL time.Duration
+	suspectGrace        time.Duration
+	maxQuarantine       time.Duration
 
 	startLock sync.Mutex
 	started   bool
@@ -90,17 +95,18 @@ func NewDaemon(
 		return nil, fmt.Errorf("monitor: storage is required")
 	}
 	d := &Daemon{
-		logger:           logging.Child(logger, "monitor"),
-		storage:          storage,
-		headers:          hdrs,
-		oracle:           oracle,
-		cfg:              cfg,
-		distributedLock:  true,
-		now:              time.Now,
-		limits:           limits{sendWaiting: defaultBatchLimit, abort: defaultBatchLimit, sync: defaultBatchLimit, proof: defaultBatchLimit, rejectRelease: defaultBatchLimit},
-		failAbandonedAge: defaultFailAbandonedAge,
-		suspectGrace:     cfg.Reconciler.SuspectGrace(),
-		maxQuarantine:    cfg.Reconciler.MaxQuarantine(),
+		logger:              logging.Child(logger, "monitor"),
+		storage:             storage,
+		headers:             hdrs,
+		oracle:              oracle,
+		cfg:                 cfg,
+		distributedLock:     true,
+		now:                 time.Now,
+		limits:              limits{sendWaiting: defaultBatchLimit, abort: defaultBatchLimit, sync: defaultBatchLimit, proof: defaultBatchLimit, rejectRelease: defaultBatchLimit},
+		failAbandonedAge:    defaultFailAbandonedAge,
+		staleReservationTTL: defaultStaleReservationTTL,
+		suspectGrace:        cfg.Reconciler.SuspectGrace(),
+		maxQuarantine:       cfg.Reconciler.MaxQuarantine(),
 	}
 	for _, o := range opts {
 		o(d)
@@ -216,7 +222,12 @@ func (d *Daemon) taskRunner(ctx context.Context, name defs.MonitorTask) (func(),
 		run = func() error { return d.storage.SendWaitingTransactions(ctx, d.limits.sendWaiting) }
 	case defs.FailAbandonedMonitorTask:
 		run = func() error {
-			return d.storage.AbortAbandoned(ctx, d.now().Add(-d.failAbandonedAge), d.limits.abort)
+			if err := d.storage.AbortAbandoned(ctx, d.now().Add(-d.failAbandonedAge), d.limits.abort); err != nil {
+				return err
+			}
+			// Reclaim reservations leaked by never-completed CreateActions
+			// (failed fan-outs, or txs stranded by an open circuit breaker).
+			return d.storage.SweepStaleReservations(ctx, d.now().Add(-d.staleReservationTTL), d.limits.abort)
 		}
 	case defs.CheckForProofsMonitorTask:
 		run = func() error { return d.storage.CheckProofs(ctx, d.limits.proof) }

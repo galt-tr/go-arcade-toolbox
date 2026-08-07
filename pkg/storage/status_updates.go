@@ -328,18 +328,28 @@ func (p *Provider) resolveBlockHash(ctx context.Context, blockHashHex string, he
 	return nil
 }
 
-// SendWaitingTransactions broadcasts up to limit delayed (status unsent) known
-// txs through the oracle and, on acceptance, commits the same wallet-state
-// transition the synchronous 202 path does (inputs spent, change promoted to
-// TierUnproven, statuses advanced). Backpressure/opaque failures leave the tx
-// unsent for the next cycle; a tx-level rejection marks it suspect.
+// resendGrace is how long a never-broadcast tx must sit before the SendWaiting
+// sweep re-drives it. It protects a freshly-created 'unprocessed' tx (whose own
+// ProcessAction is about to broadcast it) from being double-sent by the sweep;
+// anything unbroadcast longer than this was stranded (e.g. an open arcade
+// circuit breaker skipped the send) and is safe to re-broadcast.
+const resendGrace = 20 * time.Second
+
+// SendWaitingTransactions broadcasts up to limit re-drivable known txs through
+// the oracle and, on acceptance, commits the same wallet-state transition the
+// synchronous 202 path does (inputs spent, change promoted to TierUnproven,
+// statuses advanced). Its work list is both the delayed queue (status 'unsent')
+// and transactions stranded pre-broadcast ('unprocessed', never sent) — so a
+// tx the circuit breaker short-circuited while open self-heals on a later
+// cycle once arcade is reachable. Backpressure/opaque failures leave the tx for
+// the next cycle; a tx-level rejection marks it suspect.
 func (p *Provider) SendWaitingTransactions(ctx context.Context, limit int) error {
 	if limit <= 0 {
 		limit = defaultMonitorBatchLimit
 	}
-	waiting, err := p.meta.KnownTx().FindUnsent(ctx, limit)
+	waiting, err := p.meta.KnownTx().FindResendable(ctx, resendGrace, limit)
 	if err != nil {
-		return fmt.Errorf("storage: find unsent: %w", err)
+		return fmt.Errorf("storage: find resendable: %w", err)
 	}
 	for i := range waiting {
 		if err := ctx.Err(); err != nil {
@@ -351,6 +361,65 @@ func (p *Provider) SendWaitingTransactions(ctx context.Context, limit int) error
 		}
 	}
 	return nil
+}
+
+// SweepStaleReservations reclaims funding reservations older than olderThan
+// whose transaction can no longer be sent — inputs leaked by never-completed
+// CreateActions (failed fuel fan-outs, or payments built but never broadcast
+// because the circuit breaker was open). It deliberately SKIPS reservations
+// whose tx is still re-drivable (a stored raw tx that SendWaiting will retry),
+// so it never frees inputs out from under an in-flight re-broadcast. Releasing
+// is idempotent, so a racing completion is harmless.
+func (p *Provider) SweepStaleReservations(ctx context.Context, olderThan time.Time, limit int) error {
+	if limit <= 0 {
+		limit = defaultMonitorBatchLimit
+	}
+	refs, err := p.utxo.FindStaleReservations(ctx, olderThan, limit)
+	if err != nil {
+		return fmt.Errorf("storage: find stale reservations: %w", err)
+	}
+	for i := range refs {
+		ref := &refs[i]
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		resendable, err := p.reservationResendable(ctx, int(ref.UserID), ref.Reservation)
+		if err != nil {
+			p.logger.WarnContext(ctx, "sweep stale reservations: resendable check failed",
+				slog.String("reservation", ref.Reservation), slog.String("error", err.Error()))
+			continue
+		}
+		if resendable {
+			continue // SendWaiting owns it; do not free its inputs
+		}
+		if _, err := p.utxo.ReleaseReservation(ctx, ref.UserID, ref.Reservation); err != nil {
+			p.logger.WarnContext(ctx, "sweep stale reservations: release failed",
+				slog.String("reservation", ref.Reservation), slog.String("error", err.Error()))
+			continue
+		}
+	}
+	return nil
+}
+
+// reservationResendable reports whether the transaction holding this reservation
+// still has a stored raw tx and was never broadcast — i.e. SendWaiting will
+// re-drive it, so the reservation must NOT be swept.
+func (p *Provider) reservationResendable(ctx context.Context, userID int, reference string) (bool, error) {
+	txRow, found, err := p.meta.Transactions().FindByReference(ctx, userID, reference)
+	if err != nil {
+		return false, err
+	}
+	if !found || txRow.TxID == nil {
+		return false, nil
+	}
+	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, string(*txRow.TxID))
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	return len(kt.RawTx) > 0 && !kt.WasBroadcast, nil
 }
 
 // sendOneWaiting EF-encodes and broadcasts one delayed tx, then commits the

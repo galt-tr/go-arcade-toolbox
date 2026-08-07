@@ -101,9 +101,15 @@ func DefaultServicesConfig(chain BSVNetwork) WalletServices {
 			// then forces an explicit URL.
 			URL:               ep.arcadeURL,
 			FullStatusUpdates: true,
+			// A threshold of 3 tripped almost instantly under a high-TPS burst
+			// (a brief arcade slowdown yields several concurrent timeouts), then
+			// short-circuited the whole in-flight batch and stranded it. Tolerate
+			// short bursts (10 consecutive opaque failures — a genuinely down
+			// arcade still trips quickly) and probe /health every 5s so the
+			// breaker recovers in seconds, not half a minute.
 			CircuitBreaker: ArcadeCircuitBreaker{
-				FailureThreshold:           3,
-				HealthProbeIntervalSeconds: 30,
+				FailureThreshold:           10,
+				HealthProbeIntervalSeconds: 5,
 			},
 		},
 		ChainTracks: ChainTracks{

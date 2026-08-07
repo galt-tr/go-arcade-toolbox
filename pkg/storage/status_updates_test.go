@@ -540,3 +540,44 @@ func trueScript() *script.Script {
 	s := script.Script([]byte{0x51})
 	return &s
 }
+
+// TestSweepStaleReservations_ReleasesStuckReservation verifies the recovery
+// sweep reclaims a funding reservation whose transaction can no longer be sent
+// (no stored raw tx — a payment stranded pre-broadcast), so the leaked inputs
+// become spendable again instead of permanently locking the wallet.
+func TestSweepStaleReservations_ReleasesStuckReservation(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	txid := fmt.Sprintf("%064x", 0x7a)
+	h.seedChangeTx(txid, wdk.TxStatusSending, wdk.ProvenTxStatusUnprocessed, 5000, utxostore.TierSending)
+	rows, err := h.meta.Transactions().FindByTxIDAllUsers(ctx, txid)
+	require.NoError(t, err)
+	reservation := string(rows[0].Reference)
+
+	// Mint a funding coin and reserve it under the tx reference (as a real
+	// CreateAction would); the tx then strands — no raw tx, never broadcast.
+	var src chainhash.Hash
+	src[0] = 0x55
+	require.NoError(t, h.utxo.Mint(ctx, []*utxostore.Mint{{
+		Outpoint: utxostore.Outpoint{TxID: src, Vout: 0}, UserID: int64(h.userID),
+		Basket: "funding", Satoshis: 9000, InputSize: 107, Tier: utxostore.TierMined,
+	}}))
+	_, err = h.utxo.ClaimSmallestSufficient(ctx, utxostore.Scope{
+		UserID: int64(h.userID), Basket: "funding", Tier: utxostore.TierMined,
+	}, reservation, 1)
+	require.NoError(t, err)
+
+	before, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
+	require.NoError(t, err)
+	require.Equal(t, 1, before.ReservedCount, "coin reserved before the sweep")
+
+	// olderThan in the future ⇒ the reservation qualifies as stale; the tx has no
+	// raw tx so it is not re-drivable and the sweep reclaims it.
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	after, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
+	require.NoError(t, err)
+	require.Zero(t, after.ReservedCount, "stale reservation released")
+	require.Equal(t, uint64(9000), after.Claimable[utxostore.TierMined], "input claimable again")
+}

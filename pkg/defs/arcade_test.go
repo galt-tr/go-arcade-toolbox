@@ -18,8 +18,8 @@ func TestDefaultServicesConfigArcadeMainnet(t *testing.T) {
 	// EventsURL is derived from the Arcade base unchanged (client appends /events).
 	require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech", cfg.Arcade.EventsURL)
 	require.True(t, cfg.Arcade.FullStatusUpdates)
-	require.Equal(t, uint(3), cfg.Arcade.CircuitBreaker.FailureThreshold)
-	require.Equal(t, uint(30), cfg.Arcade.CircuitBreaker.HealthProbeIntervalSeconds)
+	require.Equal(t, uint(10), cfg.Arcade.CircuitBreaker.FailureThreshold)
+	require.Equal(t, uint(5), cfg.Arcade.CircuitBreaker.HealthProbeIntervalSeconds)
 }
 
 func TestDefaultServicesConfigArcadeTestnet(t *testing.T) {

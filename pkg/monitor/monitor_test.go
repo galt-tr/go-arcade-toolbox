@@ -83,9 +83,10 @@ func (m *mockStorage) SendWaitingTransactions(_ context.Context, _ int) error {
 	return nil
 }
 
-func (m *mockStorage) AbortAbandoned(context.Context, time.Time, int) error      { return nil }
-func (m *mockStorage) SynchronizeTransactionStatuses(context.Context, int) error { return nil }
-func (m *mockStorage) CheckProofs(context.Context, int) error                    { return nil }
+func (m *mockStorage) AbortAbandoned(context.Context, time.Time, int) error         { return nil }
+func (m *mockStorage) SweepStaleReservations(context.Context, time.Time, int) error { return nil }
+func (m *mockStorage) SynchronizeTransactionStatuses(context.Context, int) error    { return nil }
+func (m *mockStorage) CheckProofs(context.Context, int) error                       { return nil }
 
 func (m *mockStorage) VerifyAndReleaseSuspects(context.Context, time.Duration, time.Duration, int) (defs.ReconcilerReport, error) {
 	return defs.ReconcilerReport{}, nil
