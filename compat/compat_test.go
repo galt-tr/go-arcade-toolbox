@@ -17,9 +17,11 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"testing"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
@@ -31,6 +33,7 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	servicespkg "github.com/bsv-blockchain/go-arcade-toolbox/pkg/services"
 	storagepkg "github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
+	walletpkg "github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
@@ -827,7 +830,87 @@ func TestPendingSignActionsRepositoryCallSiteShape(t *testing.T) {
 }
 
 // ===========================================================================
-// 9. GROWTH — this file is the living compat checklist. Add to it as each
+// 9. pkg/wallet — the BRC-100 wallet. The assertions below pin the public
+// constructor generics, the sdk.Interface method set + toolbox extensions, the
+// StorageProviderFactory function-type aliases, and every With* option func,
+// exactly as a go-wallet-toolbox call site references them. Modeled on
+// pkg/wallet/wallet.go and its tests. These are compile-only (the constructor
+// paths are never executed here — the wallet's own tests and the e2e do that).
+// ===========================================================================
+
+// The Wallet satisfies the full BRC-100 sdk.Interface.
+var _ sdk.Interface = (*walletpkg.Wallet)(nil)
+
+// The eight StorageProviderFactory function-type aliases are all assignable
+// from a literal of the corresponding shape — the exact set NewWithStorageFactory
+// dispatches over.
+var (
+	_ walletpkg.StorageProviderFactoryWithWalletReturningCleanupAndError    = func(sdk.Interface) (wdk.WalletStorageProvider, func(), error) { return nil, nil, nil }
+	_ walletpkg.StorageProviderFactoryWithWalletReturningCleanup            = func(sdk.Interface) (wdk.WalletStorageProvider, func()) { return nil, nil }
+	_ walletpkg.StorageProviderFactoryWithWalletReturningError              = func(sdk.Interface) (wdk.WalletStorageProvider, error) { return nil, nil }
+	_ walletpkg.StorageProviderFactoryWithWallet                            = func(sdk.Interface) wdk.WalletStorageProvider { return nil }
+	_ walletpkg.StorageProviderFactoryWithoutWalletReturningCleanupAndError = func() (wdk.WalletStorageProvider, func(), error) { return nil, nil, nil }
+	_ walletpkg.StorageProviderFactoryWithoutWalletReturningCleanup         = func() (wdk.WalletStorageProvider, func()) { return nil, nil }
+	_ walletpkg.StorageProviderFactoryWithoutWalletReturningError           = func() (wdk.WalletStorageProvider, error) { return nil, nil }
+	_ walletpkg.StorageProviderFactoryWithoutWallet                         = func() wdk.WalletStorageProvider { return nil }
+)
+
+// compatWalletM3 is never called; it exists purely so the compiler pins the
+// exact public signatures of wallet.New / NewWithStorageFactory (all four
+// PrivateKeySource arms), every sdk.Interface method, the toolbox extensions,
+// and every With* option func.
+//
+//nolint:all // compile-only assertion body
+func compatWalletM3() {
+	var (
+		activeStorage wdk.WalletStorageProvider = (*stubWalletStorageProvider)(nil)
+		svc           *servicespkg.Services     // *services.Services flows into WithServices(wdk.Services)
+		mgr           wdk.WalletStorage         = (*stubWalletStorage)(nil)
+		repo          pending.SignActionsRepository
+		httpClient    *http.Client
+		resolver      *lookup.LookupResolver
+		keyDeriver    *sdk.KeyDeriver
+		privKey       *ec.PrivateKey
+	)
+
+	// New — the four PrivateKeySource arms, plus the full option set.
+	_, _ = walletpkg.New(defs.NetworkMainnet, "deadbeef", activeStorage,
+		walletpkg.WithServices(svc),
+		walletpkg.WithLogger(slog.Default()),
+		walletpkg.WithStorageManager(mgr),
+		walletpkg.WithPendingSignActionsRepository(repo),
+		walletpkg.WithIncludeAllSourceTransactions(true),
+		walletpkg.WithAutoKnownTxids(false),
+		walletpkg.WithAuthHTTPClient(httpClient),
+		walletpkg.WithLookupResolver(resolver),
+		walletpkg.WithTrustSelf(sdk.TrustSelfKnown),
+	)
+	_, _ = walletpkg.New(defs.NetworkTestnet, walletpkg.WIF("L1..."), activeStorage)
+	_, _ = walletpkg.New(defs.NetworkMainnet, privKey, activeStorage)
+	_, _ = walletpkg.New(defs.NetworkMainnet, keyDeriver, activeStorage)
+
+	// NewWithStorageFactory — generic over KeySource and StorageProviderFactory.
+	_, _ = walletpkg.NewWithStorageFactory(defs.NetworkMainnet, "deadbeef",
+		func() wdk.WalletStorageProvider { return activeStorage })
+
+	// The sdk.Interface method set is pinned by the var _ above; the toolbox
+	// extensions (not in sdk.Interface) are pinned here as method values.
+	var w *walletpkg.Wallet
+	_ = w.Balance
+	_ = w.ListFailedActions
+	_ = w.ListTransactions
+	_ = w.FanOutFuel
+	_ = w.GetBeefParty
+	_ = w.Close
+	_ = w.Destroy
+
+	// WithWalletSettingsManager takes an internal type (as it does upstream), so
+	// it is referenced as a value only — it cannot be named from outside pkg/wallet.
+	_ = walletpkg.WithWalletSettingsManager
+}
+
+// ===========================================================================
+// 10. GROWTH — this file is the living compat checklist. Add to it as each
 // later milestone ports its package, following the same pattern: stub +
 // interface-satisfaction assertion for new interfaces, literal construction
 // for new arg/result types, and a golden JSON pin for anything wire-visible.
@@ -851,13 +934,15 @@ func TestPendingSignActionsRepositoryCallSiteShape(t *testing.T) {
 // bridge, for a caller-supplied wdk.Services that needs to look like an
 // arcade.TxOracle.
 //
-// TODO(M3 — pkg/wallet): wallet.New(...) generic constructors, the Wallet
-// struct's exported methods (CreateAction/ProcessAction/ListActions/
-// ListOutputs/InternalizeAction/AbortAction/...), and the wallet option funcs
-// (WithStorageManager, WithServices, WithPendingSignActionsRepo, ...) —
-// pkg/wallet/wallet.go and pkg/wallet/internal/wallet_opts in the old repo.
-// WithServices(wdk.Services) is expected to accept *servicespkg.Services
-// directly (the public API-compat surface this task exists to preserve).
+// DONE(Task 17 — pkg/wallet): wallet.New / NewWithStorageFactory generic
+// constructors (all four PrivateKeySource arms), the full sdk.Interface method
+// set + the toolbox extensions (Balance/ListFailedActions/ListTransactions/
+// FanOutFuel/GetBeefParty/Close/Destroy), the eight StorageProviderFactory
+// function-type aliases, and every With* option func are pinned in section 9
+// above. WithServices(wdk.Services) accepts *servicespkg.Services directly, as
+// the compatWalletM3 body demonstrates. The constructor paths are compile-only
+// here; they are executed against the real storage.Provider in pkg/wallet's own
+// unit tests, the e2e write-path test, and the BRC-100 conformance vectors.
 //
 // TODO(M4 — pkg/monitor): monitor construction and its task/runner option
 // funcs, once ported.

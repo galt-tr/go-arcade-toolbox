@@ -1,0 +1,31 @@
+package mapping
+
+import (
+	"fmt"
+
+	sdk "github.com/bsv-blockchain/go-sdk/wallet"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+)
+
+// MapRelinquishRelinquishCertificateArgs is ported from go-wallet-toolbox (see upstream docs).
+func MapRelinquishRelinquishCertificateArgs(args sdk.RelinquishCertificateArgs) (wdk.RelinquishCertificateArgs, error) {
+	if args.Certifier == nil {
+		return wdk.RelinquishCertificateArgs{}, fmt.Errorf("certifier: must be a non nil value")
+	}
+
+	if len(args.SerialNumber) == 0 {
+		return wdk.RelinquishCertificateArgs{}, fmt.Errorf("serial number: must be a non empty string")
+	}
+
+	if len(args.Type) == 0 {
+		return wdk.RelinquishCertificateArgs{}, fmt.Errorf("certificate type: must be a non empty string")
+	}
+
+	return wdk.RelinquishCertificateArgs{
+		Type:         primitives.Base64String(primitives.EncodeBytes32Base64([32]byte(args.Type))),
+		SerialNumber: primitives.Base64String(primitives.EncodeBytes32Base64([32]byte(args.SerialNumber))),
+		Certifier:    primitives.PubKeyHex(args.Certifier.ToDERHex()),
+	}, nil
+}

@@ -70,7 +70,7 @@ func (p *Provider) resolveProvidedInputs(ctx context.Context, userID int, inputs
 // buildResultInputs assembles the signing template's inputs: caller-provided
 // inputs first (in order), then storage-allocated inputs, each with source data
 // drawn from the metastore and/or the assembled input BEEF.
-func (p *Provider) buildResultInputs(ctx context.Context, userID int, provided []resolvedInput, allocated []*utxostore.UTXO, beef *transaction.Beef) ([]*wdk.StorageCreateTransactionSdkInput, error) {
+func (p *Provider) buildResultInputs(ctx context.Context, userID int, provided []resolvedInput, allocated []*utxostore.UTXO, beef *transaction.Beef, includeSourceTx bool) ([]*wdk.StorageCreateTransactionSdkInput, error) {
 	inputs := make([]*wdk.StorageCreateTransactionSdkInput, 0, len(provided)+len(allocated))
 	vin := 0
 
@@ -85,7 +85,7 @@ func (p *Provider) buildResultInputs(ctx context.Context, userID int, provided [
 		if ri.known {
 			providedBy = wdk.ProvidedByYouAndStorage
 		}
-		inputs = append(inputs, &wdk.StorageCreateTransactionSdkInput{
+		in := &wdk.StorageCreateTransactionSdkInput{
 			Vin:                   vin,
 			SourceTxID:            ri.input.Outpoint.TxID,
 			SourceVout:            ri.input.Outpoint.Vout,
@@ -94,7 +94,11 @@ func (p *Provider) buildResultInputs(ctx context.Context, userID int, provided [
 			UnlockingScriptLength: unlockLen,
 			ProvidedBy:            providedBy,
 			Type:                  wdk.OutputTypeCustom,
-		})
+		}
+		if includeSourceTx {
+			in.SourceTransaction = sourceTxBytesFor(beef, ri.input.Outpoint.TxID)
+		}
+		inputs = append(inputs, in)
 		vin++
 	}
 
@@ -122,10 +126,27 @@ func (p *Provider) buildResultInputs(ctx context.Context, userID int, provided [
 			in.DerivationSuffix = row.DerivationSuffix
 			in.SenderIdentityKey = row.SenderIdentityKey
 		}
+		if includeSourceTx {
+			in.SourceTransaction = sourceTxBytesFor(beef, txid)
+		}
 		inputs = append(inputs, in)
 		vin++
 	}
 	return inputs, nil
+}
+
+// sourceTxBytesFor returns the serialized source transaction for txid from the
+// ancestry BEEF, or nil when absent. The wallet needs each input's source
+// transaction to build the atomic BEEF of a signable (two-step SignAction)
+// transaction; this populates it when the caller sets IncludeAllSourceTransactions.
+func sourceTxBytesFor(beef *transaction.Beef, txid string) primitives.ExplicitByteArray {
+	if beef == nil {
+		return nil
+	}
+	if src := beef.FindTransaction(txid); src != nil {
+		return src.Bytes()
+	}
+	return nil
 }
 
 const txDefaultUnlockLen = 107 // P2PKH unlocking script estimate

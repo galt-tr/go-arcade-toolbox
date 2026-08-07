@@ -1,0 +1,82 @@
+package validate_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+)
+
+func TestValidBasketConfiguration_Success(t *testing.T) {
+	tests := map[string]struct {
+		config *wdk.BasketConfiguration
+	}{
+		"valid name": {
+			config: &wdk.BasketConfiguration{
+				Name: "ValidName",
+			},
+		},
+		"exact 300 bytes": {
+			config: &wdk.BasketConfiguration{
+				Name: primitives.StringUnder300(strings.Repeat("a", 300)),
+			},
+		},
+		"zero MinimumDesiredUTXOValue is allowed for non-change baskets": {
+			config: &wdk.BasketConfiguration{
+				Name:                    "not-the-change-basket",
+				MinimumDesiredUTXOValue: 0,
+			},
+		},
+		"non-zero MinimumDesiredUTXOValue for the change basket": {
+			config: &wdk.BasketConfiguration{
+				Name:                    wdk.BasketNameForChange,
+				MinimumDesiredUTXOValue: 1000,
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validate.ValidBasketConfiguration(test.config)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestValidBasketConfiguration_Error(t *testing.T) {
+	tests := map[string]struct {
+		config      *wdk.BasketConfiguration
+		expectedErr string
+	}{
+		"empty name": {
+			config: &wdk.BasketConfiguration{
+				Name: "",
+			},
+			expectedErr: "invalid Basket name: at least 1 length",
+		},
+		"name too long": {
+			config: &wdk.BasketConfiguration{
+				Name: primitives.StringUnder300(strings.Repeat("a", 301)),
+			},
+			expectedErr: "invalid Basket name: no more than 300 length",
+		},
+		"zero MinimumDesiredUTXOValue for the change basket": {
+			config: &wdk.BasketConfiguration{
+				Name:                    wdk.BasketNameForChange,
+				MinimumDesiredUTXOValue: 0,
+			},
+			expectedErr: "minimumDesiredUTXOValue must be greater than 0 for the change basket, got 0",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validate.ValidBasketConfiguration(test.config)
+			require.Error(t, err)
+			assert.EqualError(t, err, test.expectedErr)
+		})
+	}
+}

@@ -264,7 +264,7 @@ func (p *Provider) persistCreateAction(
 		}
 	}
 
-	sdkInputs, err := p.buildResultInputs(ctx, userID, providedInputs, fundRes.AllocatedUTXOs, beef)
+	sdkInputs, err := p.buildResultInputs(ctx, userID, providedInputs, fundRes.AllocatedUTXOs, beef, args.IncludeAllSourceTransactions)
 	if err != nil {
 		return nil, err
 	}
