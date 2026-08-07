@@ -4,9 +4,71 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 )
+
+// defaultKnownTxListLimit bounds a status drill-down when the caller passes a
+// non-positive or oversized limit.
+const defaultKnownTxListLimit = 200
+
+// KnownTxRow is one transaction in a status drill-down.
+type KnownTxRow struct {
+	TxID          string  `json:"txid"`
+	Status        string  `json:"status"`
+	ArcadeStatus  string  `json:"arcade_status"`
+	BlockHeight   *uint32 `json:"block_height,omitempty"`
+	UpdatedAtUnix int64   `json:"updated_at_unix"`
+}
+
+func clampListLimit(limit int) int {
+	if limit <= 0 || limit > 1000 {
+		return defaultKnownTxListLimit
+	}
+	return limit
+}
+
+func toKnownTxRows(rows []metastore.KnownTx) []KnownTxRow {
+	out := make([]KnownTxRow, 0, len(rows))
+	for i := range rows {
+		kt := &rows[i]
+		arcade := ""
+		if kt.ArcadeStatus != nil {
+			arcade = *kt.ArcadeStatus
+		}
+		out = append(out, KnownTxRow{
+			TxID:          kt.TxID,
+			Status:        string(kt.Status),
+			ArcadeStatus:  arcade,
+			BlockHeight:   kt.BlockHeight,
+			UpdatedAtUnix: kt.UpdatedAt.Unix(),
+		})
+	}
+	return out
+}
+
+// ListKnownTxByArcadeStatus returns up to limit known transactions whose arcade
+// status equals arcadeStatus (empty string = not yet reported), most-recent
+// first. Read-only, deployment-wide (known_txs is not user-scoped). Backs the
+// dashboard's click-a-status-bucket drill-down.
+func (p *Provider) ListKnownTxByArcadeStatus(ctx context.Context, arcadeStatus string, limit int) ([]KnownTxRow, error) {
+	rows, err := p.meta.KnownTx().ListByArcadeStatus(ctx, arcadeStatus, clampListLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("storage: list known txs by arcade status: %w", err)
+	}
+	return toKnownTxRows(rows), nil
+}
+
+// ListKnownTxByStatus is the wallet-side-status counterpart of
+// [Provider.ListKnownTxByArcadeStatus].
+func (p *Provider) ListKnownTxByStatus(ctx context.Context, status string, limit int) ([]KnownTxRow, error) {
+	rows, err := p.meta.KnownTx().ListByStatus(ctx, wdk.ProvenTxReqStatus(status), clampListLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("storage: list known txs by status: %w", err)
+	}
+	return toKnownTxRows(rows), nil
+}
 
 // TierState is the claimable inventory of one settlement tier within a basket.
 type TierState struct {

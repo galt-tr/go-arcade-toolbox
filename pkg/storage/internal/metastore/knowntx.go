@@ -62,6 +62,31 @@ type KnownTxRepo struct{ s *Store }
 // KnownTx returns the known-transactions repository.
 func (s *Store) KnownTx() KnownTxRepo { return KnownTxRepo{s} }
 
+// ListByArcadeStatus returns known txs whose arcade status equals arcadeStatus,
+// most-recently-updated first, up to limit. An empty arcadeStatus matches rows
+// with no arcade status yet (NULL or ""). Deployment-wide; for UI drill-down.
+func (r KnownTxRepo) ListByArcadeStatus(ctx context.Context, arcadeStatus string, limit int) ([]KnownTx, error) {
+	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
+	if arcadeStatus == "" {
+		q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
+			"WHERE arcade_status IS NULL OR arcade_status = '' " +
+			"ORDER BY updated_at DESC, txid ASC" + clause)
+		return r.queryList(ctx, q, pageArgs)
+	}
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs WHERE arcade_status = ? " +
+		"ORDER BY updated_at DESC, txid ASC" + clause)
+	return r.queryList(ctx, q, append([]any{arcadeStatus}, pageArgs...))
+}
+
+// ListByStatus returns known txs in the given wallet-side status, most-recently-
+// updated first, up to limit. Deployment-wide; for UI drill-down.
+func (r KnownTxRepo) ListByStatus(ctx context.Context, status wdk.ProvenTxReqStatus, limit int) ([]KnownTx, error) {
+	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs WHERE status = ? " +
+		"ORDER BY updated_at DESC, txid ASC" + clause)
+	return r.queryList(ctx, q, append([]any{string(status)}, pageArgs...))
+}
+
 // CountByArcadeStatus returns the number of known transactions in each
 // arcade-reported status (SEEN_ON_NETWORK / SEEN_MULTIPLE_NODES / MINED /
 // REJECTED / …). Rows with no arcade status yet are grouped under "" (not yet
