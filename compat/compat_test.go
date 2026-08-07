@@ -286,6 +286,10 @@ func (m *stubStorageManager) GetBalance(_ context.Context, _ string) (uint64, er
 	return 0, nil
 }
 
+func (m *stubStorageManager) GetClaimableCount(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
+
 // stubWalletStorage adds GetAuth on top of the embedded manager — the shape
 // wdk.WalletStorage (the field type Wallet.storage / WithStorageManager's
 // parameter) requires.
