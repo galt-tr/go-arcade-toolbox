@@ -702,6 +702,24 @@ func (w *Wallet) BasketBalance(ctx context.Context, basket string) (balance uint
 	return balance, nil
 }
 
+// BasketClaimableCount returns the number of claimable (unreserved, unspent,
+// unfrozen) coins in the given basket. Unlike BasketBalance (which sums
+// satoshis), it counts distinct coins, so a fuel keeper can tell a single big
+// deposit coin apart from many recycled change coins and decide whether it can
+// parallelize a direct-recycle mint.
+func (w *Wallet) BasketClaimableCount(ctx context.Context, basket string) (count int, err error) {
+	ctx, span := tracing.StartTracing(ctx, "Wallet-BasketClaimableCount", attribute.String("basket", basket))
+	defer func() {
+		tracing.EndTracing(span, err)
+	}()
+
+	count, err = w.storage.GetClaimableCount(ctx, basket)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get basket %q claimable count: %w", basket, err)
+	}
+	return count, nil
+}
+
 // RelinquishOutput relinquishes an output from a basket, removing it from tracking without spending it.
 func (w *Wallet) RelinquishOutput(ctx context.Context, args sdk.RelinquishOutputArgs, originator string) (*sdk.RelinquishOutputResult, error) {
 	var err error

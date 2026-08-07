@@ -65,6 +65,12 @@ type ShapedChange struct {
 	Satoshis primitives.SatoshiValue `json:"satoshis"`
 	// Basket is the destination: the configured pool or reserve basket.
 	Basket primitives.StringUnder300 `json:"basket"`
+	// SourceBasket, when non-empty, overrides the basket the fan-out draws its
+	// funding from. Empty keeps the default routing (a pool-destination leaf funds
+	// from the reserve basket; a reserve-destination chunk funds from the change
+	// basket). Set it to fund a leaf directly from the change basket for
+	// high-throughput recycling, bypassing chunk pre-aggregation.
+	SourceBasket primitives.StringUnder300 `json:"sourceBasket,omitempty"`
 }
 
 // ValidCreateActionOptions represents options for createAction

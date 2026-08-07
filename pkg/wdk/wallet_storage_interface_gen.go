@@ -63,4 +63,8 @@ type WalletStorageBasic interface {
 	// Empty basket defaults to BasketNameForChange ("default").
 	// @Read
 	GetBalance(ctx context.Context, basket string) (uint64, error)
+	// GetClaimableCount returns the number of claimable coins in the given basket for the authenticated user.
+	// Empty basket defaults to BasketNameForChange ("default").
+	// @Read
+	GetClaimableCount(ctx context.Context, basket string) (int, error)
 }

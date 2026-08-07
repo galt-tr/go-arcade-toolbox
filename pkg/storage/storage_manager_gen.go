@@ -159,3 +159,25 @@ func (m *WalletStorageManager) GetBalance(ctx context.Context, basket string) (u
 
 	return m.getActiveReader().GetBalance(ctx, auth, basket)
 }
+
+// GetClaimableCount returns the number of claimable coins in the given basket for the authenticated user.
+// Empty basket defaults to BasketNameForChange ("default").
+//
+// GetClaimableCount is a concrete Provider method, not part of the
+// wdk.WalletStorageProvider interface getActiveReader exposes, so the active
+// store is type-asserted to reach it (the perfprovider-built *storage.Provider
+// implements it).
+func (m *WalletStorageManager) GetClaimableCount(ctx context.Context, basket string) (int, error) {
+	auth, err := m.GetAuth(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get user authentication: %w", err)
+	}
+
+	counter, ok := m.GetActive().(interface {
+		GetClaimableCount(ctx context.Context, auth wdk.AuthID, basket string) (int, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("active storage does not support GetClaimableCount")
+	}
+	return counter.GetClaimableCount(ctx, auth, basket)
+}

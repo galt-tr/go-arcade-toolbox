@@ -31,6 +31,10 @@ type fakeWallet struct {
 	// this many chunks — simulates a default basket that cannot fund the
 	// full ask ("not enough funds").
 	maxChunkCount uint64
+	// claimableCount is what BasketClaimableCount reports (distinct claimable
+	// change coins). 0 → a large default, so the direct-recycle path is taken
+	// unless a test deliberately sets a small value to force the chunk path.
+	claimableCount int
 }
 
 // test denominations mirror keeperConfig(): pool leaves are Denomination sats,
@@ -38,8 +42,8 @@ type fakeWallet struct {
 // BasketBalance reports claimable sats = coin count × denomination, so the
 // keeper's balance/denomination measurement recovers the original counts.
 const (
-	testPoolDenom    = 240               // keeperConfig().Denomination
-	testReserveDenom = 100*240 + 1000    // 25000
+	testPoolDenom    = 240            // keeperConfig().Denomination
+	testReserveDenom = 100*240 + 1000 // 25000
 )
 
 func (f *fakeWallet) BasketBalance(_ context.Context, basket string) (uint64, error) {
@@ -49,6 +53,15 @@ func (f *fakeWallet) BasketBalance(_ context.Context, basket string) (uint64, er
 		return uint64(f.reserveTotal) * testReserveDenom, nil
 	}
 	return uint64(f.poolTotal) * testPoolDenom, nil
+}
+
+func (f *fakeWallet) BasketClaimableCount(_ context.Context, _ string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.claimableCount == 0 {
+		return 1 << 20, nil // plenty: enough distinct coins to parallelize
+	}
+	return f.claimableCount, nil
 }
 
 func (f *fakeWallet) FanOutFuel(_ context.Context, shape wdk.ShapedChange, _ string) (*sdk.CreateActionResult, error) {
@@ -152,6 +165,62 @@ func TestRunOnce_ChunksReserveFirstWhenEmpty(t *testing.T) {
 	for _, call := range leaves {
 		assert.Equal(t, "fuel", string(call.shape.Basket))
 	}
+}
+
+func TestRunOnce_DirectRecycleFromChangeBasket(t *testing.T) {
+	cfg := keeperConfig()
+	cfg.RecycleBasket = "default"
+	cfg.RecycleCount = 4 // distinct from FanoutOutputsPerTx and the 8 default
+	// poolTotal 0 → deficit 1000 → 10 leaves capped at FanoutMaxTxsPerRound (5).
+	// claimableCount large (>= 2×conc) selects the direct-recycle path.
+	fake := &fakeWallet{poolTotal: 0, reserveTotal: 0, claimableCount: 1000}
+	keeper, err := fuelkeeper.New(fake, cfg, logging.NewTestLogger(t))
+	require.NoError(t, err)
+
+	require.NoError(t, keeper.RunOnce(t.Context()))
+
+	require.Equal(t, 5, fake.fuelFanOuts())
+	fuel := 0
+	for _, c := range fake.fanOuts {
+		require.NotEqual(t, "reserve", string(c.shape.Basket),
+			"direct-recycle path must not create reserve chunks")
+		if string(c.shape.Basket) == "fuel" {
+			fuel++
+			assert.EqualValues(t, 4, c.shape.Count, "RecycleCount outputs per recycle leaf")
+			assert.EqualValues(t, 240, c.shape.Satoshis)
+			assert.Equal(t, "default", string(c.shape.SourceBasket),
+				"recycle leaf funds directly from the change basket")
+		}
+	}
+	require.Equal(t, 5, fuel)
+	assert.EqualValues(t, 20, fake.pool(), "5 leaves × 4 outputs")
+	assert.EqualValues(t, 0, fake.reserveTotal, "reserve basket untouched")
+}
+
+func TestRunOnce_TooFewChangeCoinsFallsBackToChunks(t *testing.T) {
+	cfg := keeperConfig()
+	cfg.RecycleBasket = "default"
+	cfg.RecycleCount = 4
+	// conc defaults to 1 → threshold 2×1 = 2; a single claimable change coin
+	// (bootstrap / one big deposit) cannot parallelize, so the chunk path wins.
+	fake := &fakeWallet{poolTotal: 0, reserveTotal: 0, claimableCount: 1}
+	keeper, err := fuelkeeper.New(fake, cfg, logging.NewTestLogger(t))
+	require.NoError(t, err)
+
+	require.NoError(t, keeper.RunOnce(t.Context()))
+
+	require.NotEmpty(t, fake.fanOuts)
+	assert.Equal(t, "reserve", string(fake.fanOuts[0].shape.Basket),
+		"chunk path provisions a reserve chunk first")
+	require.Equal(t, 5, fake.fuelFanOuts())
+	for _, c := range fake.fanOuts {
+		if string(c.shape.Basket) == "fuel" {
+			assert.EqualValues(t, 100, c.shape.Count, "chunk-path leaves mint FanoutOutputsPerTx")
+			assert.Empty(t, string(c.shape.SourceBasket),
+				"chunk-path leaf has no SourceBasket override")
+		}
+	}
+	assert.EqualValues(t, 500, fake.pool(), "5 leaves × 100 outputs")
 }
 
 func TestSetTargetPoolSize_UsedOnNextRound(t *testing.T) {

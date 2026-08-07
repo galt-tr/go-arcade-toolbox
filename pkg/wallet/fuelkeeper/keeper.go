@@ -38,6 +38,11 @@ type WalletAPI interface {
 	// reserved-until-broadcast coins excluded — so the keeper measures genuine
 	// inventory rather than raw output counts.
 	BasketBalance(ctx context.Context, basket string) (uint64, error)
+	// BasketClaimableCount reports the number of distinct claimable coins in a
+	// basket (not their satoshis), so the keeper can tell one big deposit coin
+	// apart from many recycled change coins and decide whether a direct-recycle
+	// mint can parallelize.
+	BasketClaimableCount(ctx context.Context, basket string) (int, error)
 	FanOutFuel(ctx context.Context, shape wdk.ShapedChange, originator string) (*sdk.CreateActionResult, error)
 }
 
@@ -76,7 +81,22 @@ type Config struct {
 	// once — a single serial mint loop cannot refill fast enough to match a
 	// high-TPS stream's burn rate. 0 → 1 (serial).
 	MintConcurrency uint64
+
+	// RecycleBasket, when set, is the change basket the keeper recycles from: when
+	// it holds enough distinct claimable coins to parallelize, the keeper mints
+	// fuel leaves that fund DIRECTLY from it (RecycleCount outputs per leaf),
+	// skipping the serial reserve-chunk aggregation. Empty disables direct recycle
+	// (chunk path only).
+	RecycleBasket string
+	// RecycleCount is the fuel outputs per direct-recycle leaf (small, e.g. 8, so
+	// each leaf tx aggregates only a few change coins). 0 → DefaultRecycleCount.
+	RecycleCount uint64
 }
+
+// DefaultRecycleCount is the default fuel outputs per direct-recycle leaf (see
+// Config.RecycleCount): small, so each recycle leaf aggregates only a few
+// change coins and stays cheap to sign.
+const DefaultRecycleCount = 8
 
 // Defaults for the stream-active fairness knobs (see Config).
 const (
@@ -175,6 +195,9 @@ func New(walletAPI WalletAPI, cfg Config, logger *slog.Logger) (*Keeper, error) 
 	}
 	if cfg.StreamYieldMultiple == 0 {
 		cfg.StreamYieldMultiple = DefaultStreamYieldMultiple
+	}
+	if cfg.RecycleCount == 0 {
+		cfg.RecycleCount = DefaultRecycleCount
 	}
 	return &Keeper{
 		wallet: walletAPI,
@@ -341,21 +364,58 @@ func (k *Keeper) runOnce(ctx context.Context) (catchUp bool, err error) {
 		slog.Uint64("leafTxs", leaves),
 		slog.Uint64("maxLeafTxsPerRound", cfg.FanoutMaxTxsPerRound))
 
-	chunks, err := k.ensureChunks(ctx, cfg, leaves)
-	if err != nil {
-		return false, err
-	}
-	// Every leaf consumes one chunk; minting past the provisioned chunks
-	// would silently drain the default basket via the funding fallback.
-	if leaves > chunks {
-		k.logger.InfoContext(ctx, "clamping round to available reserve chunks",
-			slog.Uint64("leaves", leaves), slog.Uint64("chunks", chunks))
-		leaves = chunks
+	// Direct-recycle fast path: when the change basket holds enough distinct
+	// claimable coins that concurrent leaves will not all contend on one, mint
+	// fuel leaves that fund straight from it (RecycleCount outputs each),
+	// bypassing the serial reserve-chunk aggregation — which cannot build large
+	// chunks out of ~fuel-sized recycled coins fast enough to match a recycling
+	// blast's burn rate. Too few coins (bootstrap / one big deposit) falls
+	// through to the chunk path.
+	var minted uint64
+	recycled := false
+	if cfg.RecycleBasket != "" {
+		recycleCoins, rerr := k.wallet.BasketClaimableCount(ctx, cfg.RecycleBasket)
+		if rerr != nil {
+			k.logger.WarnContext(ctx, "failed to measure recycle basket, using chunk path",
+				slog.String("recycleBasket", cfg.RecycleBasket), logging.Error(rerr))
+		} else {
+			conc := cfg.MintConcurrency
+			if conc == 0 {
+				conc = 1
+			}
+			// Require ~two coins per concurrent leaf so parallel leaves are not
+			// all selecting the same handful of change coins (a provided-input
+			// conflict that would fail most of the round).
+			if recycleCoins >= 2*int(conc) { //nolint:gosec // conc is a small config knob
+				k.logger.InfoContext(ctx, "recycling fuel directly from change basket",
+					slog.Int("recycleCoins", recycleCoins),
+					slog.Uint64("leafTxs", leaves))
+				minted, err = k.mintRecycleLeaves(ctx, cfg, leaves)
+				if err != nil {
+					return false, err
+				}
+				recycled = true
+			}
+		}
 	}
 
-	minted, err := k.mintLeaves(ctx, cfg, leaves)
-	if err != nil {
-		return false, err
+	if !recycled {
+		chunks, cerr := k.ensureChunks(ctx, cfg, leaves)
+		if cerr != nil {
+			return false, cerr
+		}
+		// Every leaf consumes one chunk; minting past the provisioned chunks
+		// would silently drain the default basket via the funding fallback.
+		if leaves > chunks {
+			k.logger.InfoContext(ctx, "clamping round to available reserve chunks",
+				slog.Uint64("leaves", leaves), slog.Uint64("chunks", chunks))
+			leaves = chunks
+		}
+
+		minted, err = k.mintLeaves(ctx, cfg, leaves)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	k.logger.InfoContext(ctx, "fuel top-up round complete",
@@ -436,6 +496,77 @@ func (k *Keeper) mintLeaves(ctx context.Context, cfg Config, leaves uint64) (uin
 	minted := mintedLeaves.Load() * cfg.FanoutOutputsPerTx
 	if err != nil {
 		return minted, fmt.Errorf("mint round failed after %d outputs: %w", minted, err)
+	}
+	return minted, nil
+}
+
+// mintOneRecycleLeaf performs a single direct-recycle leaf fan-out: it mints
+// RecycleCount fuel outputs funded straight from the change (recycle) basket,
+// skipping the reserve chunk. Its retry loop mirrors mintOneLeaf's — concurrent
+// leaves draw from the same change basket and can pick the same coins, which
+// storage reports as a (non-retryable) provided-input conflict; a short stagger
+// between attempts spreads the selection.
+func (k *Keeper) mintOneRecycleLeaf(ctx context.Context, cfg Config, minted *atomic.Uint64) error {
+	shape := wdk.ShapedChange{
+		Count:        cfg.RecycleCount,
+		Satoshis:     primitives.SatoshiValue(cfg.Denomination),
+		Basket:       primitives.StringUnder300(cfg.PoolBasket),
+		SourceBasket: primitives.StringUnder300(cfg.RecycleBasket), // fund directly from change
+	}
+
+	var err error
+	for attempt := range mintLeafAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Duration(attempt) * mintLeafRetryBackoff):
+			}
+		}
+		if err = k.fanOut(ctx, cfg, shape); err == nil {
+			minted.Add(1)
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("recycle leaf fan-out failed after %d attempts: %w", mintLeafAttempts, err)
+}
+
+// mintRecycleLeaves runs up to `leaves` direct-recycle leaf fan-outs with
+// MintConcurrency-bounded parallelism and returns how many fuel outputs were
+// minted (leaves × RecycleCount). It mirrors mintLeaves' concurrency and
+// stream-fairness structure but funds each leaf directly from the change basket
+// (see mintOneRecycleLeaf) instead of consuming a reserve chunk.
+func (k *Keeper) mintRecycleLeaves(ctx context.Context, cfg Config, leaves uint64) (uint64, error) {
+	conc := cfg.MintConcurrency
+	if conc == 0 {
+		conc = 1
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(int(conc))
+
+	var mintedLeaves atomic.Uint64
+	issued := uint64(0)
+	for range leaves {
+		if gctx.Err() != nil {
+			break
+		}
+		if k.streamActive.Load() && issued >= cfg.StreamLeafCap {
+			k.logger.InfoContext(ctx, "stream active, ending recycle round at leaf cap",
+				slog.Uint64("issuedLeaves", issued))
+			break
+		}
+		issued++
+		g.Go(func() error { return k.mintOneRecycleLeaf(gctx, cfg, &mintedLeaves) })
+	}
+
+	err := g.Wait()
+	minted := mintedLeaves.Load() * cfg.RecycleCount
+	if err != nil {
+		return minted, fmt.Errorf("recycle mint round failed after %d outputs: %w", minted, err)
 	}
 	return minted, nil
 }

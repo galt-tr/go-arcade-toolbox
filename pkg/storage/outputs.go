@@ -105,6 +105,29 @@ func (p *Provider) GetBalance(ctx context.Context, auth wdk.AuthID, basket strin
 	return total, nil
 }
 
+// GetClaimableCount returns the number of claimable (unreserved, unspent,
+// unfrozen) coins in the basket across the spendable tiers, for observability
+// and fuel-keeper sizing. Empty basket defaults to the change basket.
+func (p *Provider) GetClaimableCount(ctx context.Context, auth wdk.AuthID, basket string) (int, error) {
+	p.trace(ctx, "GetClaimableCount")
+	userID, err := p.userID(auth)
+	if err != nil {
+		return 0, err
+	}
+	if basket == "" {
+		basket = p.changeBasketName()
+	}
+	bal, err := p.utxo.Balance(ctx, int64(userID), basket)
+	if err != nil {
+		return 0, fmt.Errorf("storage: claimable count: %w", err)
+	}
+	var total int
+	for _, v := range bal.ClaimableCount {
+		total += v
+	}
+	return total, nil
+}
+
 // FindOutputBasketsAuth returns the user's output baskets matching the filters.
 func (p *Provider) FindOutputBasketsAuth(ctx context.Context, auth wdk.AuthID, filters wdk.FindOutputBasketsArgs) (wdk.TableOutputBaskets, error) {
 	p.trace(ctx, "FindOutputBasketsAuth")

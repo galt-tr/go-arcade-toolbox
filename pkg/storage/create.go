@@ -454,6 +454,12 @@ func (p *Provider) fundingSource(shape *wdk.ShapedChange) (basket string, denomi
 // fanOutSourceBasket resolves which basket a fan-out draws its funding from,
 // given the shape's destination basket (see [Provider.fundingSource]).
 func (p *Provider) fanOutSourceBasket(shape *wdk.ShapedChange) string {
+	// An explicit source basket wins: the fuel keeper uses it to fund a leaf
+	// directly from the change basket (high-throughput recycling), bypassing
+	// the reserve-chunk pre-aggregation the default routing would pick.
+	if shape.SourceBasket != "" {
+		return string(shape.SourceBasket)
+	}
 	if p.utxoMgmt.Enabled() && string(shape.Basket) == p.utxoMgmt.Throughput.PoolBasket {
 		return p.utxoMgmt.Throughput.ReserveBasket
 	}
