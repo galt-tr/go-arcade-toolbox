@@ -55,10 +55,24 @@ func (f *Funder) claimExactFastPath(ctx context.Context, args FundArgs, collecto
 		n = maxExactClaim
 	}
 
-	scope := utxostore.Scope{UserID: args.UserID, Basket: args.Basket, Tier: args.Tiers[0]}
-	claimed, err := f.store.ClaimExact(ctx, scope, args.Reservation, args.Denomination, int(n)) //nolint:gosec // n <= maxExactClaim
-	if err != nil {
-		return fmt.Errorf("failed to claim exact fuel coins: %w", err)
+	// Claim exact-denomination fuel coins across the spend tiers, safest first.
+	// On a real network the pool lingers at TierUnproven (coins are broadcast-
+	// accepted but rarely mined), so a mined-only claim would miss the entire
+	// pool and force every payment onto the contended bounded walk — walking the
+	// tiers keeps the low-contention fast path alive regardless of settlement.
+	remaining := int(n) //nolint:gosec // n <= maxExactClaim
+	var claimed []*utxostore.UTXO
+	for _, tier := range args.Tiers {
+		if remaining <= 0 {
+			break
+		}
+		scope := utxostore.Scope{UserID: args.UserID, Basket: args.Basket, Tier: tier}
+		got, err := f.store.ClaimExact(ctx, scope, args.Reservation, args.Denomination, remaining)
+		if err != nil {
+			return fmt.Errorf("failed to claim exact fuel coins: %w", err)
+		}
+		claimed = append(claimed, got...)
+		remaining -= len(got)
 	}
 
 	consumed := 0

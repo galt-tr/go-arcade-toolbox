@@ -81,6 +81,26 @@ func TestFund_Throughput_ContentionExhausted(t *testing.T) {
 	require.ErrorIs(t, err, funder.ErrUTXOContention)
 }
 
+// TestFund_Throughput_ExactClaimsUnprovenTier proves the fast path stays alive
+// when the pool lingers at TierUnproven (the real-network case: broadcast-
+// accepted fuel that is never mined). It must claim the unproven coin via
+// ClaimExact by walking the spend tiers — not fall back to the bounded walk.
+func TestFund_Throughput_ExactClaimsUnprovenTier(t *testing.T) {
+	inner := newMemStore()
+	mintCoins(t, inner, "fuel", utxostore.TierUnproven, 1000, 1000, 1000)
+	store := newRecordingStore(inner)
+	f := newFunder(t, store, 1)
+
+	result, err := f.Fund(t.Context(), throughputArgs(900, 1000))
+
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1000}, allocatedSats(result), "an unproven denomination coin funds the target")
+	// The fast path probes mined (empty) then unproven (hit); both are ClaimExact
+	// and the bounded walk is never reached.
+	require.Equal(t, []claimKind{kindExact, kindExact}, store.kinds(),
+		"unproven fuel is claimed by the fast path across tiers, not the bounded walk")
+}
+
 // TestSpendTiers pins the policy-to-tier mapping.
 func TestSpendTiers(t *testing.T) {
 	require.Equal(t, []utxostore.Tier{utxostore.TierMined}, funder.SpendTiers(defs.SpendPolicyMinedOnly))
