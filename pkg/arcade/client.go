@@ -14,6 +14,7 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/go-softwarelab/common/pkg/must"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
 )
@@ -128,7 +129,7 @@ func New(logger *slog.Logger, httpClient *resty.Client, config defs.Arcade) *Cli
 	c := &Client{
 		logger:                 logger,
 		httpClient:             httpClient,
-		sseClient:              newSSEClient(),
+		sseClient:              sse.NewHTTPClient(),
 		config:                 config,
 		broadcastURL:           config.URL + "/tx",
 		queryTxURL:             config.URL + "/tx/{txid}",

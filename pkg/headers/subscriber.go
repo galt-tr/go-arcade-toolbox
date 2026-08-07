@@ -1,25 +1,21 @@
 package headers
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
 )
 
-// SSE tuning shared by the tip and reorg streams. These mirror pkg/arcade/sse.go
-// (the toolbox's proven status-stream reader); the pattern is duplicated here
-// rather than extracted into a shared package because arcade's implementation is
-// tightly bound to its own Client type, and a focused ~single-file reader keeps
-// the headers package self-contained. See the report note.
+// SSE tuning shared by the tip and reorg streams. The transport plumbing itself
+// (reconnect loop, backoff, watchdog, SSE parser) lives in internal/sse; these
+// bounds are handed to it per stream and stay overridable in tests.
 const (
 	// sseBackoffBase and sseBackoffMax bound the reconnect exponential backoff.
 	sseBackoffBase = 1 * time.Second
@@ -34,28 +30,7 @@ const (
 	// briefly-busy consumer does not immediately stall the reader.
 	tipChanBuffer   = 8
 	reorgChanBuffer = 8
-
-	sseScannerInitialBufferSize = 64 * 1024
-	sseScannerMaxBufferSize     = 1 << 20
 )
-
-// newSSEClient builds an HTTP client for the long-lived SSE streams: no overall
-// timeout (cancellation is context-driven) with sane dial/TLS/header timeouts.
-func newSSEClient() *http.Client {
-	return &http.Client{
-		Timeout: 0,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-		},
-	}
-}
 
 // SubscribeTip implements [ChainSubscriber.SubscribeTip]. It opens the
 // /tip/stream SSE, emitting a TipEvent for each tip the stream carries, and
@@ -73,7 +48,7 @@ func (c *Client) SubscribeTip(ctx context.Context) <-chan TipEvent {
 	go func() {
 		defer close(out)
 
-		// last/have are touched only by this goroutine (streamSSE calls the
+		// last/have are touched only by this goroutine (the SSE reader calls the
 		// callbacks synchronously from here), so no lock is needed.
 		var last chainhash.Hash
 		var have bool
@@ -86,8 +61,12 @@ func (c *Client) SubscribeTip(ctx context.Context) <-chan TipEvent {
 			last, have = ev.Hash, true
 		}
 
-		c.streamSSE(ctx, "tip", c.tipStreamURL,
-			func(connCtx context.Context) {
+		reader := sse.New(sse.Config{
+			Name:    "chaintracks-tip",
+			Logger:  c.logger,
+			Client:  c.sseClient,
+			Request: c.sseRequest(c.tipStreamURL),
+			OnConnect: func(connCtx context.Context) {
 				// Force a fresh emission on this (re)connect: reset dedup, then
 				// emit the current tip. If the fetch fails, the reset ensures the
 				// stream's own on-connect frame still emits a fresh tip.
@@ -100,21 +79,33 @@ func (c *Client) SubscribeTip(ctx context.Context) <-chan TipEvent {
 				}
 				send(ev)
 			},
-			func(data string) {
+			Handler: func(_ context.Context, f sse.Frame) bool {
+				if f.Data == "" {
+					return false
+				}
 				var w wireHeader
-				if err := json.Unmarshal([]byte(data), &w); err != nil {
+				if err := json.Unmarshal([]byte(f.Data), &w); err != nil {
 					c.logger.WarnContext(ctx, "tip stream: skipping malformed frame",
 						slog.String("error", err.Error()))
-					return
+					return false
 				}
 				c.observeTip(w.Height, w.Hash)
 				ev := TipEvent{Height: w.Height, Hash: w.Hash}
 				if have && last.IsEqual(&ev.Hash) {
-					return
+					return false
 				}
 				send(ev)
+				return true
 			},
-		)
+			// A connection that read at least one line was healthy; reset backoff.
+			// One that never got that far keeps backing off to avoid a hot-loop.
+			ResetBackoff:    func(r sse.ConnResult) bool { return r.ReadAny },
+			BackoffBase:     c.sseBackoffBase,
+			BackoffMax:      c.sseBackoffMax,
+			WatchdogTimeout: c.sseReadWatchdog,
+		})
+
+		_ = reader.Run(ctx)
 	}()
 
 	return out
@@ -135,32 +126,64 @@ func (c *Client) SubscribeReorg(ctx context.Context) <-chan ReorgEvent {
 	go func() {
 		defer close(out)
 
-		c.streamSSE(ctx, "reorg", c.reorgStreamURL, nil, func(data string) {
-			var w wireReorg
-			if err := json.Unmarshal([]byte(data), &w); err != nil {
-				c.logger.WarnContext(ctx, "reorg stream: skipping malformed frame",
-					slog.String("error", err.Error()))
-				return
-			}
-			if w.NewTip == nil {
-				c.logger.WarnContext(ctx, "reorg stream: skipping event without new tip",
-					slog.Int("orphanedCount", len(w.OrphanedHashes)))
-				return
-			}
+		reader := sse.New(sse.Config{
+			Name:    "chaintracks-reorg",
+			Logger:  c.logger,
+			Client:  c.sseClient,
+			Request: c.sseRequest(c.reorgStreamURL),
+			Handler: func(_ context.Context, f sse.Frame) bool {
+				if f.Data == "" {
+					return false
+				}
+				var w wireReorg
+				if err := json.Unmarshal([]byte(f.Data), &w); err != nil {
+					c.logger.WarnContext(ctx, "reorg stream: skipping malformed frame",
+						slog.String("error", err.Error()))
+					return false
+				}
+				if w.NewTip == nil {
+					c.logger.WarnContext(ctx, "reorg stream: skipping event without new tip",
+						slog.Int("orphanedCount", len(w.OrphanedHashes)))
+					return false
+				}
 
-			ev := c.toReorgEvent(&w)
-			// Evict before forwarding so a consumer observing the event never
-			// finds a stale orphaned header still cached.
-			c.evictFrom(ev.ForkHeight)
+				ev := c.toReorgEvent(&w)
+				// Evict before forwarding so a consumer observing the event never
+				// finds a stale orphaned header still cached.
+				c.evictFrom(ev.ForkHeight)
 
-			select {
-			case out <- ev:
-			case <-ctx.Done():
-			}
+				select {
+				case out <- ev:
+				case <-ctx.Done():
+				}
+				return true
+			},
+			ResetBackoff:    func(r sse.ConnResult) bool { return r.ReadAny },
+			BackoffBase:     c.sseBackoffBase,
+			BackoffMax:      c.sseBackoffMax,
+			WatchdogTimeout: c.sseReadWatchdog,
 		})
+
+		_ = reader.Run(ctx)
 	}()
 
 	return out
+}
+
+// sseRequest returns a request builder for the given SSE stream URL: a GET with
+// the standard event-stream headers, bound to the per-connection context the
+// reader passes it. The chaintracks streams carry no Last-Event-ID resume.
+func (c *Client) sseRequest(url string) func(context.Context) (*http.Request, error) {
+	return func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("User-Agent", userAgent)
+		return req, nil
+	}
 }
 
 // toReorgEvent maps the wire reorg shape onto the toolbox [ReorgEvent].
@@ -207,126 +230,4 @@ func (c *Client) fetchTip(ctx context.Context) (TipEvent, error) {
 
 	c.observeTip(body.Height, body.Hash)
 	return TipEvent{Height: body.Height, Hash: body.Hash}, nil
-}
-
-// streamSSE runs the reconnect loop for one SSE endpoint until ctx is canceled.
-// onConnect (may be nil) runs once after each successful connect; onData runs
-// for each SSE data frame. name labels the stream in logs.
-func (c *Client) streamSSE(ctx context.Context, name, url string, onConnect func(context.Context), onData func(string)) {
-	backoff := c.sseBackoffBase
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		progressed := c.streamOnce(ctx, url, onConnect, onData)
-		if ctx.Err() != nil {
-			return
-		}
-
-		// A connection that read at least one line was healthy; reset backoff.
-		// One that never got that far keeps backing off to avoid a hot-loop.
-		if progressed {
-			backoff = c.sseBackoffBase
-		}
-
-		c.logger.DebugContext(ctx, "chaintracks sse stream interrupted, reconnecting",
-			slog.String("stream", name),
-			slog.Duration("backoff", backoff))
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		backoff = min(backoff*2, c.sseBackoffMax)
-	}
-}
-
-// streamOnce performs a single SSE connection and dispatches data frames until
-// the stream ends. It reports whether any line was read (used to reset backoff).
-// A per-connection context backs a read-liveness watchdog: when no line arrives
-// within the watchdog timeout the connection (not the outer ctx) is canceled so
-// the stream reconnects instead of hanging on a dead peer.
-func (c *Client) streamOnce(ctx context.Context, url string, onConnect func(context.Context), onData func(string)) (progressed bool) {
-	connCtx, cancelConn := context.WithCancel(ctx)
-	defer cancelConn()
-
-	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, url, nil)
-	if err != nil {
-		c.logger.WarnContext(ctx, "chaintracks sse: failed to build request",
-			slog.String("url", url), slog.String("error", err.Error()))
-		return false
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", userAgent)
-
-	response, err := c.sseClient.Do(req)
-	if err != nil {
-		if ctx.Err() == nil {
-			c.logger.WarnContext(ctx, "chaintracks sse: failed to connect",
-				slog.String("url", url), slog.String("error", err.Error()))
-		}
-		return false
-	}
-	defer func() { _ = response.Body.Close() }()
-
-	if response.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, sseScannerInitialBufferSize))
-		c.logger.WarnContext(ctx, "chaintracks sse: unexpected http status",
-			slog.String("url", url), slog.Int("status", response.StatusCode))
-		return false
-	}
-
-	if onConnect != nil {
-		onConnect(ctx)
-	}
-
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 0, sseScannerInitialBufferSize), sseScannerMaxBufferSize)
-
-	watchdog := time.AfterFunc(c.sseReadWatchdog, cancelConn)
-	defer watchdog.Stop()
-
-	var data string
-	for scanner.Scan() {
-		watchdog.Reset(c.sseReadWatchdog)
-		progressed = true
-		line := scanner.Text()
-
-		// A blank line ends a frame: dispatch accumulated data and reset.
-		if line == "" {
-			if data != "" {
-				onData(data)
-			}
-			data = ""
-			continue
-		}
-		// Comments (": keepalive") are ignored; only "data:" lines accumulate.
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		if value, ok := sseDataValue(line); ok {
-			if data != "" {
-				data += "\n"
-			}
-			data += value
-		}
-	}
-	// An incomplete trailing frame is discarded per the SSE spec.
-
-	return progressed
-}
-
-// sseDataValue returns the value of a "data:" SSE field line (stripping the one
-// optional leading space), and whether the line was a data field. Non-data
-// fields (id/event/…) are irrelevant to these streams and ignored.
-func sseDataValue(line string) (string, bool) {
-	field, value, found := strings.Cut(line, ":")
-	if !found || field != "data" {
-		return "", false
-	}
-	return strings.TrimPrefix(value, " "), true
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
 )
@@ -184,7 +185,7 @@ func New(logger *slog.Logger, cfg defs.ChainTracks, opts ...Option) (*Client, er
 		SetDebug(logging.IsDebug(logger))
 
 	if c.sseClient == nil {
-		c.sseClient = newSSEClient()
+		c.sseClient = sse.NewHTTPClient()
 	}
 
 	return c, nil

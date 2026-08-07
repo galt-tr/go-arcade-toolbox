@@ -1,18 +1,14 @@
 package arcade
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
+	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 )
 
@@ -26,30 +22,11 @@ const (
 	// redialed instead of hanging.
 	readWatchdogTimeout = 60 * time.Second
 
-	// sseScannerInitialBufferSize is the initial buffer of the SSE line scanner.
-	sseScannerInitialBufferSize = 64 * 1024
-	// sseScannerMaxBufferSize is the maximum size of a single SSE line (1 MiB).
-	sseScannerMaxBufferSize = 1 << 20
+	// sseScannerMaxBufferSize is the maximum size of a single SSE line (1 MiB),
+	// mirroring the shared reader's cap. Retained here so the oversized-frame
+	// test can build a line that trips it.
+	sseScannerMaxBufferSize = sse.MaxLineSize
 )
-
-// newSSEClient creates an HTTP client for the long-lived SSE stream: no overall
-// timeout (cancellation is driven by context), but sane dial/TLS/response-header
-// timeouts on the transport.
-func newSSEClient() *http.Client {
-	return &http.Client{
-		Timeout: 0,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-		},
-	}
-}
 
 // eventsURL builds the full SSE endpoint URL, falling back to the base URL when
 // EventsURL is not configured and scoping the stream with the callback token.
@@ -75,170 +52,83 @@ func eventsURL(config defs.Arcade) string {
 // any event arrives), and drops+redials a connection on which nothing is read
 // for the watchdog timeout.
 //
+// The transport plumbing (reconnect loop, backoff, watchdog, SSE parser) lives
+// in internal/sse; this method supplies only the arcade-specific policy: the
+// request (callback token + Last-Event-ID resume header), per-frame dispatch
+// (the StatusEvent shape, the at-least-once ns cursor), and the reset-only-after
+// -clean-delivery rule.
+//
 // It blocks until ctx is canceled and then returns ctx.Err(). An error returned
 // by onEvent is only logged - the event still counts as delivered (at-least-once).
 func (c *Client) StreamStatus(ctx context.Context, lastEventID string, onEvent func(StatusEvent) error) error {
-	backoff := c.sseBackoffBase
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		delivered, err := c.streamOnce(ctx, &lastEventID, onEvent)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if err != nil {
-			c.logger.WarnContext(
-				ctx, "arcade events stream interrupted, reconnecting",
-				slog.String("error", err.Error()),
-				slog.Int("deliveredEvents", delivered),
-				slog.Duration("backoff", backoff),
-			)
-		} else {
-			c.logger.DebugContext(
-				ctx, "arcade events stream closed by server, reconnecting",
-				slog.Int("deliveredEvents", delivered),
-				slog.Duration("backoff", backoff),
-			)
-		}
-
+	reader := sse.New(sse.Config{
+		Name:   "arcade-events",
+		Logger: c.logger,
+		Client: c.sseClient,
+		Request: func(connCtx context.Context) (*http.Request, error) {
+			req, err := http.NewRequestWithContext(connCtx, http.MethodGet, c.eventsURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Accept", "text/event-stream")
+			req.Header.Set("Cache-Control", "no-cache")
+			req.Header.Set("User-Agent", userAgent)
+			// Last-Event-ID resumes from the most recently delivered event; the
+			// cursor is advanced by dispatchFrame on delivery (at-least-once).
+			if lastEventID != "" {
+				req.Header.Set("Last-Event-ID", lastEventID)
+			}
+			return req, nil
+		},
+		Handler: func(hctx context.Context, f sse.Frame) bool {
+			return c.dispatchFrame(hctx, f, &lastEventID, onEvent)
+		},
 		// Reset backoff only after a cleanly-ended connection that delivered
 		// events; a connection that died with a read error (e.g. an oversized
 		// frame hitting bufio.ErrTooLong on every reconnect) must keep backing
 		// off to avoid a hot-loop.
-		if delivered > 0 && err == nil {
-			backoff = c.sseBackoffBase
-		}
+		ResetBackoff: func(r sse.ConnResult) bool {
+			return r.Delivered > 0 && r.Err == nil
+		},
+		BackoffBase:     c.sseBackoffBase,
+		BackoffMax:      c.sseBackoffMax,
+		WatchdogTimeout: c.sseReadWatchdogTimeout,
+	})
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff):
-		}
-
-		backoff = min(backoff*2, c.sseBackoffMax)
-	}
-}
-
-// streamOnce performs a single connection to the events endpoint and dispatches
-// status events until the stream ends. It returns the number of delivered events.
-//
-// A per-connection context backs a read-liveness watchdog: when no line is read
-// for c.sseReadWatchdogTimeout, the connection (not the outer ctx) is canceled
-// so the stream reconnects instead of hanging forever on a dead TCP peer.
-func (c *Client) streamOnce(ctx context.Context, lastEventID *string, onEvent func(StatusEvent) error) (delivered int, err error) {
-	connCtx, cancelConn := context.WithCancel(ctx)
-	defer cancelConn()
-
-	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, c.eventsURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create arcade events request: %w", err)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", userAgent)
-	if *lastEventID != "" {
-		req.Header.Set("Last-Event-ID", *lastEventID)
-	}
-
-	response, err := c.sseClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to connect to arcade events stream: %w", err)
-	}
-	defer func() {
-		_ = response.Body.Close()
-	}()
-
-	if response.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, sseScannerInitialBufferSize))
-		return 0, fmt.Errorf("arcade events stream returned unexpected http status [%d %s]", response.StatusCode, response.Status)
-	}
-
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 0, sseScannerInitialBufferSize), sseScannerMaxBufferSize)
-
-	// Read-liveness watchdog: cancel this connection when no line arrives in time.
-	watchdog := time.AfterFunc(c.sseReadWatchdogTimeout, cancelConn)
-	defer watchdog.Stop()
-
-	var frame sseFrame
-	for scanner.Scan() {
-		watchdog.Reset(c.sseReadWatchdogTimeout)
-		line := scanner.Text()
-
-		// A blank line marks the end of a frame.
-		if line == "" {
-			if c.dispatchFrame(ctx, frame, lastEventID, onEvent) {
-				delivered++
-			}
-			frame = sseFrame{}
-			continue
-		}
-
-		// Lines starting with ":" are keepalive comments; all others accumulate.
-		if !strings.HasPrefix(line, ":") {
-			processSSELine(line, &frame)
-		}
-	}
-	// An incomplete frame at the end of the stream is discarded per the SSE spec.
-
-	return delivered, c.mapScanError(connCtx, ctx, scanner.Err())
-}
-
-// mapScanError wraps a scanner read error of the events stream, distinguishing a
-// watchdog-triggered stall (connCtx canceled while the outer ctx is still alive)
-// from a plain read failure. A nil scanErr is returned as nil.
-func (c *Client) mapScanError(connCtx, ctx context.Context, scanErr error) error {
-	if scanErr == nil {
-		return nil
-	}
-	// A watchdog-triggered cancellation only kills this connection: the outer
-	// ctx is still alive, so StreamStatus reconnects instead of returning.
-	if connCtx.Err() != nil && ctx.Err() == nil {
-		return fmt.Errorf("arcade events stream stalled (no data for %s): %w", c.sseReadWatchdogTimeout, scanErr)
-	}
-	return fmt.Errorf("arcade events stream read failed: %w", scanErr)
-}
-
-// sseFrame accumulates the fields of one SSE frame until a blank line dispatches it.
-type sseFrame struct {
-	id    string
-	event string
-	data  string
+	return reader.Run(ctx)
 }
 
 // dispatchFrame parses and delivers one accumulated SSE frame. It reports
 // whether the event was delivered to onEvent. Frames with an event type other
 // than "status" and frames whose data does not parse as a TxRecord (or carries
-// no txid) are skipped without killing the stream.
-func (c *Client) dispatchFrame(ctx context.Context, frame sseFrame, lastEventID *string, onEvent func(StatusEvent) error) bool {
-	if frame.data == "" {
+// no txid) are skipped without killing the stream. On delivery it advances
+// lastEventID (the resume cursor).
+func (c *Client) dispatchFrame(ctx context.Context, f sse.Frame, lastEventID *string, onEvent func(StatusEvent) error) bool {
+	if f.Data == "" {
 		return false
 	}
-	if frame.event != "" && frame.event != "status" {
+	if f.Event != "" && f.Event != "status" {
 		return false
 	}
 
 	var record TxRecord
-	if err := json.Unmarshal([]byte(frame.data), &record); err != nil {
+	if err := json.Unmarshal([]byte(f.Data), &record); err != nil {
 		c.logger.WarnContext(
 			ctx, "skipping malformed arcade status event",
-			slog.String("eventID", frame.id),
+			slog.String("eventID", f.ID),
 			slog.String("error", err.Error()),
 		)
 		return false
 	}
 	if record.TxID == "" {
-		c.logger.WarnContext(ctx, "skipping arcade status event without txid", slog.String("eventID", frame.id))
+		c.logger.WarnContext(ctx, "skipping arcade status event without txid", slog.String("eventID", f.ID))
 		return false
 	}
 
-	if err := onEvent(StatusEvent{ID: frame.id, Record: record}); err != nil {
+	if err := onEvent(StatusEvent{ID: f.ID, Record: record}); err != nil {
 		c.logger.ErrorContext(
 			ctx, "arcade status event handler failed",
-			slog.String("eventID", frame.id),
+			slog.String("eventID", f.ID),
 			slog.String("txID", record.TxID),
 			slog.String("error", err.Error()),
 		)
@@ -248,36 +138,8 @@ func (c *Client) dispatchFrame(ctx context.Context, frame sseFrame, lastEventID 
 	// every frame carrying an id): Last-Event-ID is advanced only for DELIVERED
 	// frames, so frames that were read but not delivered are redelivered by the
 	// server after a reconnect (at-least-once delivery).
-	if frame.id != "" {
-		*lastEventID = frame.id
+	if f.ID != "" {
+		*lastEventID = f.ID
 	}
 	return true
-}
-
-// processSSELine accumulates one SSE line into the current frame. Unknown field
-// names are silently ignored per the SSE spec.
-func processSSELine(line string, frame *sseFrame) {
-	field, value := splitSSELine(line)
-	switch field {
-	case "id":
-		frame.id = value
-	case "event":
-		frame.event = value
-	case "data":
-		if frame.data != "" {
-			frame.data += "\n"
-		}
-		frame.data += value
-	}
-}
-
-// splitSSELine splits one SSE line into its field name and value, stripping the
-// single optional space after the colon per the SSE spec.
-func splitSSELine(line string) (field, value string) {
-	field, value, found := strings.Cut(line, ":")
-	if !found {
-		// A line with no colon is a field with an empty value per the SSE spec.
-		return line, ""
-	}
-	return field, strings.TrimPrefix(value, " ")
 }
