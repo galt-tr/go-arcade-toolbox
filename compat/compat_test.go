@@ -29,6 +29,7 @@ import (
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	servicespkg "github.com/bsv-blockchain/go-arcade-toolbox/pkg/services"
 	storagepkg "github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
@@ -338,6 +339,15 @@ func (s *stubServices) NLockTimeIsFinal(_ context.Context, _ any) (bool, error) 
 func (s *stubServices) GetStatusForTxIDs(_ context.Context, _ []string) (*wdk.GetStatusForTxIDsResult, error) {
 	return nil, nil
 }
+
+// pkg/services growth: the real services.Services — not just the stub above
+// — satisfies wdk.Services end to end, mirroring the old go-wallet-toolbox
+// concrete WalletServices. It implements the wide wdk.Services interface over
+// the lean arcade.TxOracle + headers.Headers clients (see pkg/services' own
+// tests for the method-by-method mapping); the constructor (services.New)
+// takes those live clients, so it is exercised in pkg/services' own tests
+// rather than reconstructed here.
+var _ wdk.Services = (*servicespkg.Services)(nil)
 
 // ===========================================================================
 // 4. Args construction — literal construction of the key BRC-100 arg/result
@@ -830,11 +840,24 @@ func TestPendingSignActionsRepositoryCallSiteShape(t *testing.T) {
 // option funcs (WithChangeBasket, WithCommission, WithNetwork, ...) live there
 // too. The go-wallet-toolbox WalletStorageManager wrapper is not ported.
 //
+// DONE(Task 16 — pkg/services): services.Services satisfies wdk.Services end
+// to end — see the `var _ wdk.Services = (*servicespkg.Services)(nil)`
+// assertion in section 3 above. It implements the wide wdk.Services interface
+// as a compatibility shim over the lean arcade.TxOracle + headers.Headers
+// clients (single-target broadcast, no multi-provider fallback queues — see
+// pkg/services' own doc.go); the constructor (services.New) takes those live
+// clients, so it is wired and exercised in pkg/services' own tests rather than
+// reconstructed here. services.OracleFromServices is the reverse (degraded)
+// bridge, for a caller-supplied wdk.Services that needs to look like an
+// arcade.TxOracle.
+//
 // TODO(M3 — pkg/wallet): wallet.New(...) generic constructors, the Wallet
 // struct's exported methods (CreateAction/ProcessAction/ListActions/
 // ListOutputs/InternalizeAction/AbortAction/...), and the wallet option funcs
 // (WithStorageManager, WithServices, WithPendingSignActionsRepo, ...) —
 // pkg/wallet/wallet.go and pkg/wallet/internal/wallet_opts in the old repo.
+// WithServices(wdk.Services) is expected to accept *servicespkg.Services
+// directly (the public API-compat surface this task exists to preserve).
 //
 // TODO(M4 — pkg/monitor): monitor construction and its task/runner option
 // funcs, once ported.
