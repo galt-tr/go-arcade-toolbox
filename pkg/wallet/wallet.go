@@ -130,6 +130,19 @@ func WithAutoKnownTxids(value bool) func(*wallet_opts.Opts) {
 	}
 }
 
+// WithThroughputMode - default: `false`
+// If true, the CreateAction hot path skips shared BEEF party-graph maintenance
+// (the GetKnownTxIDs snapshot and MergeBeefFromParty merge). Both are
+// serialized on a single mutex and dominated by MerklePath root recomputation,
+// which caps CreateAction throughput regardless of concurrency. Storage remains
+// the source of truth for input BEEF ancestry, so correctness is unaffected.
+// Suitable for high-volume self-funded workloads (e.g. fuel-pool blasting).
+func WithThroughputMode(value bool) func(*wallet_opts.Opts) {
+	return func(opts *wallet_opts.Opts) {
+		opts.ThroughputMode = value
+	}
+}
+
 // WithAuthHTTPClient configures a custom HTTP client for authenticated requests to certificate authorities.
 func WithAuthHTTPClient(client *http.Client) func(*wallet_opts.Opts) {
 	return func(o *wallet_opts.Opts) {
@@ -422,6 +435,13 @@ func (w *Wallet) FanOutFuel(ctx context.Context, shape wdk.ShapedChange, origina
 			// grows without bound while nothing is mined, eventually exceeding
 			// the BEEF builder's recursion limit and killing all minting.
 			ReturnTXIDOnly: to.Ptr(true),
+			// Broadcast fuel synchronously even when the wallet's payment path
+			// runs delayed. Delayed fan-outs leave their outputs at TierSending,
+			// which the funding fast path ([mined, unproven]) cannot claim — so
+			// the pool would never actually replenish. Immediate broadcast
+			// promotes the minted leaves to TierUnproven (claimable), and makes
+			// each leaf's chunk parent real before the next leaf chains on it.
+			AcceptDelayedBroadcast: to.Ptr(false),
 		},
 	}, originator, w.party)
 	if err != nil {
@@ -659,6 +679,25 @@ func (w *Wallet) Balance(ctx context.Context) (balance uint64, err error) {
 	balance, err = w.storage.GetBalance(ctx, wdk.BasketNameForChange)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get wallet's balance: %w", err)
+	}
+	return balance, nil
+}
+
+// BasketBalance returns the total spendable (claimable) satoshis in the given
+// basket — coins that are neither reserved, spent-pending, nor frozen. Unlike
+// Balance (which reports the change basket), it targets an arbitrary basket,
+// e.g. a fuel pool. Reserved coins are excluded, so a fuel keeper can size its
+// top-up against genuinely claimable inventory rather than raw output counts
+// (which include in-flight reserved-until-broadcast coins).
+func (w *Wallet) BasketBalance(ctx context.Context, basket string) (balance uint64, err error) {
+	ctx, span := tracing.StartTracing(ctx, "Wallet-BasketBalance", attribute.String("basket", basket))
+	defer func() {
+		tracing.EndTracing(span, err)
+	}()
+
+	balance, err = w.storage.GetBalance(ctx, basket)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get basket %q balance: %w", basket, err)
 	}
 	return balance, nil
 }

@@ -43,6 +43,18 @@ type Flags struct {
 	// If "known", input transactions may omit supporting validity proof data for all TXIDs known to this wallet.
 	// If nil, input BEEFs must be complete and valid.
 	TrustSelf *sdk.TrustSelf
+
+	// ThroughputMode, when true, skips client-side BEEF party-graph maintenance
+	// on the CreateAction hot path — the GetKnownTxIDs snapshot and
+	// MergeBeefFromParty merge, both serialized on the single BeefParty mutex
+	// and dominated by MerklePath root recomputation. Storage remains the
+	// authoritative source of input BEEF ancestry (returned in every
+	// CreateAction result), so signing and broadcast are unaffected; the only
+	// things given up are the in-process ancestry cache and txidOnly response
+	// compaction. Intended for high-volume self-funded workloads (e.g.
+	// fuel-pool-funded blasting) where that single mutex otherwise caps
+	// throughput regardless of concurrency.
+	ThroughputMode bool
 }
 
 // DefaultClient is ported from go-wallet-toolbox (see upstream docs).

@@ -23,7 +23,6 @@ import (
 	"time"
 
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
-	"github.com/go-softwarelab/common/pkg/to"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
@@ -35,7 +34,10 @@ import (
 // WalletAPI is the narrow wallet surface the keeper drives.
 // *wallet.Wallet satisfies it.
 type WalletAPI interface {
-	ListOutputs(ctx context.Context, args sdk.ListOutputsArgs, originator string) (*sdk.ListOutputsResult, error)
+	// BasketBalance reports the CLAIMABLE (spendable) satoshis in a basket —
+	// reserved-until-broadcast coins excluded — so the keeper measures genuine
+	// inventory rather than raw output counts.
+	BasketBalance(ctx context.Context, basket string) (uint64, error)
 	FanOutFuel(ctx context.Context, shape wdk.ShapedChange, originator string) (*sdk.CreateActionResult, error)
 }
 
@@ -308,7 +310,7 @@ func (k *Keeper) runOnce(ctx context.Context) (catchUp bool, err error) {
 
 	cfg := k.snapshot()
 
-	inventory, err := k.countBasketOutputs(ctx, cfg.PoolBasket, cfg.Originator)
+	inventory, err := k.countClaimableCoins(ctx, cfg.PoolBasket, cfg.Denomination)
 	if err != nil {
 		return false, fmt.Errorf("failed to measure fuel pool: %w", err)
 	}
@@ -443,12 +445,12 @@ func (k *Keeper) mintLeaves(ctx context.Context, cfg Config, leaves uint64) (uin
 // does not (tree fan-out, interior layer). It returns the number of chunks
 // available after provisioning — the caller must not mint more leaves.
 func (k *Keeper) ensureChunks(ctx context.Context, cfg Config, leaves uint64) (uint64, error) {
-	chunks, err := k.countBasketOutputs(ctx, cfg.ReserveBasket, cfg.Originator)
+	chunkValue := cfg.FanoutOutputsPerTx*cfg.Denomination + cfg.ChunkFeeHeadroom
+
+	chunks, err := k.countClaimableCoins(ctx, cfg.ReserveBasket, chunkValue)
 	if err != nil {
 		return 0, fmt.Errorf("failed to measure reserve: %w", err)
 	}
-
-	chunkValue := cfg.FanoutOutputsPerTx*cfg.Denomination + cfg.ChunkFeeHeadroom
 	for chunks < leaves {
 		if ctx.Err() != nil {
 			return chunks, fmt.Errorf("chunk provisioning interrupted: %w", ctx.Err())
@@ -495,13 +497,20 @@ func (k *Keeper) ensureChunks(ctx context.Context, cfg Config, leaves uint64) (u
 	return chunks, nil
 }
 
-func (k *Keeper) countBasketOutputs(ctx context.Context, basket, originator string) (uint64, error) {
-	result, err := k.wallet.ListOutputs(ctx, sdk.ListOutputsArgs{
-		Basket: basket,
-		Limit:  to.Ptr(uint32(1)),
-	}, originator)
-	if err != nil {
-		return 0, fmt.Errorf("failed to list %q outputs: %w", basket, err)
+// countClaimableCoins returns how many claimable `denomination`-valued coins a
+// basket holds, computed from its spendable balance. It deliberately measures
+// claimable inventory — not raw output rows — because in delayed mode consumed
+// coins sit reserved-until-broadcast, and reserved coins the funding fast path
+// cannot claim would otherwise fool the keeper into idling while the pool
+// starves. denomination is the pool leaf value for the pool basket and the
+// chunk value for the reserve basket.
+func (k *Keeper) countClaimableCoins(ctx context.Context, basket string, denomination uint64) (uint64, error) {
+	if denomination == 0 {
+		return 0, nil
 	}
-	return uint64(result.TotalOutputs), nil
+	sats, err := k.wallet.BasketBalance(ctx, basket)
+	if err != nil {
+		return 0, fmt.Errorf("failed to measure %q balance: %w", basket, err)
+	}
+	return sats / denomination, nil
 }

@@ -1,12 +1,20 @@
 package funder
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+)
 
 var (
 	// ErrNotEnoughFunds is returned when a full walk over the configured tiers
 	// cannot cover the funding target. The reservation is released before it is
-	// returned, so no coins are left held.
-	ErrNotEnoughFunds = errors.New("funder: not enough funds to cover the funding target")
+	// returned, so no coins are left held. It wraps the public
+	// [wdk.ErrNotEnoughFunds] sentinel so callers outside the module can treat
+	// insufficient-funds as back-pressure via errors.Is without importing this
+	// internal package.
+	ErrNotEnoughFunds = fmt.Errorf("funder: not enough funds to cover the funding target: %w", wdk.ErrNotEnoughFunds)
 
 	// ErrUTXOContention is returned when optimistic-store contention
 	// ([utxostore.ErrContention]) persists across every bounded retry. The

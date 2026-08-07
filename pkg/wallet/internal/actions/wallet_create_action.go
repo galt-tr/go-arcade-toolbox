@@ -40,7 +40,12 @@ func (a *CreateAction) CreateAction(ctx context.Context, args wallet.CreateActio
 		a.WdkArgsMutator(&a.wdkArgs)
 	}
 
-	if a.wdkArgs.Options.KnownTxids == nil {
+	// ThroughputMode skips the party-graph snapshot: GetKnownTxIDs validates
+	// every tx in the shared BeefParty under a single mutex, a serial hot spot
+	// under high concurrency. Leaving KnownTxids nil only means storage returns
+	// full ancestry instead of txidOnly-compacted BEEF — correctness is
+	// unaffected.
+	if !a.WalletOpts.ThroughputMode && a.wdkArgs.Options.KnownTxids == nil {
 		knownTxIDs, err := wp.GetKnownTxIDs()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get known txids for auto known txids: %w", err)
@@ -62,6 +67,15 @@ func (a *CreateAction) CreateAction(ctx context.Context, args wallet.CreateActio
 	}
 
 	if result.Tx == nil {
+		return result, nil
+	}
+
+	// ThroughputMode skips shared BEEF party-graph maintenance: MergeBeefFromParty
+	// (and the txidOnly verification) is serialized on a single mutex and
+	// dominated by MerklePath root recomputation, capping throughput regardless
+	// of concurrency. Storage already returned complete input BEEF, so this only
+	// forgoes the in-process ancestry cache and txidOnly compaction.
+	if a.WalletOpts.ThroughputMode {
 		return result, nil
 	}
 

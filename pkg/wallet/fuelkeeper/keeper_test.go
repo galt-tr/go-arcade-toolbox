@@ -33,14 +33,22 @@ type fakeWallet struct {
 	maxChunkCount uint64
 }
 
-func (f *fakeWallet) ListOutputs(_ context.Context, args sdk.ListOutputsArgs, _ string) (*sdk.ListOutputsResult, error) {
+// test denominations mirror keeperConfig(): pool leaves are Denomination sats,
+// reserve chunks are FanoutOutputsPerTx*Denomination + ChunkFeeHeadroom sats.
+// BasketBalance reports claimable sats = coin count × denomination, so the
+// keeper's balance/denomination measurement recovers the original counts.
+const (
+	testPoolDenom    = 240               // keeperConfig().Denomination
+	testReserveDenom = 100*240 + 1000    // 25000
+)
+
+func (f *fakeWallet) BasketBalance(_ context.Context, basket string) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	total := f.poolTotal
-	if args.Basket == "reserve" {
-		total = f.reserveTotal
+	if basket == "reserve" {
+		return uint64(f.reserveTotal) * testReserveDenom, nil
 	}
-	return &sdk.ListOutputsResult{TotalOutputs: total}, nil
+	return uint64(f.poolTotal) * testPoolDenom, nil
 }
 
 func (f *fakeWallet) FanOutFuel(_ context.Context, shape wdk.ShapedChange, _ string) (*sdk.CreateActionResult, error) {
