@@ -78,6 +78,16 @@ func (r KnownTxRepo) ListByArcadeStatus(ctx context.Context, arcadeStatus string
 	return r.queryList(ctx, q, append([]any{arcadeStatus}, pageArgs...))
 }
 
+// ListRecent returns the most-recently-updated known txs regardless of status,
+// up to limit — the "all in-flight / recent transactions" drill-down (during a
+// blast this is the flood of fuel-funded txs, newest first). Deployment-wide.
+func (r KnownTxRepo) ListRecent(ctx context.Context, limit int) ([]KnownTx, error) {
+	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
+		"ORDER BY updated_at DESC, txid ASC" + clause)
+	return r.queryList(ctx, q, pageArgs)
+}
+
 // ListByStatus returns known txs in the given wallet-side status, most-recently-
 // updated first, up to limit. Deployment-wide; for UI drill-down.
 func (r KnownTxRepo) ListByStatus(ctx context.Context, status wdk.ProvenTxReqStatus, limit int) ([]KnownTx, error) {

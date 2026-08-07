@@ -70,6 +70,17 @@ func (p *Provider) ListKnownTxByStatus(ctx context.Context, status string, limit
 	return toKnownTxRows(rows), nil
 }
 
+// ListKnownTxRecent returns the most-recent known transactions regardless of
+// status — the "all recent / in-flight transactions" view (during a blast, the
+// stream of fuel-funded txs), each with its txid for an arcade drill-down.
+func (p *Provider) ListKnownTxRecent(ctx context.Context, limit int) ([]KnownTxRow, error) {
+	rows, err := p.meta.KnownTx().ListRecent(ctx, clampListLimit(limit))
+	if err != nil {
+		return nil, fmt.Errorf("storage: list recent known txs: %w", err)
+	}
+	return toKnownTxRows(rows), nil
+}
+
 // TierState is the claimable inventory of one settlement tier within a basket.
 type TierState struct {
 	// Tier is the tier name: "sending" | "unproven" | "mined".
