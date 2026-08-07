@@ -433,6 +433,26 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 	return released, nil
 }
 
+// RemoveSpentBy implements [utxostore.Store]: deletes every row spent by
+// spendingTxID, a now-terminal (mined) tx whose inputs are permanently
+// consumed. Idempotent; returns the number of rows removed.
+func (s *Store) RemoveSpentBy(_ context.Context, spendingTxID chainhash.Hash) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, errClosed
+	}
+
+	removed := 0
+	for op, r := range s.rows {
+		if r.utxo.SpentBy != nil && *r.utxo.SpentBy == spendingTxID {
+			delete(s.rows, op)
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 // Promote implements [utxostore.Store]: retiers rows in either direction;
 // missing rows are skipped, unchanged rows do not count.
 func (s *Store) Promote(_ context.Context, ops []utxostore.Outpoint, to utxostore.Tier) (int, error) {

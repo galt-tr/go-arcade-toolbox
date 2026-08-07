@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
 )
 
@@ -106,6 +108,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"FreezeUnfreeze", std(s.freezeUnfreeze)},
 		{"Remove", std(s.remove)},
 		{"RemoveByMintTx", std(s.removeByMintTx)},
+		{"RemoveSpentBy", std(s.removeSpentBy)},
 		{"Balance", std(s.balance)},
 		{"FindStaleReservations", s.findStaleReservations},
 		{"StaleReservationDating", s.staleReservationDating},
@@ -1070,6 +1073,49 @@ func (s *suite) removeByMintTx(t *testing.T, store utxostore.Store) {
 	require.Empty(t, report.Removed)
 	require.Len(t, report.AlreadyReserved, 1)
 	require.Len(t, report.AlreadySpentBy, 1)
+}
+
+// removeSpentBy verifies that RemoveSpentBy deletes exactly the rows spent by
+// the given tx (a now-terminal spend), leaves coins spent by other txs, and is
+// idempotent.
+func (s *suite) removeSpentBy(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	MintTx(t, store, "removespentby", user, basket, utxostore.TierMined, 100, 200, 300)
+
+	spenderA := NewTxID("removespentby-A")
+	spenderB := NewTxID("removespentby-B")
+	spend := func(denom uint64, spender chainhash.Hash) utxostore.Outpoint {
+		claimed, err := store.ClaimExact(ctx, sc, "res", denom, 1)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{
+			{Outpoint: claimed[0].Outpoint, Reservation: "res", SpendingTxID: spender},
+		}))
+		return claimed[0].Outpoint
+	}
+	// 100 + 200 spent by A; 300 spent by a different tx B.
+	opA1 := spend(100, spenderA)
+	opA2 := spend(200, spenderA)
+	opB := spend(300, spenderB)
+
+	// RemoveSpentBy(A) drops both A-coins and leaves the B-coin untouched.
+	n, err := store.RemoveSpentBy(ctx, spenderA)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	for _, op := range []utxostore.Outpoint{opA1, opA2} {
+		_, gerr := store.Get(ctx, op)
+		require.ErrorIs(t, gerr, &utxostore.NotFoundError{}, "A-spent coin removed")
+	}
+	gotB, err := store.Get(ctx, opB)
+	require.NoError(t, err)
+	require.NotNil(t, gotB.SpentBy, "B-spent coin untouched")
+
+	// Idempotent: a second call removes nothing.
+	n, err = store.RemoveSpentBy(ctx, spenderA)
+	require.NoError(t, err)
+	require.Zero(t, n)
 }
 
 func (s *suite) balance(t *testing.T, store utxostore.Store) {

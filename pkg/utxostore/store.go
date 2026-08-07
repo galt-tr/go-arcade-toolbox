@@ -123,6 +123,16 @@ type Store interface {
 	// Returns the number of rows released.
 	Unspend(ctx context.Context, spendingTxID chainhash.Hash, ops []Outpoint) (int, error)
 
+	// RemoveSpentBy deletes every row currently marked spent by spendingTxID.
+	// Called when spendingTxID reaches a terminal on-chain state (mined): its
+	// inputs are permanently consumed and no longer live, so they leave the hot
+	// inventory (their history remains in the wallet's output ledger). Unlike
+	// Unspend it restores nothing — a mined tx's inputs cannot be contested — and
+	// unlike Remove it needs no explicit outpoints: every row whose SpentBy ==
+	// spendingTxID goes. Idempotent (a second call removes nothing). Returns the
+	// number of rows removed.
+	RemoveSpentBy(ctx context.Context, spendingTxID chainhash.Hash) (int, error)
+
 	// Promote sets the tier of each row to `to`. Downgrades are allowed
 	// (reorg). Missing outpoints are skipped; rows already at the target tier
 	// count as unchanged. Applies regardless of reservation, spend, or frozen

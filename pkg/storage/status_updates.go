@@ -161,10 +161,11 @@ func (p *Provider) applySeen(ctx context.Context, rec arcade.TxRecord) error {
 }
 
 // applyMined verifies the BUMP merkle root against the header source and, only
-// on success, stores the proof, completes the tx, and promotes change to
-// TierMined. A missing/unparseable BUMP, an unverifiable root (our header view
-// lagging arcade), or a mismatched root all leave the tx unproven — never
-// storing an unverified proof — for CheckProofs to retry via GetTx.
+// on success, stores the proof, completes the tx, promotes change to TierMined,
+// and removes the now-terminal tx's spent inputs from the hot inventory. A
+// missing/unparseable BUMP, an unverifiable root (our header view lagging
+// arcade), or a mismatched root all leave the tx unproven — never storing an
+// unverified proof — for CheckProofs to retry via GetTx.
 func (p *Provider) applyMined(ctx context.Context, rec arcade.TxRecord) error {
 	txid := rec.TxID
 	if len(rec.MerklePath) == 0 {
@@ -229,7 +230,22 @@ func (p *Provider) applyMined(ctx context.Context, rec arcade.TxRecord) error {
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) {
 			return fmt.Errorf("storage: mined: mark completed: %w", err)
 		}
-		return p.promoteChangeByTxID(ctx, txid, utxostore.TierMined)
+		if err := p.promoteChangeByTxID(ctx, txid, utxostore.TierMined); err != nil {
+			return err
+		}
+		// The mined tx is terminal: its spent inputs are permanently consumed and
+		// no longer live, so drop them from the hot inventory (their history stays
+		// in the output ledger). Without this, spent rows linger forever and
+		// inflate insert/index cost. Idempotent on a MINED re-apply.
+		removed, err := p.utxo.RemoveSpentBy(ctx, *txidHash)
+		if err != nil {
+			return fmt.Errorf("storage: mined: remove spent inputs: %w", err)
+		}
+		if removed > 0 {
+			p.logger.DebugContext(ctx, "removed spent inputs of mined tx",
+				slog.String("txid", txid), slog.Int("removed", removed))
+		}
+		return nil
 	})
 }
 

@@ -174,3 +174,41 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 	}
 	return released, nil
 }
+
+// RemoveSpentBy implements [utxostore.Store]: deletes every row spent by
+// spendingTxID, a now-terminal (mined) tx whose inputs are permanently
+// consumed. There is no secondary index on spentBy, so this runs a filtered set
+// scan and durably deletes each match; a spentBy SI would optimize it if
+// aerostore ever became a mined-heavy hot path, but mined-apply is not a hot
+// path. Idempotent; returns the number of rows removed.
+func (s *Store) RemoveSpentBy(_ context.Context, spendingTxID chainhash.Hash) (int, error) {
+	if s.closed.Load() {
+		return 0, errClosed
+	}
+	stmt := as.NewStatement(s.namespace, s.set)
+	qp := as.NewQueryPolicy()
+	qp.FilterExpression = as.ExpEq(as.ExpBlobBin(binSpentBy), as.ExpBlobVal(spendingTxID[:]))
+	rs, err := s.client.Query(qp, stmt)
+	if err != nil {
+		return 0, fmt.Errorf("aerostore: remove-spent-by query: %w", err)
+	}
+	var ops []utxostore.Outpoint
+	for res := range rs.Results() {
+		if res.Err != nil {
+			return 0, fmt.Errorf("aerostore: remove-spent-by result: %w", res.Err)
+		}
+		u, cerr := recordToUTXO(res.Record)
+		if cerr != nil {
+			return 0, cerr
+		}
+		ops = append(ops, u.Outpoint)
+	}
+	removed := 0
+	for _, op := range ops {
+		if derr := s.deleteRecord(op); derr != nil {
+			return removed, derr
+		}
+		removed++
+	}
+	return removed, nil
+}

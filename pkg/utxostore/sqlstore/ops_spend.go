@@ -156,6 +156,29 @@ func (s *Store) Promote(ctx context.Context, ops []utxostore.Outpoint, to utxost
 	return changed, nil
 }
 
+// RemoveSpentBy implements [utxostore.Store]: deletes every row spent by
+// spendingTxID, a now-terminal (mined) tx whose inputs are permanently
+// consumed. One indexed DELETE via idx_utxos_spent_by; Spend stores spent_by as
+// SpendingTxID[:], so the match is byte-exact. Idempotent.
+func (s *Store) RemoveSpentBy(ctx context.Context, spendingTxID chainhash.Hash) (int, error) {
+	if s.isClosed() {
+		return 0, errClosed
+	}
+	var removed int64
+	err := s.withTx(ctx, func(x queryer) error {
+		res, err := x.ExecContext(ctx, s.rebind("DELETE FROM utxos WHERE spent_by=?"), spendingTxID[:])
+		if err != nil {
+			return err
+		}
+		removed, err = res.RowsAffected()
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("sqlstore: remove spent by %s: %w", spendingTxID, err)
+	}
+	return int(removed), nil
+}
+
 // RemoveByMintTx implements [utxostore.Store]: removes phantom coins of an
 // invalidated mint transaction and classifies the survivors. Every op must be
 // an output of mintTxID; a mismatch fails the whole call with a plain error and
