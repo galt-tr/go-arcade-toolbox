@@ -63,6 +63,11 @@ type Provider struct {
 	storageName        string
 	storageIdentityKey string
 
+	// immediateBroadcast forces ProcessAction to broadcast synchronously,
+	// overriding the caller's acceptDelayedBroadcast option (see
+	// WithImmediateBroadcast).
+	immediateBroadcast bool
+
 	now func() time.Time
 
 	// modeA is true when the metastore and utxostore share one *sql.DB, so the
@@ -125,6 +130,20 @@ func WithStorageName(name string) Option {
 // WithClock overrides the provider clock (tests).
 func WithClock(now func() time.Time) Option {
 	return func(p *Provider) { p.now = now }
+}
+
+// WithImmediateBroadcast forces ProcessAction to broadcast every transaction
+// synchronously, ignoring the BRC-100 acceptDelayedBroadcast option (which
+// defaults to true, deferring the send to the monitor's SendWaiting task). With
+// this set, a transaction is posted to arcade before ProcessAction returns and
+// its on-network status is known immediately.
+//
+// This trades away the delayed-mode throughput headroom (delayed broadcast is
+// what keeps arcade's round-trip off the client's critical path in the
+// high-TPS design) for immediate confirmation. Explicit no-send transactions
+// are unaffected — they still wait for their sendWith batch.
+func WithImmediateBroadcast() Option {
+	return func(p *Provider) { p.immediateBroadcast = true }
 }
 
 // New builds a Provider over the given subsystems. The scripts/beef verifiers

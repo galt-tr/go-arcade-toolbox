@@ -77,7 +77,7 @@ type e2eStack struct {
 	utxo     utxostore.Store
 }
 
-func newE2EStack(t *testing.T) *e2eStack {
+func newE2EStack(t *testing.T, extraOpts ...storage.Option) *e2eStack {
 	t.Helper()
 	ctx := context.Background()
 	logger := logging.NewTestLogger(t)
@@ -95,8 +95,10 @@ func newE2EStack(t *testing.T) *e2eStack {
 	fnd := funder.New(logger, utxo, defs.DefaultFeeModel())
 
 	provider, err := storage.New(logger, meta, utxo, fnd, oracle, hdrs,
-		storage.WithNetwork(e2eNet),
-		storage.WithStorageName("e2e-storage"),
+		append([]storage.Option{
+			storage.WithNetwork(e2eNet),
+			storage.WithStorageName("e2e-storage"),
+		}, extraOpts...)...,
 	)
 	require.NoError(t, err)
 	_, err = provider.Migrate(ctx, "e2e-storage", e2eStorageIDKey)
@@ -383,6 +385,33 @@ func TestE2E_WritePath_Delayed(t *testing.T) {
 	// DEFERRED to M4: with no monitor running, a delayed broadcast is queued but
 	// never sent, so no POST /tx reaches arcade in M3.
 	require.Zero(t, s.arc.BroadcastCount(), "delayed broadcast is deferred to the M4 monitor")
+}
+
+// TestE2E_WritePath_ImmediateBroadcastOverridesDelayed is the counterpart to the
+// delayed test: with storage.WithImmediateBroadcast() the provider must ignore
+// acceptDelayedBroadcast=true and send synchronously, so the exact same delayed
+// CreateAction reaches arcade with a POST /tx before the call returns (no
+// dependency on the monitor's SendWaiting task).
+func TestE2E_WritePath_ImmediateBroadcastOverridesDelayed(t *testing.T) {
+	ctx := context.Background()
+	s := newE2EStack(t, storage.WithImmediateBroadcast())
+	s.seedMinedPayment(e2eSeedSatoshis, e2eBlockHeight)
+
+	args := fixtures.DefaultWalletCreateActionArgs(t, func(a *sdk.CreateActionArgs) {
+		a.Description = "e2e immediate-broadcast payment"
+		a.Outputs[0].Satoshis = e2ePaymentAmount
+		a.Options.AcceptDelayedBroadcast = to.Ptr(true) // caller asks to delay...
+	})
+	res, err := s.wallet.CreateAction(ctx, args, e2eOriginator)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.NotNil(t, res.Txid)
+
+	// ...but immediate mode wins: exactly one POST /tx carrying a non-empty EF
+	// reached arcade synchronously.
+	require.Equal(t, 1, s.arc.BroadcastCount(),
+		"immediate mode must broadcast synchronously despite acceptDelayedBroadcast=true")
+	require.NotEmpty(t, s.arc.Broadcasts()[0].EF)
 }
 
 // TestE2E_InternalizeTrustAnchor_Negative proves the header-verified-proof trust

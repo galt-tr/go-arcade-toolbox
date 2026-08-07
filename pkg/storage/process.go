@@ -26,6 +26,14 @@ func (p *Provider) ProcessAction(ctx context.Context, auth wdk.AuthID, args wdk.
 	}
 	result := &wdk.ProcessActionResult{}
 
+	// Immediate-broadcast mode overrides the delayed default so the send happens
+	// inline now instead of via the monitor. Applied before persisting/status
+	// selection so every downstream branch treats the tx as non-delayed. An
+	// explicit no-send is a distinct caller choice and is left untouched.
+	if p.immediateBroadcast {
+		args.IsDelayed = false
+	}
+
 	if args.IsNewTx {
 		if err := p.processNewTx(ctx, userID, args); err != nil {
 			return nil, err
