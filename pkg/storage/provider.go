@@ -68,6 +68,13 @@ type Provider struct {
 	// WithImmediateBroadcast).
 	immediateBroadcast bool
 
+	// sendConcurrency bounds how many delayed transactions SendWaitingTransactions
+	// broadcasts to arcade in parallel per run. 1 (default) preserves the original
+	// sequential behavior; higher values let the background drainer keep pace with
+	// a high creation rate so the delayed queue does not grow unbounded (see
+	// WithSendConcurrency).
+	sendConcurrency int
+
 	now func() time.Time
 
 	// modeA is true when the metastore and utxostore share one *sql.DB, so the
@@ -144,6 +151,21 @@ func WithClock(now func() time.Time) Option {
 // are unaffected — they still wait for their sendWith batch.
 func WithImmediateBroadcast() Option {
 	return func(p *Provider) { p.immediateBroadcast = true }
+}
+
+// WithSendConcurrency sets how many delayed transactions SendWaitingTransactions
+// broadcasts to arcade in parallel per run. The default of 1 broadcasts
+// sequentially; a high-throughput deployment running delayed broadcast should
+// raise it (e.g. to the arcade client's connection budget) so the background
+// drainer sustains the creation rate and the delayed queue stays bounded. n < 1
+// is treated as 1.
+func WithSendConcurrency(n int) Option {
+	return func(p *Provider) {
+		if n < 1 {
+			n = 1
+		}
+		p.sendConcurrency = n
+	}
 }
 
 // New builds a Provider over the given subsystems. The scripts/beef verifiers

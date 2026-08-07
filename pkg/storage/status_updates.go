@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
@@ -351,15 +353,45 @@ func (p *Provider) SendWaitingTransactions(ctx context.Context, limit int) error
 	if err != nil {
 		return fmt.Errorf("storage: find resendable: %w", err)
 	}
-	for i := range waiting {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := p.sendOneWaiting(ctx, &waiting[i]); err != nil {
-			p.logger.WarnContext(ctx, "send waiting: broadcast failed, will retry next cycle",
-				slog.String("txid", waiting[i].TxID), slog.String("error", err.Error()))
-		}
+	if len(waiting) == 0 {
+		return nil
 	}
+
+	// Broadcast the batch with bounded concurrency. Each POST /tx is an arcade
+	// round-trip; done sequentially the drainer cannot keep pace with a
+	// high-throughput creation rate and the delayed queue grows without bound.
+	// Delayed self-payments are independent (each spends already-broadcast
+	// funding), so parallel broadcast is safe; per-tx errors are logged and the
+	// tx is left for the next cycle rather than aborting the batch.
+	conc := p.sendConcurrency
+	if conc < 1 {
+		conc = 1
+	}
+	var sent, failed atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(conc)
+	for i := range waiting {
+		kt := &waiting[i]
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return gctx.Err()
+			}
+			if serr := p.sendOneWaiting(gctx, kt); serr != nil {
+				failed.Add(1)
+				p.logger.WarnContext(gctx, "send waiting: broadcast failed, will retry next cycle",
+					slog.String("txid", kt.TxID), slog.String("error", serr.Error()))
+				return nil
+			}
+			sent.Add(1)
+			return nil
+		})
+	}
+	if werr := g.Wait(); werr != nil {
+		return werr
+	}
+	p.logger.DebugContext(ctx, "send waiting batch complete",
+		slog.Int64("broadcast", sent.Load()), slog.Int64("failed", failed.Load()),
+		slog.Int("batch", len(waiting)), slog.Int("concurrency", conc))
 	return nil
 }
 

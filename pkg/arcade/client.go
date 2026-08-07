@@ -106,6 +106,19 @@ func New(logger *slog.Logger, httpClient *resty.Client, config defs.Arcade) *Cli
 
 	if httpClient == nil {
 		httpClient = resty.New()
+		// The stock http.Transport keeps only 2 idle connections per host, so a
+		// high-concurrency background broadcaster (many parallel POST /tx to one
+		// arcade) would churn a fresh TCP+TLS handshake per request. Give it a
+		// generous keep-alive pool so concurrent broadcasts reuse connections.
+		httpClient.SetTransport(&http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          512,
+			MaxIdleConnsPerHost:   256,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		})
 	}
 	httpClient = httpClient.
 		SetHeader("Accept", "application/json").
