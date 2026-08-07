@@ -20,10 +20,11 @@
 // is committed in its own transaction: CreateAction reserves inputs via the
 // funder, then persists metadata and COMPENSATES (a whole-token
 // ReleaseReservation) if that metadata write fails; ProcessAction/AbortAction
-// apply the Spend / Promote / Mint / RemoveByMintTx directly. The
-// outbox-backed crash-recovery drain worker — which would heal a process that
-// crashed between the two direct writes by replaying utxo_ops_outbox rows — is
-// deferred to M4; the storage-side hooks it will call live here.
+// apply the Spend / Promote / Mint / RemoveByMintTx directly. A process that
+// crashes between the two direct writes is healed by the outbox-backed
+// crash-recovery drain: the monitor's reject_release task calls DrainOutbox,
+// which replays the durable utxo_ops_outbox rows idempotently (oldest-first,
+// parked after MaxOutboxAttempts).
 //
 // # The txid timing decision (change minting)
 //
