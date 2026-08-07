@@ -89,6 +89,17 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		outputScriptLens = append(outputScriptLens, txutils.P2PKHLockingScriptLength)
 		nonChangeOutputCount++
 	}
+	// Fuel fan-out (throughput strategy): the action mints shape.Count
+	// self-owned P2PKH outputs of shape.Satoshis each into the destination
+	// (pool/reserve) basket. Account for their serialized bytes and count here so
+	// the fee and change math cover them; their value is added to the target and
+	// the outputs themselves are emitted by buildOutputPlans.
+	if shape := args.Options.FuelShape; shape != nil {
+		for i := uint64(0); i < shape.Count; i++ {
+			outputScriptLens = append(outputScriptLens, txutils.P2PKHLockingScriptLength)
+		}
+		nonChangeOutputCount += shape.Count
+	}
 	inputScriptLens, err := providedInputSizes(args.Inputs)
 	if err != nil {
 		return nil, err
@@ -98,6 +109,9 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 	target := providedOutputSats
 	if commissionEnabled {
 		target += int64(p.commission.Satoshis) //nolint:gosec // commission satoshis are small
+	}
+	if shape := args.Options.FuelShape; shape != nil {
+		target += int64(shape.Count) * int64(shape.Satoshis) //nolint:gosec // count*denomination fits int64 for realistic fan-outs
 	}
 	target -= providedInputSats
 	targetSat, err := satoshi.From(target)
@@ -117,7 +131,7 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 	// path (Denomination > 0, Basket = the pool); otherwise it takes the default
 	// bounded tiered claim from the change basket (Denomination stays 0). Change
 	// computation, tiers, and existingBasketCount are unchanged on both paths.
-	fundBasket, denomination, err := p.fundingSource()
+	fundBasket, denomination, err := p.fundingSource(args.Options.FuelShape)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +347,35 @@ func (p *Provider) buildOutputPlans(args wdk.ValidCreateActionArgs, fundRes *fun
 		})
 	}
 
+	// Fuel fan-out outputs (throughput strategy, ProvidedByStorage): shape.Count
+	// self-owned wallet-derived BRC29 P2PKH coins of exactly shape.Satoshis each,
+	// booked into the destination (pool/reserve) basket. Emitted as change-purpose
+	// outputs so the same derivation, signing, and mint machinery applies — the
+	// only differences from ordinary change are the exact per-output value and the
+	// destination basket, which make them ClaimExact-selectable fuel coins.
+	if shape := args.Options.FuelShape; shape != nil {
+		dest := string(shape.Basket)
+		for i := uint64(0); i < shape.Count; i++ {
+			suffix, err := p.rand.Base64(derivationSuffixBytes)
+			if err != nil {
+				return nil, fmt.Errorf("storage: generate fuel derivation suffix: %w", err)
+			}
+			s := suffix
+			prefix := derivationPrefix
+			name := dest
+			plans = append(plans, outputPlan{
+				satoshis:         int64(shape.Satoshis), //nolint:gosec // denomination fits int64
+				change:           true,
+				outputType:       string(wdk.OutputTypeP2PKH),
+				providedBy:       string(wdk.ProvidedByStorage),
+				purpose:          wdk.ChangePurpose,
+				basket:           &name,
+				derivationPrefix: &prefix,
+				derivationSuffix: &s,
+			})
+		}
+	}
+
 	// Change outputs (ProvidedByStorage, wallet-derived BRC29 P2PKH).
 	changeName := p.changeBasketName()
 	changeValues := distributeChange(fundRes.ChangeAmount, fundRes.ChangeOutputsCount)
@@ -388,7 +431,16 @@ func distributeChange(total satoshi.Value, count uint64) []uint64 {
 //
 // Throughput OFF: fund from the change basket ("default") with denomination 0,
 // i.e. the unchanged bounded tiered (privacy) claim.
-func (p *Provider) fundingSource() (basket string, denomination uint64, err error) {
+func (p *Provider) fundingSource(shape *wdk.ShapedChange) (basket string, denomination uint64, err error) {
+	// Fuel fan-out: fund from the shape's SOURCE basket with a bounded tiered
+	// claim (Denomination 0 — source coins are arbitrary, not denominated). A
+	// leaf shape (destination = pool) draws from the reserve basket; a chunk
+	// shape (destination = reserve) draws from the default change basket. This
+	// is what lets the keeper bootstrap the pool from ordinary deposits instead
+	// of trying to fund a fan-out from the (empty) pool it is trying to fill.
+	if shape != nil {
+		return p.fanOutSourceBasket(shape), 0, nil
+	}
 	if !p.utxoMgmt.Enabled() {
 		return p.changeBasketName(), 0, nil
 	}
@@ -397,6 +449,15 @@ func (p *Provider) fundingSource() (basket string, denomination uint64, err erro
 		return "", 0, fmt.Errorf("storage: resolve fuel denomination: %w", err)
 	}
 	return p.utxoMgmt.Throughput.PoolBasket, denomination, nil
+}
+
+// fanOutSourceBasket resolves which basket a fan-out draws its funding from,
+// given the shape's destination basket (see [Provider.fundingSource]).
+func (p *Provider) fanOutSourceBasket(shape *wdk.ShapedChange) string {
+	if p.utxoMgmt.Enabled() && string(shape.Basket) == p.utxoMgmt.Throughput.PoolBasket {
+		return p.utxoMgmt.Throughput.ReserveBasket
+	}
+	return p.changeBasketName()
 }
 
 // spendTiers resolves the status-tier walk for funding.

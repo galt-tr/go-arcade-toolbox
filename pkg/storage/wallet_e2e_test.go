@@ -445,6 +445,62 @@ func TestE2E_StateReport(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrAuthorization)
 }
 
+// assertBasketCoins asserts a (user, basket) holds exactly count claimable coins
+// summing to count*denom sats — i.e. count coins of exactly denom each.
+func assertBasketCoins(t *testing.T, ctx context.Context, store utxostore.Store, userID int64, basket string, count int, denom uint64) {
+	t.Helper()
+	bal, err := store.Balance(ctx, userID, basket)
+	require.NoError(t, err)
+	gotCount := 0
+	for _, c := range bal.ClaimableCount {
+		gotCount += c
+	}
+	var gotSats uint64
+	for _, s := range bal.Claimable {
+		gotSats += s
+	}
+	require.Equalf(t, count, gotCount, "basket %q claimable coin count", basket)
+	require.Equalf(t, uint64(count)*denom, gotSats, "basket %q claimable sats", basket)
+}
+
+// TestE2E_FanOutFuel_BootstrapsPool drives the throughput FuelKeeper's two-stage
+// fan-out END TO END through the wallet (not a pre-seeded pool): a chunk fan-out
+// mints reserve coins funded from the default deposit, then a leaf fan-out mints
+// pool coins funded from the reserve — proving storage now implements FuelShape
+// shaped-change minting (funds from the source basket, mints Count coins of
+// exactly Satoshis into the destination basket, ClaimExact-selectable).
+func TestE2E_FanOutFuel_BootstrapsPool(t *testing.T) {
+	ctx := context.Background()
+	tp := defs.UTXOManagement{Strategy: defs.StrategyThroughput, Throughput: defs.DefaultUTXOManagement().Throughput}
+	// Immediate broadcast so each fan-out promotes its minted coins
+	// sending→unproven, making them spendable by the next stage.
+	s := newE2EStack(t, storage.WithUTXOManagement(tp), storage.WithImmediateBroadcast())
+	s.seedMinedPayment(e2eSeedSatoshis, e2eBlockHeight)
+	userID := int64(*s.authID(ctx).UserID)
+
+	// Stage 1 — chunk fan-out: fund from the default deposit, mint into reserve.
+	const chunkCount, chunkDenom = 2, 20000
+	_, err := s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: chunkCount, Satoshis: chunkDenom, Basket: "reserve"}, e2eOriginator)
+	require.NoError(t, err, "chunk fan-out must fund from the default basket and mint reserve coins")
+	assertBasketCoins(t, ctx, s.utxo, userID, "reserve", chunkCount, chunkDenom)
+
+	// Stage 2 — leaf fan-out: fund from the reserve, mint into the fuel pool.
+	const leafCount, leafDenom = 5, 1000
+	_, err = s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: leafCount, Satoshis: leafDenom, Basket: "fuel"}, e2eOriginator)
+	require.NoError(t, err, "leaf fan-out must fund from the reserve basket and mint pool coins")
+	assertBasketCoins(t, ctx, s.utxo, userID, "fuel", leafCount, leafDenom)
+
+	// The pool coins are selectable by exact denomination — the ClaimExact fast
+	// path the throughput funder relies on.
+	claimed, err := s.utxo.ClaimExact(ctx,
+		utxostore.Scope{UserID: userID, Basket: "fuel", Tier: utxostore.TierUnproven}, "claim-fuel", leafDenom, leafCount)
+	require.NoError(t, err)
+	require.Len(t, claimed, leafCount, "all pool coins claimable by exact denomination")
+	for _, u := range claimed {
+		require.EqualValues(t, leafDenom, u.Satoshis)
+	}
+}
+
 // TestE2E_InternalizeTrustAnchor_Negative proves the header-verified-proof trust
 // anchor is genuinely consulted end to end: with the BUMP's merkle root NOT
 // registered in the mock chaintracks, the real headers.Client's VerifyMerkleRoot

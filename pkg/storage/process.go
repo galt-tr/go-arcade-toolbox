@@ -172,13 +172,16 @@ func (p *Provider) mintChange(ctx context.Context, userID int, transactionID uin
 	}
 	mints := make([]*utxostore.Mint, 0, len(rows))
 	for i := range rows {
-		if rows[i].Basket == nil || *rows[i].Basket != p.changeBasketName() {
+		// Mint each self-owned (change-purpose) output into ITS OWN basket: the
+		// default change basket for ordinary change, and the pool/reserve basket
+		// for throughput fuel fan-out outputs (which are also emitted as change).
+		if rows[i].Basket == nil {
 			continue
 		}
 		mints = append(mints, &utxostore.Mint{
 			Outpoint:  utxostore.Outpoint{TxID: *hash, Vout: rows[i].Vout},
 			UserID:    int64(userID),
-			Basket:    p.changeBasketName(),
+			Basket:    *rows[i].Basket,
 			Satoshis:  uint64(rows[i].Satoshis), //nolint:gosec // change value non-negative
 			InputSize: utxostore.DefaultP2PKHInputSize,
 			Tier:      utxostore.TierSending,
@@ -462,7 +465,12 @@ func (p *Provider) changeOutpoints(ctx context.Context, userID int, transactionI
 	}
 	ops := make([]utxostore.Outpoint, 0, len(rows))
 	for i := range rows {
-		if rows[i].Basket == nil || *rows[i].Basket != p.changeBasketName() {
+		// Every self-owned (change-purpose) output regardless of basket: the
+		// default change basket AND the throughput pool/reserve baskets (fuel
+		// fan-out outputs). Promotion on broadcast-accept and change removal on
+		// abort must cover them all, or fuel coins would stay stranded at
+		// TierSending (never spendable) or linger after an abort.
+		if rows[i].Basket == nil {
 			continue
 		}
 		ops = append(ops, utxostore.Outpoint{TxID: *hash, Vout: rows[i].Vout})
