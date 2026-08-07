@@ -135,7 +135,14 @@ func (c *utxoCollector) result() (*Result, error) {
 func (c *utxoCollector) allocateUTXO(utxo *utxostore.UTXO) (err error) {
 	c.addToAllocated(utxo)
 
-	err = c.increaseSize(uint64(utxo.InputSize))
+	// InputSize is the unlocking-SCRIPT length (P2PKH default 107); the input's
+	// full serialized contribution also includes the 41-byte outpoint+sequence+
+	// scriptLen-varint overhead. Price the whole input — the same figure the
+	// look-ahead in remaining() uses (txutils.P2PKHEstimatedInputSize) — so the
+	// committed fee covers the real tx size. Counting only the script here
+	// undercounts each input by 41 bytes and, at a fee rate sitting on arcade's
+	// GoBDK min-fee floor, drops the broadcast below it (insufficient-fee).
+	err = c.increaseSize(txutils.TransactionInputSize(uint64(utxo.InputSize)))
 	if err != nil {
 		return fmt.Errorf("failed to increase tx size: %w", err)
 	}

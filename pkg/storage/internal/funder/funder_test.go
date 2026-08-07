@@ -1,12 +1,14 @@
 package funder_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/satoshi"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/txutils"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
@@ -15,6 +17,51 @@ import (
 func newFunder(t *testing.T, store utxostore.Store, satPerKB int64) *funder.Funder {
 	t.Helper()
 	return funder.New(logging.NewTestLogger(t), store, defs.FeeModel{Type: defs.SatPerKB, Value: satPerKB})
+}
+
+// TestFund_FeeCoversFullSerializedInputSize is a regression guard for an
+// insufficient-fee reject observed against a live arcade (GoBDK min-fee floor
+// == the configured 100 sat/kB, zero margin): the funder priced each allocated
+// input at only its unlocking-SCRIPT length (InputSize, 107 for P2PKH) instead
+// of the FULL serialized input size (txid+vout+scriptLen-varint+script+sequence
+// = 148 for P2PKH). The 41-byte-per-input undercount dropped the effective fee
+// below the configured rate — e.g. 43 sats on a 464-byte tx (~92.7 sat/kB) —
+// and arcade rejected the broadcast.
+//
+// The fee the funder commits MUST cover the transaction's real serialized size
+// at the configured rate. Reconstruct that size from the funding decision (the
+// allocated inputs' script lengths + the payment output + the change outputs)
+// and assert the committed fee is at least the rate applied to it.
+func TestFund_FeeCoversFullSerializedInputSize(t *testing.T) {
+	const rate = int64(100) // matches arcade's GoBDK floor: any undercount => reject
+	store := newMemStore()
+	mintCoins(t, store, "tx", utxostore.TierMined, 1_000_000)
+	f := newFunder(t, store, rate)
+
+	// baseArgs' CurrentTxSize (44) is envelope(8) + input-count varint(1) +
+	// output-count varint(1) + the single P2PKH payment output(34).
+	result, err := f.Fund(t.Context(), baseArgs(21_044, 44, 1))
+	require.NoError(t, err)
+	require.Len(t, result.AllocatedUTXOs, 1, "one 1M coin funds the payment")
+
+	inputScriptLens := make([]uint64, 0, len(result.AllocatedUTXOs))
+	for _, u := range result.AllocatedUTXOs {
+		inputScriptLens = append(inputScriptLens, uint64(u.InputSize))
+	}
+	// The payment output plus every change output the funder decided to create.
+	outputScriptLens := make([]uint64, 0, 1+int(result.ChangeOutputsCount))
+	outputScriptLens = append(outputScriptLens, txutils.P2PKHLockingScriptLength)
+	for i := uint64(0); i < result.ChangeOutputsCount; i++ {
+		outputScriptLens = append(outputScriptLens, txutils.P2PKHLockingScriptLength)
+	}
+
+	actualSize := txutils.TransactionSizeFromScriptLengths(inputScriptLens, outputScriptLens)
+	minFee := int64(math.Ceil(float64(actualSize) / 1000 * float64(rate)))
+
+	require.GreaterOrEqualf(t, result.Fee.Int64(), minFee,
+		"committed fee %d must cover the %d-byte serialized tx at %d sat/kB (need >= %d); "+
+			"a lower fee is what arcade rejects as insufficient-fee",
+		result.Fee.Int64(), actualSize, rate, minFee)
 }
 
 // TestFund_FeeGrowthRecomputesRemaining pins the CRITICAL edge of the bounded
