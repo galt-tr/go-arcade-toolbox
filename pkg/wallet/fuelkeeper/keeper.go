@@ -387,10 +387,22 @@ func (k *Keeper) runOnce(ctx context.Context) (catchUp bool, err error) {
 			// all selecting the same handful of change coins (a provided-input
 			// conflict that would fail most of the round).
 			if recycleCoins >= 2*int(conc) { //nolint:gosec // conc is a small config knob
+				// Recycle leaves mint RecycleCount outputs each (not
+				// FanoutOutputsPerTx), so size the leaf count to the deficit at
+				// that width — reusing `leaves` (computed for the wider chunk
+				// leaf) would under-mint by FanoutOutputsPerTx/RecycleCount.
+				recycleLeaves := (deficit + cfg.RecycleCount - 1) / cfg.RecycleCount
+				if recycleLeaves > cfg.FanoutMaxTxsPerRound {
+					recycleLeaves = cfg.FanoutMaxTxsPerRound
+				}
+				if k.streamActive.Load() && recycleLeaves > cfg.StreamLeafCap {
+					recycleLeaves = cfg.StreamLeafCap
+				}
 				k.logger.InfoContext(ctx, "recycling fuel directly from change basket",
 					slog.Int("recycleCoins", recycleCoins),
-					slog.Uint64("leafTxs", leaves))
-				minted, err = k.mintRecycleLeaves(ctx, cfg, leaves)
+					slog.Uint64("leafTxs", recycleLeaves),
+					slog.Uint64("recycleCount", cfg.RecycleCount))
+				minted, err = k.mintRecycleLeaves(ctx, cfg, recycleLeaves)
 				if err != nil {
 					return false, err
 				}
