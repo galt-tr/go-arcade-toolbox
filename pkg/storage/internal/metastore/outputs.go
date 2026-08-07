@@ -253,6 +253,27 @@ func (r OutputsRepo) ListOutputs(ctx context.Context, filter ListOutputsFilter) 
 	return out, total, nil
 }
 
+// CountInBasket returns how many output rows a user holds in the named basket.
+// It is the cheap counterpart to the total ListOutputs computes: a single
+// indexed range count over idx_outputs_user_basket (user_id, basket), with NO
+// join to transactions.
+//
+// The value is identical to ListOutputs's total for the same (user, basket)
+// with no status filter: outputs.transaction_id is a NOT NULL foreign key into
+// the unique transactions.transaction_id, so the inner join ListOutputs
+// performs matches exactly one transaction row per output — it neither drops
+// nor fans out rows — and the change-count caller (Provider.changeBasketCount)
+// applied no status filter either. Dropping the join therefore preserves the
+// count while removing a per-op join whose cost scaled with the basket size.
+func (r OutputsRepo) CountInBasket(ctx context.Context, userID int, basket string) (int64, error) {
+	q := r.s.rebind("SELECT COUNT(*) FROM outputs WHERE user_id = ? AND basket = ?")
+	var total int64
+	if err := r.s.execer(ctx).QueryRowContext(ctx, q, userID, basket).Scan(&total); err != nil {
+		return 0, fmt.Errorf("metastore: count outputs in basket: %w", err)
+	}
+	return total, nil
+}
+
 // FindOutputs returns the outputs matching args, ordered by output_id ASC. It
 // honors every filter it can evaluate locally and DELIBERATELY IGNORES
 // args.Spendable — spendability is external (see the package doc). args.TxID

@@ -416,14 +416,28 @@ func (p *Provider) maxChangeOutputsPerTx() uint64 {
 }
 
 // changeBasketCount returns an approximate count of outputs already in the
-// change basket, used to cap new change outputs. It counts descriptive rows
-// (an over-approximation is safe: it only shrinks the change budget).
+// change basket. It feeds funder.FundArgs.ExistingBasketCount, which clamps how
+// many new change outputs a create-action mints (NumberOfDesiredUTXOs −
+// existing, floored at 1). It counts descriptive rows (an over-approximation is
+// safe: it only shrinks the change budget) and is fetched BEFORE any DB
+// transaction opens (SQLite single-connection deadlock avoidance).
+//
+// Throughput mode SKIPS the count and returns 0 ("do not clamp on basket
+// fullness"). Under the fuel-pool strategy funding comes from a fixed-
+// denomination pool whose closed-form exact claims leave ~no change, so
+// clamping the change fan-out on how full the change basket is is degenerate.
+// Crucially this removes a per-op COUNT whose cost scales with the pool's row
+// count — the dominant scalable cost on the throughput hot path (the funding
+// pool lives in the change basket, so the count grew with pool size).
+//
+// The tiered (privacy) path keeps the clamp: the count still runs, now as a
+// cheap indexed count over idx_outputs_user_basket with no join to transactions
+// (an identical value — see OutputsRepo.CountInBasket).
 func (p *Provider) changeBasketCount(ctx context.Context, userID int) (int64, error) {
-	_, total, err := p.meta.Outputs().ListOutputs(ctx, metastore.ListOutputsFilter{
-		UserID: userID,
-		Basket: p.changeBasketName(),
-		Limit:  1,
-	})
+	if p.utxoMgmt.Enabled() {
+		return 0, nil
+	}
+	total, err := p.meta.Outputs().CountInBasket(ctx, userID, p.changeBasketName())
 	if err != nil {
 		return 0, fmt.Errorf("storage: count change basket: %w", err)
 	}

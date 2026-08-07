@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-07T05:30:49.956292652-04:00",
+  "label": "hybrid-after-128w",
+  "backend": "aerospike-hybrid",
+  "mode": "signandprocess",
+  "environment": {
+    "hostname": "fedora",
+    "os": "linux",
+    "arch": "amd64",
+    "kernel": "7.1.5-100.fc43.x86_64",
+    "cpuModel": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "logicalCores": 32,
+    "ramBytes": 67164336128,
+    "goVersion": "go1.26.3",
+    "podmanVersion": "podman version 5.8.4"
+  },
+  "config": {
+    "workers": 128,
+    "targetTps": 0,
+    "durationSec": 60,
+    "warmupSec": 5,
+    "poolSize": 60000,
+    "denomination": 1000000,
+    "paymentSats": 1000,
+    "maxDbConns": 144,
+    "network": "test",
+    "fundingPath": "throughput (ClaimExact fuel pool)"
+  },
+  "throughput": {
+    "sustainedTps": 489.683,
+    "totalOps": 29381,
+    "windowSeconds": 60,
+    "targetTps": 1000,
+    "pctOfTarget": 48.968,
+    "bucketWidthSec": 10,
+    "buckets": [
+      {
+        "startSec": 0,
+        "tps": 343.9
+      },
+      {
+        "startSec": 10,
+        "tps": 647.6
+      },
+      {
+        "startSec": 20,
+        "tps": 502.8
+      },
+      {
+        "startSec": 30,
+        "tps": 394
+      },
+      {
+        "startSec": 40,
+        "tps": 543.5
+      },
+      {
+        "startSec": 50,
+        "tps": 506.3
+      },
+      {
+        "startSec": 60,
+        "tps": 0
+      }
+    ]
+  },
+  "phases": {
+    "e2e": {
+      "count": 29381,
+      "minMs": 77.193,
+      "p50Ms": 228.017,
+      "p95Ms": 530.262,
+      "p99Ms": 735.883,
+      "maxMs": 1109.149,
+      "meanMs": 261.116
+    }
+  },
+  "contention": {
+    "attempted": 31659,
+    "succeeded": 31531,
+    "contentionRetries": 0,
+    "deadlockRetries": 0,
+    "contentionFails": 0,
+    "deadlockFails": 0,
+    "otherErrors": 128
+  },
+  "monitor": {
+    "enabled": true,
+    "mining": true,
+    "minedEmitted": 31531,
+    "actionsTotal": 31769,
+    "actionsCompleted": 5914,
+    "maturationPct": 59.14
+  },
+  "poolDepth": [
+    {
+      "atSec": 8.264,
+      "balanceSats": 59948784135
+    },
+    {
+      "atSec": 16.456,
+      "balanceSats": 59999737421
+    },
+    {
+      "atSec": 24.668,
+      "balanceSats": 60036237973
+    },
+    {
+      "atSec": 32.709,
+      "balanceSats": 59950803929
+    },
+    {
+      "atSec": 40.941,
+      "balanceSats": 59925392406
+    },
+    {
+      "atSec": 49.194,
+      "balanceSats": 59966794668
+    },
+    {
+      "atSec": 57.273,
+      "balanceSats": 59843065094
+    }
+  ],
+  "notes": [
+    "FUEL-POOL PATH: the provider runs with UTXOManagement.Strategy=throughput, so each worker's wallet.CreateAction funds via the funder's closed-form ClaimExact fast path (FundArgs.Denomination\u003e0) over a denominated pool — no tiered SKIP-LOCKED best-fit scan. This is the 1000-TPS design's funding route (Task 27 wiring).",
+    "POOL BASKET = 'default' (a measurement choice, not the production layout): the pool must hold wallet-SIGNABLE coins so every op can sign+broadcast through the real wallet, and the only public API that mints BRC-29-signable coins (InternalizeAction wallet-payment) books them into the default basket. ClaimExact selects strictly by (basket, tier, satoshis==denomination), so the non-denominated change that also lands in 'default' is invisible to the fast path. A dedicated 'fuel' basket would need shaped-change minting (FanOutFuel/FuelShape) which storage does not yet implement — see the benchmark README gap analysis.",
+    "NO RECYCLING: unlike the tiered path, each op's change is NOT re-claimed (it is not denomination-sized), so the pool strictly drains ~1 coin per op. The pool is sized to outlast warmup+duration; if ClaimExact ever underflowed it would fall back to the tiered walk over 'default' (visible as a contention/not-enough-funds spike). A clean run shows ~0 contention and ~0 not-enough-funds.",
+    "Measures storage + wallet throughput: broadcasts hit the in-process mockarcade (202 instantly), not a live network.",
+    "otherErrors is the residual bucket: write-path errors not matched as contention or deadlock — e.g. transient BEEF-assembly or reference/timeout errors, including the one in-flight op per worker interrupted at shutdown. Typically \u003c0.5% of ops and not individually root-caused.",
+    "The monitor daemon runs the real SSE apply pipeline; the auto-miner emits status-SSE MINED frames (with proof headers) so change matures unproven-\u003emined through the async loop under load (best-effort: frames may drop when the pipeline is behind). The auto-miner does NOT advance the chaintracks tip stream.",
+    "Single-call mode: one CreateAction does create+sign+process+broadcast; only the end-to-end phase is timed (fewest round trips). Fewer round trips is only plausibly ~2x on the SQL/hybrid backends; on write-serialized SQLite it can be marginally slower."
+  ]
+}
