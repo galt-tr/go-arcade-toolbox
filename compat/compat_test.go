@@ -29,10 +29,18 @@ import (
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	storagepkg "github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
 )
+
+// M2 growth: the real storage.Provider — not just the stub above — satisfies
+// wdk.WalletStorageProvider end to end. This is the compile assertion the M2
+// GROWTH TODO called for. The Provider's constructor wiring and option funcs
+// (New, WithChangeBasket, WithCommission, ...) are exercised in pkg/storage's
+// own tests; here we only need the interface-satisfaction guarantee.
+var _ wdk.WalletStorageProvider = (*storagepkg.Provider)(nil)
 
 // ===========================================================================
 // 1. wdk.WalletStorageProvider — the 21-method write-capable storage
@@ -814,11 +822,13 @@ func TestPendingSignActionsRepositoryCallSiteShape(t *testing.T) {
 // interface-satisfaction assertion for new interfaces, literal construction
 // for new arg/result types, and a golden JSON pin for anything wire-visible.
 //
-// TODO(M2 — pkg/storage): storage.NewProvider(...) / storage.Provider
-// construction, storage.NewWalletStorageManager(identityKey, logger, active,
-// backups...) wiring, provider option funcs (WithChangeBasket,
-// WithCommission, WithSyncReader, ...), and confirm storage.Provider still
-// satisfies wdk.WalletStorageProvider end to end (not just our stub).
+// DONE(M2 — pkg/storage): storage.Provider satisfies wdk.WalletStorageProvider
+// end to end — see the `var _ wdk.WalletStorageProvider = (*storagepkg.Provider)(nil)`
+// assertion near the top of this file. The constructor (storage.New) takes live
+// subsystems (metastore/utxostore/funder/oracle/headers), so it is wired and
+// exercised in pkg/storage's own tests rather than reconstructed here; the
+// option funcs (WithChangeBasket, WithCommission, WithNetwork, ...) live there
+// too. The go-wallet-toolbox WalletStorageManager wrapper is not ported.
 //
 // TODO(M3 — pkg/wallet): wallet.New(...) generic constructors, the Wallet
 // struct's exported methods (CreateAction/ProcessAction/ListActions/
