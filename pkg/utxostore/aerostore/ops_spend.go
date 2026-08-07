@@ -153,13 +153,16 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 		wp := as.NewWritePolicy(0, 0)
 		wp.RecordExistsAction = as.UPDATE_ONLY
 		wp.FilterExpression = as.ExpEq(as.ExpBlobBin(binSpentBy), as.ExpBlobVal(spendingTxID[:]))
+		s.fireRestoreRaceHook()
+		// Restore claimKey unless the row is frozen, deriving its tier from the
+		// live tier bin so a concurrent Promote cannot leave a stale-tier key.
 		_, aerr := s.client.Operate(
 			wp, key,
 			removeBinOp(binSpentBy),
 			removeBinOp(binResBy),
 			removeBinOp(binResAt),
 			as.PutOp(as.NewBin(binInvKey, invKeyFor(u.UserID, u.Basket))),
-			restoreClaimKeyOp(claimKeyForUTXO(u)),
+			restoreClaimKeyOp(as.ExpBinExists(binFrozen), u),
 		)
 		if aerr != nil {
 			if aerr.Matches(types.FILTERED_OUT) || aerr.Matches(types.KEY_NOT_FOUND_ERROR) {

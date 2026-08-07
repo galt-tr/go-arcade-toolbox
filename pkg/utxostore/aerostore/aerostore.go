@@ -96,6 +96,13 @@ type Store struct {
 	logger         *slog.Logger
 	durableDeletes bool
 
+	// restoreRaceHook, when non-nil, is invoked by the release/unspend/unfreeze
+	// restore paths immediately BEFORE their server-side restore Operate. It is
+	// a TEST-ONLY seam for deterministically landing a concurrent Promote inside
+	// the caller's snapshot→restore window (the stale-tier claimKey race);
+	// production leaves it nil so the check is a single predictable branch.
+	restoreRaceHook func()
+
 	closeOnce sync.Once
 	closed    atomic.Bool
 }
@@ -488,15 +495,49 @@ func (s *Store) getRecord(op utxostore.Outpoint) (rec *as.Record, found bool, er
 	return r, true, nil
 }
 
-// restoreClaimKeyOp returns an operation that writes claimKey (making the row
-// claimable) ONLY if the row is not frozen — evaluated atomically server-side,
-// so a concurrent freeze can never be overwritten. When frozen, the write is
-// skipped (the bin stays absent). Used by release/unspend transitions that
-// return a coin to the pool.
-func restoreClaimKeyOp(claimKey string) *as.Operation {
-	return as.ExpWriteOp(binClaimKey,
-		as.ExpCond(as.ExpNot(as.ExpBinExists(binFrozen)), as.ExpStringVal(claimKey), as.ExpUnknown()),
-		as.ExpWriteFlagEvalNoFail)
+// restoreClaimKeyOp returns an operation that RESTORES the claimKey bin (making
+// the row claimable again), deriving the key's embedded tier from the record's
+// OWN live tier bin, but ONLY when skipWhen evaluates false — all evaluated
+// atomically server-side. This closes the stale-tier window: a concurrent
+// Promote that rewrote the tier bin between the caller's snapshot read and this
+// write is reflected in the restored key, so the coin can never become
+// claimable under a stale tier's secondary-index bucket.
+//
+// aerospike-client-go/v8 has no server-side string concatenation, but tier is a
+// tiny enum (1..3), so the client precomputes the three candidate claimKey
+// strings and the SERVER selects the one whose embedded tier equals the live
+// tier bin (an ExpCond ladder). The expression reads only bins this Operate
+// does NOT modify (tier, plus skipWhen's bins), so it always observes their
+// live committed values regardless of intra-Operate operation ordering.
+//
+// skipWhen names the states in which the coin must NOT be resurrected as
+// claimable (frozen, for the release/unspend paths; reserved or spent, for the
+// unfreeze path); when it holds, ExpUnknown + EvalNoFail skips the write and the
+// bin stays absent. An unexpected tier (impossible — tiers are validated on
+// mint/promote) likewise falls through to a skip rather than writing a bogus
+// key.
+func restoreClaimKeyOp(skipWhen *as.Expression, u *utxostore.UTXO) *as.Operation {
+	bucket := bucketOf(u.Satoshis)
+	// ExpCond form: test1, action1, test2, action2, …, defaultAction. Skip
+	// (write nothing) when skipWhen holds; otherwise select the claimKey string
+	// whose embedded tier matches the record's LIVE tier bin.
+	pairs := []*as.Expression{skipWhen, as.ExpUnknown()}
+	for _, t := range []utxostore.Tier{utxostore.TierSending, utxostore.TierUnproven, utxostore.TierMined} {
+		pairs = append(pairs,
+			as.ExpEq(as.ExpIntBin(binTier), as.ExpIntVal(int64(t))),
+			as.ExpStringVal(claimKeyFor(u.UserID, u.Basket, t, bucket)),
+		)
+	}
+	pairs = append(pairs, as.ExpUnknown()) // unexpected tier → skip
+	return as.ExpWriteOp(binClaimKey, as.ExpCond(pairs...), as.ExpWriteFlagEvalNoFail)
+}
+
+// fireRestoreRaceHook invokes the test-only restore-race seam if one is set.
+// See the restoreRaceHook field.
+func (s *Store) fireRestoreRaceHook() {
+	if s.restoreRaceHook != nil {
+		s.restoreRaceHook()
+	}
 }
 
 // removeBinOp returns an operation that removes a bin (a Put of a nil value).
@@ -521,9 +562,4 @@ func batchCountErr(failed, total int) error {
 		return nil
 	}
 	return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, total)
-}
-
-// claimKeyForUTXO derives a coin's claimKey from its current identity/tier.
-func claimKeyForUTXO(u *utxostore.UTXO) string {
-	return claimKeyFor(u.UserID, u.Basket, u.Tier, bucketOf(u.Satoshis))
 }

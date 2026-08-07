@@ -209,13 +209,20 @@ func (s *Store) Unfreeze(_ context.Context, ops []utxostore.Outpoint) error {
 			itemErrs = append(itemErrs, kerr)
 			continue
 		}
-		ops2 := []*as.Operation{removeBinOp(binFrozen)}
-		if u.ReservedBy == "" && u.SpentBy == nil {
-			ops2 = append(ops2, as.PutOp(as.NewBin(binClaimKey, claimKeyForUTXO(u))))
-		}
 		wp := as.NewWritePolicy(0, 0)
 		wp.RecordExistsAction = as.UPDATE_ONLY
-		if _, aerr := s.client.Operate(wp, key, ops2...); aerr != nil {
+		s.fireRestoreRaceHook()
+		// Lift the hold and restore claimKey iff the row is otherwise claimable
+		// (unreserved AND unspent) — both the guard and the restored key's tier
+		// are evaluated server-side against the live record, so a Promote or a
+		// reserve/spend racing the snapshot read above can neither leave a
+		// stale-tier key nor resurrect a now-reserved/-spent coin as claimable.
+		_, aerr := s.client.Operate(
+			wp, key,
+			removeBinOp(binFrozen),
+			restoreClaimKeyOp(as.ExpOr(as.ExpBinExists(binResBy), as.ExpBinExists(binSpentBy)), u),
+		)
+		if aerr != nil {
 			if aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
 				itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
 				continue

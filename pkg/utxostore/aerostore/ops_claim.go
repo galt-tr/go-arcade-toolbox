@@ -285,7 +285,7 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 
 	released := 0
 	for _, u := range rows {
-		ok, rerr := s.releaseRow(u.Outpoint, reservation, claimKeyForUTXO(u))
+		ok, rerr := s.releaseRow(u, reservation)
 		if rerr != nil {
 			return released, rerr
 		}
@@ -321,7 +321,7 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 		if u.ReservedBy != reservation || u.SpentBy != nil {
 			continue // skip: stale or foreign release intent
 		}
-		if _, rerr := s.releaseRow(op, reservation, claimKeyForUTXO(u)); rerr != nil {
+		if _, rerr := s.releaseRow(u, reservation); rerr != nil {
 			return rerr
 		}
 	}
@@ -330,10 +330,12 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 
 // releaseRow performs the CAS that returns a reserved row to the claimable
 // pool: guarded by resBy == reservation and unspent, it removes resBy/resAt and
-// restores claimKey (unless the row is frozen). Returns false when the guard no
-// longer holds (FILTERED_OUT) — an idempotent skip.
-func (s *Store) releaseRow(op utxostore.Outpoint, reservation, claimKey string) (bool, error) {
-	key, err := s.keyFor(op)
+// restores claimKey (unless the row is frozen). The restored claimKey's tier is
+// derived server-side from the live tier bin, so a Promote that raced the
+// caller's snapshot read cannot leave a stale-tier key. Returns false when the
+// guard no longer holds (FILTERED_OUT) — an idempotent skip.
+func (s *Store) releaseRow(u *utxostore.UTXO, reservation string) (bool, error) {
+	key, err := s.keyFor(u.Outpoint)
 	if err != nil {
 		return false, err
 	}
@@ -343,17 +345,18 @@ func (s *Store) releaseRow(op utxostore.Outpoint, reservation, claimKey string) 
 		as.ExpEq(as.ExpStringBin(binResBy), as.ExpStringVal(reservation)),
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
 	)
+	s.fireRestoreRaceHook()
 	_, aerr := s.client.Operate(
 		wp, key,
 		removeBinOp(binResBy),
 		removeBinOp(binResAt),
-		restoreClaimKeyOp(claimKey),
+		restoreClaimKeyOp(as.ExpBinExists(binFrozen), u),
 	)
 	if aerr != nil {
 		if aerr.Matches(types.FILTERED_OUT) || aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
 			return false, nil // guard no longer holds: skip
 		}
-		return false, fmt.Errorf("aerostore: release %s: %w", op, aerr)
+		return false, fmt.Errorf("aerostore: release %s: %w", u.Outpoint, aerr)
 	}
 	return true, nil
 }
