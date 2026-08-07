@@ -74,6 +74,15 @@ type Config struct {
 	// consumes ~1/(1+3)=25% of the shared serialized-wallet time, leaving the
 	// rest to stream createActions and metrics. 0 → DefaultStreamYieldMultiple.
 	StreamYieldMultiple uint64
+	// DisableStreamYield turns off the per-fan-out fair-share pause entirely
+	// (StreamLeafCap still bounds a round's burst size). Because the yield is
+	// proportional to RPC duration, under a heavy stream opTook inflates and the
+	// yield inflates with it — throttling the keeper below the stream's burn rate
+	// exactly when full keeper speed is needed. Set this in dedicated
+	// high-throughput deployments (sustained ≥1000-TPS blast recycling fuel) where
+	// the keeper must keep pace; leave it false when the keeper shares a wallet
+	// with latency-sensitive foreground work that must not be starved.
+	DisableStreamYield bool
 
 	// MintConcurrency is how many leaf fan-outs a round runs in parallel.
 	// Leaves are independent (each consumes its own reserve chunk), and a
@@ -252,7 +261,7 @@ func (k *Keeper) fanOut(ctx context.Context, cfg Config, shape wdk.ShapedChange)
 // yieldToStream sleeps multiple×opTook (with a small floor) while a stream is
 // active so waiters on the serialized wallet run before the keeper's next RPC.
 func (k *Keeper) yieldToStream(ctx context.Context, cfg Config, opTook time.Duration) {
-	if !k.streamActive.Load() {
+	if !k.streamActive.Load() || cfg.DisableStreamYield {
 		return
 	}
 	pause := opTook * time.Duration(cfg.StreamYieldMultiple) //nolint:gosec // multiple is a small config knob
