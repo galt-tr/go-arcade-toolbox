@@ -84,6 +84,17 @@ func (p *Provider) buildBEEF(ctx context.Context, beef *transaction.Beef, txid s
 	if _, err := beef.MergeRawTx(kt.RawTx, nil); err != nil {
 		return fmt.Errorf("storage: merge raw tx %s: %w", txid, err)
 	}
+
+	// Direct-only mode: the spent coin's own transaction (just merged) carries
+	// the output arcade needs as the EF prevout. Stop here rather than merging
+	// this tx's stored input BEEF and recursing — that walk is O(chain length)
+	// and, under delayed broadcast with nothing yet mined, an unbounded unproven
+	// chain would blow up MergeBump/ComputeRoot. Deep ancestry is BRC-62
+	// completeness the arcade-only model does not require.
+	if p.directInputBEEF {
+		return nil
+	}
+
 	if len(kt.InputBEEF) > 0 {
 		if err := beef.MergeBeefBytes(kt.InputBEEF); err != nil {
 			return fmt.Errorf("storage: merge input beef %s: %w", txid, err)

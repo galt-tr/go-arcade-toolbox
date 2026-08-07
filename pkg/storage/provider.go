@@ -75,6 +75,16 @@ type Provider struct {
 	// WithSendConcurrency).
 	sendConcurrency int
 
+	// directInputBEEF, when true, assembles a transaction's stored input BEEF
+	// from only the directly-spent coins' transactions rather than their full
+	// recursive ancestry. Arcade validates the extended-format broadcast from
+	// each input's inline prevout, so the direct source is sufficient; the deep
+	// ancestry is BRC-62-verifier completeness the arcade-only model does not
+	// need. It bounds assembly to O(inputs) and prevents a deep unproven chain
+	// (delayed mode, nothing mined yet) from blowing up buildBEEF's MerklePath
+	// root recomputation (see WithDirectInputBEEF).
+	directInputBEEF bool
+
 	now func() time.Time
 
 	// modeA is true when the metastore and utxostore share one *sql.DB, so the
@@ -166,6 +176,17 @@ func WithSendConcurrency(n int) Option {
 		}
 		p.sendConcurrency = n
 	}
+}
+
+// WithDirectInputBEEF bounds stored input-BEEF assembly to the directly-spent
+// coins' transactions (no recursive ancestry). It is the correct setting for an
+// arcade-only deployment: arcade validates the EF broadcast from inline
+// prevouts, so deep ancestry is unnecessary, and omitting it keeps input-BEEF
+// assembly O(inputs) instead of O(chain length) — essential for high-throughput
+// delayed broadcast, where unproven coins accumulate faster than they are
+// proven and the ancestry would otherwise grow without bound.
+func WithDirectInputBEEF() Option {
+	return func(p *Provider) { p.directInputBEEF = true }
 }
 
 // New builds a Provider over the given subsystems. The scripts/beef verifiers
