@@ -29,9 +29,11 @@ type WalletServices struct {
 }
 
 // deriveEndpoints fills in the Arcade SSE events URL and the ChainTracks URL from
-// the Arcade URL when they are not set explicitly. Arcade SSE events run on port
-// 8082 and ChainTracks runs on port 8083 (path /chaintracks/v2) inside arcade
-// deployments. Explicit configuration always takes precedence.
+// the Arcade URL when they are not set explicitly. A public arcade gateway serves
+// the SSE events stream and ChainTracks on the SAME scheme+host+port as the
+// broadcaster, routed by path (events at /events, ChainTracks under /chaintracks/v2),
+// so both are derived from the arcade base with its port preserved. Explicit
+// configuration always takes precedence.
 func (ws *WalletServices) deriveEndpoints() {
 	if ws.Arcade.URL == "" {
 		return
@@ -111,8 +113,9 @@ func DefaultServicesConfig(chain BSVNetwork) WalletServices {
 		GetBeefMaxDepth: DefaultGetBeefMaxDepth,
 	}
 
-	// Derive the Arcade events / ChainTracks URLs from the Arcade host (ports
-	// 8082 / 8083) for any field left empty by endpointsForChain.
+	// Derive the Arcade events / ChainTracks URLs from the Arcade base (same
+	// host+port, ChainTracks under /chaintracks/v2) for any field left empty by
+	// endpointsForChain.
 	cfg.deriveEndpoints()
 
 	return cfg

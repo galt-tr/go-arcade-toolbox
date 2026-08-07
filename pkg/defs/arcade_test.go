@@ -15,8 +15,8 @@ func TestDefaultServicesConfigArcadeMainnet(t *testing.T) {
 	// then:
 	require.True(t, cfg.Arcade.Enabled)
 	require.Equal(t, defs.ArcadeURL, cfg.Arcade.URL)
-	// EventsURL is derived from the Arcade host on port 8082.
-	require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech:8082", cfg.Arcade.EventsURL)
+	// EventsURL is derived from the Arcade base unchanged (client appends /events).
+	require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech", cfg.Arcade.EventsURL)
 	require.True(t, cfg.Arcade.FullStatusUpdates)
 	require.Equal(t, uint(3), cfg.Arcade.CircuitBreaker.FailureThreshold)
 	require.Equal(t, uint(30), cfg.Arcade.CircuitBreaker.HealthProbeIntervalSeconds)

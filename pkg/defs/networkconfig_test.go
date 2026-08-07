@@ -30,15 +30,16 @@ func TestTstnChaintracksURL(t *testing.T) {
 		require.Equal(t, "https://ct.example.tstn/custom", got)
 	})
 
-	t.Run("falls back to the arcade host (port 8083, /chaintracks/v2) when chaintracks unset", func(t *testing.T) {
+	t.Run("falls back to the arcade base (/chaintracks/v2, no port) when chaintracks unset", func(t *testing.T) {
 		t.Setenv(defs.EnvTstnArcadeURL, "https://arcade.example.tstn/")
 		t.Setenv(defs.EnvTstnChaintracksURL, "")
 
 		got, err := defs.TstnChaintracksURL()
 		require.NoError(t, err)
 		// trailing slash on the arcade URL is normalized away before deriving the endpoint;
-		// the go-chaintracks client appends /tip, /header/... under this base.
-		require.Equal(t, "https://arcade.example.tstn:8083/chaintracks/v2", got)
+		// the arcade base host+port is preserved (public gateway serves everything on one
+		// port by path); the go-chaintracks client appends /tip, /header/... under this base.
+		require.Equal(t, "https://arcade.example.tstn/chaintracks/v2", got)
 	})
 
 	t.Run("errors when neither variable is set", func(t *testing.T) {

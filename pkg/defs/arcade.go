@@ -14,8 +14,8 @@ const ArcadeServiceName = "Arcade"
 const ArcadeURL = "https://arcade-v2-us-1.bsvblockchain.tech"
 
 // ArcadeTTNURL is the default Arcade instance for the public Teranode Test Net (ttn).
-// The same host also serves ChainTracks (port 8083, path /chaintracks/v2) and the SSE
-// events stream (port 8082); those URLs are derived from this host by DefaultServicesConfig.
+// The same host+port also serves ChainTracks (path /chaintracks/v2) and the SSE events
+// stream (path /events); those URLs are derived from this base by DefaultServicesConfig.
 const ArcadeTTNURL = "https://arcade-v2-ttn-us-1.bsvblockchain.tech"
 
 // ArcadeCircuitBreaker configures when the wallet fails over away from Arcade.
@@ -85,8 +85,8 @@ func (a *Arcade) Validate() error {
 
 // validateArcadeURL checks that the Arcade base URL is parseable, uses an
 // http/https scheme and has a non-empty host — the shape the events/ChainTracks
-// endpoint derivation (ports 8082/8083) relies on. Without this check a
-// scheme-less URL would silently yield empty derived endpoints.
+// endpoint derivation (same base + /events, + /chaintracks/v2) relies on. Without
+// this check a scheme-less URL would silently yield empty derived endpoints.
 func validateArcadeURL(arcadeURL string) error {
 	u, err := url.Parse(arcadeURL)
 	if err != nil {

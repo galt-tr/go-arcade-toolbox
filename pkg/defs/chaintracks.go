@@ -4,10 +4,10 @@ import "fmt"
 
 // ChainTracks configures the ChainTracks headers client.
 //
-// In the arcade-only posture ChainTracks always runs remotely inside the Arcade
-// deployment (port 8083, path /chaintracks/v2), so there is no embedded/remote
-// mode toggle. When URL is left empty it is derived from the Arcade URL by
-// WalletServices (see network_endpoints.go); an explicit URL always wins.
+// In the arcade-only posture ChainTracks is served by the Arcade gateway under the
+// /chaintracks/v2 path (same host+port as the broadcaster), so there is no
+// embedded/remote mode toggle. When URL is left empty it is derived from the Arcade
+// URL by WalletServices (see network_endpoints.go); an explicit URL always wins.
 //
 // The go-chaintracks HTTP client treats URL as a base and requests /tip,
 // /header/height/{n}, etc. under it.

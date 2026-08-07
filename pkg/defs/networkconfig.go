@@ -12,9 +12,9 @@ import (
 // hardcoded in this (public) source tree. They are supplied at runtime through environment
 // variables:
 //
-//	TSTN_ARCADE_URL       Arcade broadcaster endpoint base. Also the fallback host for
+//	TSTN_ARCADE_URL       Arcade broadcaster endpoint base. Also the fallback base for
 //	                      ChainTracks when TSTN_CHAINTRACKS_URL is unset
-//	                      (${TSTN_ARCADE_URL} host, port 8083, path /chaintracks/v2).
+//	                      (${TSTN_ARCADE_URL} + /chaintracks/v2, same host+port).
 //	TSTN_CHAINTRACKS_URL  ChainTracks service base URL.
 //
 // tstn runs only Arcade (broadcast + merkle proofs) and ChainTracks (headers); there is no
@@ -38,7 +38,7 @@ func TstnArcadeURL() string {
 }
 
 // TstnChaintracksURL returns the ChainTracks service base URL for tstn. It falls back to
-// the Arcade host (port 8083, path /chaintracks/v2) when TSTN_CHAINTRACKS_URL is unset
+// the Arcade base (+ /chaintracks/v2, same host+port) when TSTN_CHAINTRACKS_URL is unset
 // (mirroring the derivation used for ttn/main), and returns an error when neither variable
 // is configured.
 func TstnChaintracksURL() (string, error) {

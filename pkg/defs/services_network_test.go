@@ -14,11 +14,11 @@ func TestDefaultServicesConfigPerNetwork(t *testing.T) {
 
 		require.True(t, cfg.Arcade.Enabled)
 		require.Equal(t, defs.ArcadeURL, cfg.Arcade.URL)
-		// SSE events derive from the arcade host on port 8082.
-		require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech:8082", cfg.Arcade.EventsURL)
+		// SSE events derive from the arcade base unchanged (client appends /events).
+		require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech", cfg.Arcade.EventsURL)
 		require.True(t, cfg.ChainTracks.Enabled)
-		// ChainTracks derives from the arcade host on port 8083 under /chaintracks/v2.
-		require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech:8083/chaintracks/v2", cfg.ChainTracks.URL)
+		// ChainTracks derives from the arcade base under /chaintracks/v2 (no port).
+		require.Equal(t, "https://arcade-v2-us-1.bsvblockchain.tech/chaintracks/v2", cfg.ChainTracks.URL)
 
 		require.NoError(t, cfg.Validate())
 	})
@@ -40,9 +40,9 @@ func TestDefaultServicesConfigPerNetwork(t *testing.T) {
 
 		require.True(t, cfg.Arcade.Enabled)
 		require.Equal(t, defs.ArcadeTTNURL, cfg.Arcade.URL)
-		require.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech:8082", cfg.Arcade.EventsURL)
+		require.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech", cfg.Arcade.EventsURL)
 		require.True(t, cfg.ChainTracks.Enabled)
-		require.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech:8083/chaintracks/v2", cfg.ChainTracks.URL)
+		require.Equal(t, "https://arcade-v2-ttn-us-1.bsvblockchain.tech/chaintracks/v2", cfg.ChainTracks.URL)
 
 		require.NoError(t, cfg.Validate())
 	})
@@ -55,10 +55,10 @@ func TestDefaultServicesConfigPerNetwork(t *testing.T) {
 
 		require.True(t, cfg.Arcade.Enabled)
 		require.Equal(t, "https://arcade.example.tstn", cfg.Arcade.URL)
-		require.Equal(t, "https://arcade.example.tstn:8082", cfg.Arcade.EventsURL)
+		require.Equal(t, "https://arcade.example.tstn", cfg.Arcade.EventsURL)
 		require.True(t, cfg.ChainTracks.Enabled)
 		// chaintracks falls back to the arcade host when TSTN_CHAINTRACKS_URL is unset.
-		require.Equal(t, "https://arcade.example.tstn:8083/chaintracks/v2", cfg.ChainTracks.URL)
+		require.Equal(t, "https://arcade.example.tstn/chaintracks/v2", cfg.ChainTracks.URL)
 
 		require.NoError(t, cfg.Validate())
 	})
@@ -96,15 +96,17 @@ func TestDefaultServicesConfigPerNetwork(t *testing.T) {
 		require.Equal(t, "https://ct.custom.example/v9", cfg.ChainTracks.URL)
 	})
 
-	t.Run("derivation replaces an explicit port on the arcade URL", func(t *testing.T) {
+	t.Run("derivation preserves an explicit port on the arcade URL", func(t *testing.T) {
 		cfg := defs.DefaultServicesConfig(defs.NetworkMainnet)
 		cfg.Arcade.URL = "https://arcade.custom.example:9999"
 		cfg.Arcade.EventsURL = ""
 		cfg.ChainTracks.URL = ""
 
 		require.NoError(t, cfg.Validate())
-		require.Equal(t, "https://arcade.custom.example:8082", cfg.Arcade.EventsURL)
-		require.Equal(t, "https://arcade.custom.example:8083/chaintracks/v2", cfg.ChainTracks.URL)
+		// A gateway on a non-standard port serves every service on THAT port by path,
+		// so the port is preserved (not swapped for an internal :8082/:8083).
+		require.Equal(t, "https://arcade.custom.example:9999", cfg.Arcade.EventsURL)
+		require.Equal(t, "https://arcade.custom.example:9999/chaintracks/v2", cfg.ChainTracks.URL)
 	})
 }
 
