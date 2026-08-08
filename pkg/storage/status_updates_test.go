@@ -635,7 +635,9 @@ func TestSendWaitingTransactions(t *testing.T) {
 	require.EqualValues(t, 1, h.oracle.broadcasts.Load(), "the waiting tx was broadcast once")
 	require.Equal(t, wdk.TxStatusUnproven, h.txStatus(mainTxID))
 	require.Equal(t, wdk.ProvenTxStatusUnconfirmed, h.knownTx(mainTxID).Status)
-	require.Equal(t, utxostore.TierUnproven, h.tier(op), "change promoted to unproven")
+	require.Equal(t, utxostore.TierSending, h.tier(op), "change not claimable on the 202, only on SEEN")
+	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{TxID: mainTxID, Status: arcade.StatusSeenOnNetwork}))
+	require.Equal(t, utxostore.TierUnproven, h.tier(op), "SEEN promotes change to claimable")
 	// The reserved input flipped to spent by the main tx.
 	inUTXO, err := h.utxo.Get(ctx, utxostore.Outpoint{TxID: *srcTxID, Vout: 0})
 	require.NoError(t, err)

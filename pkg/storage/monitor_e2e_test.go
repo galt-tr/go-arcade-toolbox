@@ -52,6 +52,11 @@ func TestE2E_Monitor_SSE_MINED_PromotesOwnSentTx(t *testing.T) {
 
 	requireActionStatus(t, s, "sse-mined", wdk.TxStatusUnproven)
 
+	// Change is claimable only once arcade SEENs the tx (a 202 is not
+	// validation), so drive the SEEN the monitor applies from SSE before the
+	// pre-mine tier check.
+	s.seeTx(txid)
+
 	// The change coin is at TierUnproven before mining.
 	changeOp := s.changeOutpoint(txid)
 	require.Equal(t, utxostore.TierUnproven, s.tierOf(changeOp), "change is unproven pre-mine")

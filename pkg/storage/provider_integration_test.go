@@ -132,9 +132,17 @@ func TestModeA_CreateProcessAccept_Atomic(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, spent.SpentBy)
 
-	ch, err := h.utxo.Get(ctx, changeOutpoint(t, res, txid))
+	// Change is minted but not yet claimable: a 202 is acceptance-for-processing,
+	// not validation, so change stays at TierSending until arcade SEENs the tx.
+	chOp := changeOutpoint(t, res, txid)
+	ch, err := h.utxo.Get(ctx, chOp)
 	require.NoError(t, err)
-	assert.Equal(t, utxostore.TierUnproven, ch.Tier)
+	assert.Equal(t, utxostore.TierSending, ch.Tier, "change not claimable on the 202, only on SEEN")
+
+	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{TxID: txid, Status: arcade.StatusSeenOnNetwork}))
+	ch, err = h.utxo.Get(ctx, chOp)
+	require.NoError(t, err)
+	assert.Equal(t, utxostore.TierUnproven, ch.Tier, "SEEN promotes change to claimable")
 }
 
 // TestModeA_BroadcastFailure_Consistent proves an opaque broadcast failure

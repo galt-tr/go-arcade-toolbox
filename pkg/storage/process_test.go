@@ -57,10 +57,18 @@ func TestProcessAction_Accept(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, u.SpentBy, "input spent on acceptance")
 
-	// change promoted to TierUnproven.
-	ch, err := h.utxo.Get(ctx, changeOutpoint(t, res, txid))
+	// change minted but NOT yet claimable: a 202 is acceptance-for-processing,
+	// not validation, so change stays at TierSending until arcade SEENs the tx.
+	chOp := changeOutpoint(t, res, txid)
+	ch, err := h.utxo.Get(ctx, chOp)
 	require.NoError(t, err)
-	assert.Equal(t, utxostore.TierUnproven, ch.Tier)
+	assert.Equal(t, utxostore.TierSending, ch.Tier, "change is not claimable on the 202, only on SEEN")
+
+	// On the SEEN status the change is promoted to claimable (TierUnproven).
+	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{TxID: txid, Status: arcade.StatusSeenOnNetwork}))
+	ch, err = h.utxo.Get(ctx, chOp)
+	require.NoError(t, err)
+	assert.Equal(t, utxostore.TierUnproven, ch.Tier, "SEEN promotes change to claimable")
 }
 
 func TestProcessAction_Reject(t *testing.T) {

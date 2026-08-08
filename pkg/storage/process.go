@@ -324,9 +324,15 @@ func (p *Provider) applyAcceptedBroadcast(ctx context.Context, userID int, txid 
 			if err := p.spendReservedInputs(ctx, tx, txid, string(txRow.Reference)); err != nil {
 				return err
 			}
-			if err := p.promoteChange(ctx, userID, txRow.TransactionID, txid, utxostore.TierUnproven); err != nil {
-				return err
-			}
+			// Change stays at TierSending here and is NOT promoted to claimable
+			// on the 202. A 202 is "accepted for processing", not validated: the
+			// tx can still fail validation, and until arcade has SEEN it a child
+			// that spends this change can reach arcade's validation before the
+			// parent is in its mempool — an unknown-input rejection that cascades
+			// down a self-payment chain. Promotion to TierUnproven happens only on
+			// the actual SEEN status ([Provider.applySeen] / the poll fallback), or
+			// directly to TierMined on proof — so a coin is spendable only once the
+			// network has accepted the tx that created it.
 			if err := p.markInputsSpent(ctx, userID, txRow.TransactionID, tx); err != nil {
 				return err
 			}

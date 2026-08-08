@@ -215,6 +215,17 @@ func (s *e2eStack) seedMinedPayment(sats uint64, height uint32) (seedTxid string
 	return txid
 }
 
+// seeTx applies arcade's SEEN status for txid, the way the monitor's SSE
+// consumer does in production. ProcessAction's 202 no longer promotes a tx's
+// change to claimable (a 202 is not validation); promotion happens on the real
+// SEEN event, so a synchronous test that spends a tx's freshly-minted outputs
+// must drive SEEN first.
+func (s *e2eStack) seeTx(txid string) {
+	s.t.Helper()
+	require.NoError(s.t, s.provider.ApplyStatusUpdate(context.Background(),
+		arcade.TxRecord{TxID: txid, Status: arcade.StatusSeenOnNetwork}))
+}
+
 // TestE2E_WritePath_Broadcast is the M3 payoff: seed → create+sign+process →
 // broadcast, asserting the broadcast hit the real arcade server, the tx is
 // unproven, the input was spent, change was minted, and the balance moved.
@@ -472,22 +483,25 @@ func assertBasketCoins(t *testing.T, ctx context.Context, store utxostore.Store,
 func TestE2E_FanOutFuel_BootstrapsPool(t *testing.T) {
 	ctx := context.Background()
 	tp := defs.UTXOManagement{Strategy: defs.StrategyThroughput, Throughput: defs.DefaultUTXOManagement().Throughput}
-	// Immediate broadcast so each fan-out promotes its minted coins
-	// sending→unproven, making them spendable by the next stage.
+	// A tx's minted coins become spendable on SEEN (not on the 202), so each
+	// fan-out stage must be SEEN before the next stage can fund from it — the
+	// monitor drives this via SSE in production; here seeTx stands in.
 	s := newE2EStack(t, storage.WithUTXOManagement(tp), storage.WithImmediateBroadcast())
 	s.seedMinedPayment(e2eSeedSatoshis, e2eBlockHeight)
 	userID := int64(*s.authID(ctx).UserID)
 
 	// Stage 1 — chunk fan-out: fund from the default deposit, mint into reserve.
 	const chunkCount, chunkDenom = 2, 20000
-	_, err := s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: chunkCount, Satoshis: chunkDenom, Basket: "reserve"}, e2eOriginator)
+	chunk, err := s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: chunkCount, Satoshis: chunkDenom, Basket: "reserve"}, e2eOriginator)
 	require.NoError(t, err, "chunk fan-out must fund from the default basket and mint reserve coins")
+	s.seeTx(chunk.Txid.String()) // reserve coins become claimable
 	assertBasketCoins(t, ctx, s.utxo, userID, "reserve", chunkCount, chunkDenom)
 
 	// Stage 2 — leaf fan-out: fund from the reserve, mint into the fuel pool.
 	const leafCount, leafDenom = 5, 1000
-	_, err = s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: leafCount, Satoshis: leafDenom, Basket: "fuel"}, e2eOriginator)
+	leaf, err := s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: leafCount, Satoshis: leafDenom, Basket: "fuel"}, e2eOriginator)
 	require.NoError(t, err, "leaf fan-out must fund from the reserve basket and mint pool coins")
+	s.seeTx(leaf.Txid.String()) // pool coins become claimable
 	assertBasketCoins(t, ctx, s.utxo, userID, "fuel", leafCount, leafDenom)
 
 	// The pool coins are selectable by exact denomination — the ClaimExact fast

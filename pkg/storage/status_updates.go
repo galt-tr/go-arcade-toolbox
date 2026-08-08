@@ -324,7 +324,12 @@ func (p *Provider) changeOutpointsByTxID(ctx context.Context, txid string) ([]ut
 	}
 	ops := make([]utxostore.Outpoint, 0, len(rows))
 	for i := range rows {
-		if rows[i].Basket == nil || *rows[i].Basket != p.changeBasketName() {
+		// Every self-owned (change-purpose) output regardless of basket — the
+		// default change basket AND the throughput pool/reserve baskets. Since
+		// promotion to claimable now happens ONLY here (on SEEN) and no longer on
+		// the 202, a default-only filter would strand fuel/pool coins at
+		// TierSending forever. Matches [Provider.changeOutpoints].
+		if rows[i].Basket == nil {
 			continue
 		}
 		ops = append(ops, utxostore.Outpoint{TxID: *hash, Vout: rows[i].Vout})
@@ -738,10 +743,12 @@ func (p *Provider) changeOutpointsByTxIDs(ctx context.Context, txids []string) (
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	changeName := p.changeBasketName()
 	ops := make([]utxostore.Outpoint, 0, len(rows))
 	for i := range rows {
-		if rows[i].Basket == nil || *rows[i].Basket != changeName || rows[i].TxID == nil {
+		// All change baskets, not just the default (see changeOutpointsByTxID):
+		// SEEN is now the only promotion point, so pool/reserve fuel coins must
+		// be promoted here too or they stay stranded at TierSending.
+		if rows[i].Basket == nil || rows[i].TxID == nil {
 			continue
 		}
 		hash, err := chainhash.NewHashFromHex(*rows[i].TxID)
