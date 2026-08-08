@@ -52,6 +52,18 @@ func (m *mockStorage) ApplyStatusUpdate(_ context.Context, rec arcade.TxRecord) 
 	return nil
 }
 
+// ApplyStatusBatch records every record in arrival order (the SSE apply pool now
+// drives this instead of ApplyStatusUpdate).
+func (m *mockStorage) ApplyStatusBatch(_ context.Context, recs []arcade.TxRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.applyErr != nil {
+		return m.applyErr
+	}
+	m.applied = append(m.applied, recs...)
+	return nil
+}
+
 func (m *mockStorage) appliedTxIDs() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

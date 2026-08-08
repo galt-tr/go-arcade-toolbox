@@ -308,6 +308,66 @@ func (r TransactionsRepo) ClearInputBEEFByTxID(ctx context.Context, txid string)
 	return nil
 }
 
+// BulkUpdateStatusByTxIDs transitions every transaction row whose txid is in
+// txids to status. When expectedCurrent is non-empty it is a compare-and-set
+// precondition (status IN expectedCurrent) exactly like
+// [TransactionsRepo.UpdateStatusByTxID] — but as ONE set-based UPDATE with no
+// ErrStatusUpdateSkipped bookkeeping: rows that fail the precondition are simply
+// not updated, which is how the async batch applier tolerates the skip.
+func (r TransactionsRepo) BulkUpdateStatusByTxIDs(ctx context.Context, txids []string, status wdk.TxStatus, expectedCurrent ...wdk.TxStatus) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	args := []any{string(status), r.s.encTime(r.s.now())}
+	ph := make([]string, 0, len(txids))
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return err
+		}
+		ph = append(ph, "?")
+		args = append(args, raw)
+	}
+	conds := []string{"txid IN (" + joinComma(ph) + ")"}
+	if len(expectedCurrent) > 0 {
+		conds = append(conds, "status IN ("+inPlaceholders(len(expectedCurrent))+")")
+		for _, st := range expectedCurrent {
+			args = append(args, string(st))
+		}
+	}
+	q := r.s.rebind("UPDATE transactions SET status = ?, updated_at = ? WHERE " + joinAnd(conds))
+	if _, err := r.s.execer(ctx).ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("metastore: bulk update transaction status: %w", err)
+	}
+	return nil
+}
+
+// BulkClearInputBEEFByTxIDs drops the stored input BEEF for every transaction
+// row whose txid is in txids (the `input_beef IS NOT NULL` guard makes it a
+// cheap no-op for rows already cleared). It is the set-based form of
+// [TransactionsRepo.ClearInputBEEFByTxID] used by the mined batch writer.
+func (r TransactionsRepo) BulkClearInputBEEFByTxIDs(ctx context.Context, txids []string) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	args := []any{r.s.encTime(r.s.now())}
+	ph := make([]string, 0, len(txids))
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return err
+		}
+		ph = append(ph, "?")
+		args = append(args, raw)
+	}
+	q := r.s.rebind("UPDATE transactions SET input_beef = NULL, updated_at = ? WHERE txid IN (" +
+		joinComma(ph) + ") AND input_beef IS NOT NULL")
+	if _, err := r.s.execer(ctx).ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("metastore: bulk clear input beef: %w", err)
+	}
+	return nil
+}
+
 func (r TransactionsRepo) applyStatusUpdate(ctx context.Context, q string, args []any, guarded bool) error {
 	res, err := r.s.execer(ctx).ExecContext(ctx, q, args...)
 	if err != nil {

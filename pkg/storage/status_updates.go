@@ -352,6 +352,416 @@ func (p *Provider) resolveBlockHash(ctx context.Context, blockHashHex string, he
 	return nil
 }
 
+// minedVerifyConcurrency bounds the parallel header-verification of a batch's
+// MINED proofs (pure reads against the header source, no writes) before the
+// single batched write transaction.
+const minedVerifyConcurrency = 8
+
+// ApplyStatusBatch applies a whole SSE apply-batch of arcade status records to
+// the wallet state with BATCHED database writes. It is the high-throughput entry
+// point the monitor's SSE apply pool calls; the poll fallbacks
+// (SynchronizeTransactionStatuses / CheckProofs) still call the per-tx
+// ApplyStatusUpdate.
+//
+// It is EXACTLY EQUIVALENT to calling ApplyStatusUpdate on each rec in arrival
+// order — same terminal + arcade-lattice guards, same per-txid outcome, same
+// idempotency — but collapses the per-event (FindByTxID + a small write
+// transaction) into: one bulk known_tx load, per-tx MINED verification (header
+// reads, done in parallel outside any transaction, never storing an unverified
+// proof), then a SINGLE Mode-A transaction that applies each status class in
+// set-based form.
+//
+// Collapse rule (step 1): within one batch a txid almost always appears once —
+// its SEEN and its MINED are minutes apart and so land in different batches.
+// When a txid DOES repeat within a batch, if every record carries the SAME
+// status they are idempotent duplicates and collapse to a single apply; if they
+// carry DIFFERENT statuses (reachable on cursor-resume-after-outage replay,
+// where a txid's SEEN and MINED co-batch) that txid FALLS BACK to a per-event
+// ApplyStatusUpdate loop in arrival order. That preserves exact semantics for
+// the rare intricate case (a SEEN's advancement that a subsequently-unverifiable
+// MINED would otherwise mask) while still batching every single-status txid —
+// i.e. the entire steady-state load.
+func (p *Provider) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+
+	// 1. Group by txid preserving first-seen (arrival) order.
+	perTxid := make(map[string][]arcade.TxRecord, len(recs))
+	order := make([]string, 0, len(recs))
+	for _, rec := range recs {
+		if rec.TxID == "" {
+			continue // empty txid: a no-op, exactly like ApplyStatusUpdate
+		}
+		if _, seen := perTxid[rec.TxID]; !seen {
+			order = append(order, rec.TxID)
+		}
+		perTxid[rec.TxID] = append(perTxid[rec.TxID], rec)
+	}
+	if len(order) == 0 {
+		return nil
+	}
+
+	// 2. Bulk-load all known txs in ONE query. A txid absent from the map is not
+	//    ours — skip it, exactly like ApplyStatusUpdate's !found return.
+	loaded, err := p.meta.KnownTx().FindByTxIDs(ctx, order)
+	if err != nil {
+		return fmt.Errorf("storage: batch load known txs: %w", err)
+	}
+	known := make(map[string]metastore.KnownTx, len(loaded))
+	for i := range loaded {
+		known[loaded[i].TxID] = loaded[i]
+	}
+
+	// 3 + 4. Guards (evaluated in memory per rec against the loaded row, identical
+	//        to ApplyStatusUpdate) and classification of the single surviving
+	//        record per txid. Multi-distinct-status txids defer to the fallback.
+	var (
+		seenRecs     []arcade.TxRecord
+		minedRecs    []arcade.TxRecord
+		rejectedRecs []arcade.TxRecord
+		arcadeOnly   []arcade.TxRecord // PENDING_RETRY + default: record arcade status only
+		fallback     []string
+	)
+	for _, txid := range order {
+		kt, ok := known[txid]
+		if !ok {
+			continue // not ours
+		}
+		// Terminal wallet-state guard: a proven or terminally-failed tx is never
+		// downgraded by a later event (identical to ApplyStatusUpdate).
+		if kt.Status == wdk.ProvenTxStatusCompleted || kt.Status.IsTerminalFailure() {
+			continue
+		}
+		evs := perTxid[txid]
+		if multipleDistinctStatuses(evs) {
+			fallback = append(fallback, txid)
+			continue
+		}
+		rec := evs[len(evs)-1] // collapse duplicates: all share one status
+		// Arcade lattice guard: a frame may only advance the status, never regress
+		// it (identical to ApplyStatusUpdate).
+		var prev arcade.Status
+		if kt.ArcadeStatus != nil {
+			prev = arcade.Status(*kt.ArcadeStatus)
+		}
+		if !rec.Status.CanSupersede(prev) {
+			continue
+		}
+		switch rec.Status {
+		case arcade.StatusSeenOnNetwork, arcade.StatusSeenMultipleNodes, arcade.StatusAcceptedByNetwork:
+			seenRecs = append(seenRecs, rec)
+		case arcade.StatusMined, arcade.StatusImmutable:
+			minedRecs = append(minedRecs, rec)
+		case arcade.StatusRejected, arcade.StatusDoubleSpendAttempted:
+			rejectedRecs = append(rejectedRecs, rec)
+		case arcade.StatusPendingRetry:
+			arcadeOnly = append(arcadeOnly, rec)
+		default:
+			arcadeOnly = append(arcadeOnly, rec)
+		}
+	}
+
+	// 5a. MINED verification is per-tx and lives OUTSIDE the write transaction
+	//     (header I/O), exactly like applyMined; only verified proofs are written.
+	verified := p.verifyMinedBatch(ctx, minedRecs)
+
+	// 5b. One Mode-A transaction for every batched write.
+	if len(seenRecs) > 0 || len(verified) > 0 || len(rejectedRecs) > 0 || len(arcadeOnly) > 0 {
+		if err := p.meta.Do(ctx, func(ctx context.Context) error {
+			if err := p.applySeenBatch(ctx, seenRecs); err != nil {
+				return err
+			}
+			if err := p.applyMinedBatch(ctx, verified); err != nil {
+				return err
+			}
+			if err := p.applyRejectedBatch(ctx, rejectedRecs); err != nil {
+				return err
+			}
+			return p.setArcadeStatusBatch(ctx, arcadeOnly)
+		}); err != nil {
+			return err
+		}
+	}
+
+	// 6. Per-event fallback for the rare multi-distinct-status txids: exact
+	//    ApplyStatusUpdate semantics, arrival order preserved. Distinct txids are
+	//    independent, so ordering relative to the batched writes is irrelevant.
+	for _, txid := range fallback {
+		for _, rec := range perTxid[txid] {
+			if err := p.ApplyStatusUpdate(ctx, rec); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// multipleDistinctStatuses reports whether a txid's batch records carry more
+// than one distinct arcade status (the trigger for the per-event fallback).
+func multipleDistinctStatuses(evs []arcade.TxRecord) bool {
+	if len(evs) <= 1 {
+		return false
+	}
+	first := evs[0].Status
+	for i := 1; i < len(evs); i++ {
+		if evs[i].Status != first {
+			return true
+		}
+	}
+	return false
+}
+
+// minedProof is a MINED record whose merkle root has been header-verified,
+// carrying the proof material to store.
+type minedProof struct {
+	rec       arcade.TxRecord
+	txidHash  chainhash.Hash
+	height    uint32
+	blockHash []byte
+	mpBytes   []byte
+	root      []byte
+}
+
+// verifyMinedBatch header-verifies each MINED record's merkle root (in parallel,
+// bounded) and returns only the verified ones with their proof material. It
+// replicates applyMined's pre-write verification EXACTLY; a proof that fails,
+// cannot yet be verified, or is malformed is dropped (left unproven for the
+// proof poll), never stored.
+func (p *Provider) verifyMinedBatch(ctx context.Context, recs []arcade.TxRecord) []minedProof {
+	if len(recs) == 0 {
+		return nil
+	}
+	results := make([]*minedProof, len(recs))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(minedVerifyConcurrency)
+	for i := range recs {
+		g.Go(func() error {
+			results[i] = p.verifyMinedOne(gctx, recs[i])
+			return nil
+		})
+	}
+	_ = g.Wait()
+	out := make([]minedProof, 0, len(recs))
+	for _, r := range results {
+		if r != nil {
+			out = append(out, *r)
+		}
+	}
+	return out
+}
+
+// verifyMinedOne is the read-only pre-write half of applyMined for one record:
+// it returns the proof material when the BUMP's root verifies against the header
+// source, or nil (with the same warn/debug logging as applyMined) for every
+// defer/skip/bad case. Unlike applyMined it never returns a hard error — a
+// missing headers source is logged and deferred so a global misconfig cannot
+// fail sibling txids' writes; hdrs is required in practice.
+func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord) *minedProof {
+	txid := rec.TxID
+	if len(rec.MerklePath) == 0 {
+		p.logger.DebugContext(ctx, "mined event without merkle path; deferring to proof poll", slog.String("txid", txid))
+		return nil
+	}
+	if p.hdrs == nil {
+		p.logger.WarnContext(ctx, "cannot verify merkle proof: no headers source; deferring", slog.String("txid", txid))
+		return nil
+	}
+	txidHash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		p.logger.WarnContext(ctx, "cannot parse mined txid; deferring", slog.String("txid", txid), slog.String("error", err.Error()))
+		return nil
+	}
+	mp, err := transaction.NewMerklePathFromBinary(rec.MerklePath)
+	if err != nil {
+		p.logger.WarnContext(ctx, "mined event carries an unparseable merkle path; not storing",
+			slog.String("txid", txid), slog.String("error", err.Error()))
+		return nil
+	}
+	if rec.BlockHeight != 0 && uint64(mp.BlockHeight) != rec.BlockHeight {
+		p.logger.WarnContext(ctx, "mined event block height disagrees with merkle path; not storing",
+			slog.String("txid", txid),
+			slog.Uint64("eventHeight", rec.BlockHeight),
+			slog.Uint64("pathHeight", uint64(mp.BlockHeight)))
+		return nil
+	}
+	root, err := mp.ComputeRoot(txidHash)
+	if err != nil {
+		p.logger.WarnContext(ctx, "cannot compute merkle root from event path; not storing",
+			slog.String("txid", txid), slog.String("error", err.Error()))
+		return nil
+	}
+	ok, verr := p.hdrs.VerifyMerkleRoot(ctx, root, mp.BlockHeight)
+	if verr != nil {
+		p.logger.DebugContext(ctx, "merkle root not yet verifiable; deferring to proof poll",
+			slog.String("txid", txid), slog.String("error", verr.Error()))
+		return nil
+	}
+	if !ok {
+		p.logger.WarnContext(ctx, "merkle root failed header verification; rejecting proof",
+			slog.String("txid", txid), slog.Uint64("height", uint64(mp.BlockHeight)))
+		return nil
+	}
+	return &minedProof{
+		rec:       rec,
+		txidHash:  *txidHash,
+		height:    mp.BlockHeight,
+		blockHash: p.resolveBlockHash(ctx, rec.BlockHash, mp.BlockHeight),
+		mpBytes:   mp.Bytes(),
+		root:      root[:],
+	}
+}
+
+// applySeenBatch advances every SEEN-class tx to unproven and promotes all their
+// change to TierUnproven — the batched form of applySeen. Must run inside
+// p.meta.Do.
+func (p *Provider) applySeenBatch(ctx context.Context, recs []arcade.TxRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	txids := recordTxIDs(recs)
+	if err := p.meta.Transactions().BulkUpdateStatusByTxIDs(ctx, txids, wdk.TxStatusUnproven,
+		wdk.TxStatusSending, wdk.TxStatusNoSend, wdk.TxStatusUnproven, wdk.TxStatusUnprocessed); err != nil {
+		return fmt.Errorf("storage: batch seen: mark unproven: %w", err)
+	}
+	if err := p.meta.KnownTx().BulkUpdateStatus(ctx, txids, wdk.ProvenTxStatusUnconfirmed,
+		wdk.ProvenTxReqBeyondBroadcastStageStatuses...); err != nil {
+		return fmt.Errorf("storage: batch seen: mark unconfirmed: %w", err)
+	}
+	ops, err := p.changeOutpointsByTxIDs(ctx, txids)
+	if err != nil {
+		return err
+	}
+	if len(ops) > 0 {
+		if _, err := p.utxo.Promote(ctx, ops, utxostore.TierUnproven); err != nil {
+			return fmt.Errorf("storage: batch seen: promote change: %w", err)
+		}
+	}
+	return p.setArcadeStatusBatch(ctx, recs)
+}
+
+// applyMinedBatch stores each verified proof (per-tx, as the proof data differs)
+// then batches the status/beef/change/spent writes — the batched form of
+// applyMined. Must run inside p.meta.Do.
+func (p *Provider) applyMinedBatch(ctx context.Context, proofs []minedProof) error {
+	if len(proofs) == 0 {
+		return nil
+	}
+	txids := make([]string, len(proofs))
+	recs := make([]arcade.TxRecord, len(proofs))
+	for i := range proofs {
+		txids[i] = proofs[i].rec.TxID
+		recs[i] = proofs[i].rec
+	}
+	// Per-tx proof write (each proof's data differs — acceptable per the batch
+	// design). SetProof also flips known_txs → completed and drops its input_beef.
+	for i := range proofs {
+		pr := &proofs[i]
+		if err := p.meta.KnownTx().SetProof(ctx, pr.rec.TxID, pr.height, pr.blockHash, pr.mpBytes, pr.root); err != nil &&
+			!errors.Is(err, metastore.ErrNotFound) {
+			return fmt.Errorf("storage: batch mined: set proof: %w", err)
+		}
+	}
+	if err := p.setArcadeStatusBatch(ctx, recs); err != nil {
+		return err
+	}
+	if err := p.meta.Transactions().BulkUpdateStatusByTxIDs(ctx, txids, wdk.TxStatusCompleted,
+		wdk.TxStatusSending, wdk.TxStatusNoSend, wdk.TxStatusUnproven, wdk.TxStatusUnprocessed, wdk.TxStatusCompleted); err != nil {
+		return fmt.Errorf("storage: batch mined: mark completed: %w", err)
+	}
+	if err := p.meta.Transactions().BulkClearInputBEEFByTxIDs(ctx, txids); err != nil {
+		return fmt.Errorf("storage: batch mined: clear input beef: %w", err)
+	}
+	ops, err := p.changeOutpointsByTxIDs(ctx, txids)
+	if err != nil {
+		return err
+	}
+	if len(ops) > 0 {
+		if _, err := p.utxo.Promote(ctx, ops, utxostore.TierMined); err != nil {
+			return fmt.Errorf("storage: batch mined: promote change: %w", err)
+		}
+	}
+	// Remove the spent inputs of each mined (terminal) tx. Looping the existing
+	// per-tx RemoveSpentBy is acceptable (low relative frequency, and avoids
+	// widening the utxostore.Store interface across its three backends);
+	// idempotent on a re-apply.
+	for i := range proofs {
+		if _, err := p.utxo.RemoveSpentBy(ctx, proofs[i].txidHash); err != nil {
+			return fmt.Errorf("storage: batch mined: remove spent inputs %s: %w", proofs[i].rec.TxID, err)
+		}
+	}
+	return nil
+}
+
+// applyRejectedBatch marks each REJECTED-class tx suspect — the batched form of
+// applyRejected. Looping the existing per-tx MarkSuspect is acceptable (low
+// frequency). Must run inside p.meta.Do.
+func (p *Provider) applyRejectedBatch(ctx context.Context, recs []arcade.TxRecord) error {
+	for _, rec := range recs {
+		if err := p.meta.KnownTx().MarkSuspect(ctx, rec.TxID, p.now(), rec.CompetingTxs, string(rec.Status)); err != nil &&
+			!errors.Is(err, metastore.ErrNotFound) {
+			return fmt.Errorf("storage: batch mark suspect %s: %w", rec.TxID, err)
+		}
+	}
+	return nil
+}
+
+// setArcadeStatusBatch records the arcade wire status for a set of records,
+// grouping by status value so each distinct value is a single UPDATE. Must run
+// inside p.meta.Do.
+func (p *Provider) setArcadeStatusBatch(ctx context.Context, recs []arcade.TxRecord) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	byStatus := make(map[arcade.Status][]string)
+	for _, rec := range recs {
+		byStatus[rec.Status] = append(byStatus[rec.Status], rec.TxID)
+	}
+	for status, txids := range byStatus {
+		if err := p.meta.KnownTx().BulkSetArcadeStatus(ctx, txids, string(status)); err != nil {
+			return fmt.Errorf("storage: batch set arcade status: %w", err)
+		}
+	}
+	return nil
+}
+
+// changeOutpointsByTxIDs returns the change outpoints for all of txids in one
+// bulk query — the batched analog of changeOutpointsByTxID.
+func (p *Provider) changeOutpointsByTxIDs(ctx context.Context, txids []string) ([]utxostore.Outpoint, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	rows, err := p.meta.Outputs().FindChangeOutputsByTxIDs(ctx, txids)
+	if err != nil {
+		return nil, fmt.Errorf("storage: find change outputs (bulk): %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	changeName := p.changeBasketName()
+	ops := make([]utxostore.Outpoint, 0, len(rows))
+	for i := range rows {
+		if rows[i].Basket == nil || *rows[i].Basket != changeName || rows[i].TxID == nil {
+			continue
+		}
+		hash, err := chainhash.NewHashFromHex(*rows[i].TxID)
+		if err != nil {
+			return nil, fmt.Errorf("storage: parse change txid %s: %w", *rows[i].TxID, err)
+		}
+		ops = append(ops, utxostore.Outpoint{TxID: *hash, Vout: rows[i].Vout})
+	}
+	return ops, nil
+}
+
+// recordTxIDs extracts the txids of a record slice, preserving order.
+func recordTxIDs(recs []arcade.TxRecord) []string {
+	out := make([]string, len(recs))
+	for i := range recs {
+		out[i] = recs[i].TxID
+	}
+	return out
+}
+
 // resendGrace is how long a never-broadcast tx must sit before the SendWaiting
 // sweep re-drives it. It protects a freshly-created 'unprocessed' tx (whose own
 // ProcessAction is about to broadcast it) from being double-sent by the sweep;

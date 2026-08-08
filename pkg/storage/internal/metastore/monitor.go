@@ -100,6 +100,32 @@ func (r KnownTxRepo) SetArcadeStatus(ctx context.Context, txid, arcadeStatus str
 	return nil
 }
 
+// BulkSetArcadeStatus records arcadeStatus on every known tx whose txid is in
+// txids in ONE UPDATE. The async batch applier groups txids by their (identical)
+// arcade status value and calls this once per distinct value, mirroring the
+// single-row [KnownTxRepo.SetArcadeStatus] — a missing txid is simply not
+// updated (the benign ErrNotFound the per-row writer tolerates).
+func (r KnownTxRepo) BulkSetArcadeStatus(ctx context.Context, txids []string, arcadeStatus string) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	args := []any{arcadeStatus, r.s.encTime(r.s.now())}
+	ph := make([]string, 0, len(txids))
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return err
+		}
+		ph = append(ph, "?")
+		args = append(args, raw)
+	}
+	q := r.s.rebind("UPDATE known_txs SET arcade_status = ?, updated_at = ? WHERE txid IN (" + joinComma(ph) + ")")
+	if _, err := r.s.execer(ctx).ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("metastore: bulk set arcade status: %w", err)
+	}
+	return nil
+}
+
 // MarkSuspect moves a known tx into the suspect-failed grace window recording
 // everything the reject reconciler will read back via FindSuspectFailed:
 // status = suspectFailed, suspect_since, the competing txids, and the arcade

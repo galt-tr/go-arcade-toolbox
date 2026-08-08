@@ -323,6 +323,46 @@ func (r KnownTxRepo) UpdateStatus(ctx context.Context, txid string, status wdk.P
 	return ErrStatusUpdateSkipped
 }
 
+// BulkUpdateStatus transitions every known tx whose txid is in txids to status,
+// guarded by skipForStatuses (rows whose current status is in that set are left
+// untouched) exactly like the single-row [KnownTxRepo.UpdateStatus] — but as ONE
+// set-based UPDATE with no per-row skip/not-found bookkeeping: a row the guard
+// blocks, or a txid that does not exist, is simply not updated, which is
+// precisely how the async batch applier tolerates ErrStatusUpdateSkipped /
+// ErrNotFound from the per-row writer. was_broadcast is set sticky when the new
+// status is broadcast evidence, matching UpdateStatus.
+func (r KnownTxRepo) BulkUpdateStatus(ctx context.Context, txids []string, status wdk.ProvenTxReqStatus, skipForStatuses ...wdk.ProvenTxReqStatus) error {
+	if len(txids) == 0 {
+		return nil
+	}
+	setWasBroadcast := ""
+	if status.WasBroadcastStatus() {
+		setWasBroadcast = ", was_broadcast = " + r.s.boolTrueLiteral()
+	}
+	args := []any{string(status), r.s.encTime(r.s.now())}
+	ph := make([]string, 0, len(txids))
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return err
+		}
+		ph = append(ph, "?")
+		args = append(args, raw)
+	}
+	conds := []string{"txid IN (" + joinComma(ph) + ")"}
+	if len(skipForStatuses) > 0 {
+		conds = append(conds, "status NOT IN ("+inPlaceholders(len(skipForStatuses))+")")
+		for _, st := range skipForStatuses {
+			args = append(args, string(st))
+		}
+	}
+	q := r.s.rebind("UPDATE known_txs SET status = ?" + setWasBroadcast + ", updated_at = ? WHERE " + joinAnd(conds))
+	if _, err := r.s.execer(ctx).ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("metastore: bulk update known tx status: %w", err)
+	}
+	return nil
+}
+
 // existsByTxID reports whether a known-tx row with the given raw txid exists.
 func (r KnownTxRepo) existsByTxID(ctx context.Context, raw []byte) (bool, error) {
 	q := r.s.rebind("SELECT 1 FROM known_txs WHERE txid = ?")
@@ -477,6 +517,29 @@ func (r KnownTxRepo) FindByTxID(ctx context.Context, txid string) (*KnownTx, boo
 		return nil, false, fmt.Errorf("metastore: find known tx: %w", err)
 	}
 	return kt, true, nil
+}
+
+// FindByTxIDs bulk-loads the known txs for the given display-hex txids in ONE
+// query, returning only the rows that exist (a missing txid is simply absent
+// from the result — the async batch applier treats that as "not ours", the same
+// as FindByTxID's found=false). It mirrors FindByTxID's scan; result order is
+// unspecified, so the caller maps by txid.
+func (r KnownTxRepo) FindByTxIDs(ctx context.Context, txids []string) ([]KnownTx, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	ph := make([]string, 0, len(txids))
+	args := make([]any, 0, len(txids))
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return nil, err
+		}
+		ph = append(ph, "?")
+		args = append(args, raw)
+	}
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs WHERE txid IN (" + joinComma(ph) + ")")
+	return r.queryList(ctx, q, args)
 }
 
 // FindSuspectFailed returns known txs that have sat in the suspect-failed grace

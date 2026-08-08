@@ -420,6 +420,114 @@ func TestApplyStatusUpdate_UnknownTxid_Noop(t *testing.T) {
 	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{TxID: newTxID(0x77), Status: arcade.StatusMined}))
 }
 
+// --- ApplyStatusBatch tests ------------------------------------------------
+
+// TestApplyStatusBatch_StaleSeenOnCompletedIsNoop applies, in ONE batch, a fresh
+// SEEN for one txid and a stale SEEN for a DIFFERENT txid whose row is already
+// completed. The batched terminal guard must make the stale one a no-op (no tier
+// downgrade, no status regression) while the fresh one advances normally — the
+// batch equivalent of the per-event terminal guard.
+func TestApplyStatusBatch_StaleSeenOnCompletedIsNoop(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	fresh := newTxID(0xA1)
+	freshOp := h.seedChangeTx(fresh, wdk.TxStatusSending, wdk.ProvenTxStatusUnprocessed, 5000, utxostore.TierSending)
+
+	stale := newTxID(0xA2)
+	staleOp := h.seedChangeTx(stale, wdk.TxStatusCompleted, wdk.ProvenTxStatusCompleted, 7000, utxostore.TierMined)
+	require.NoError(t, h.meta.KnownTx().SetArcadeStatus(ctx, stale, string(arcade.StatusMined)))
+
+	require.NoError(t, h.p.ApplyStatusBatch(ctx, []arcade.TxRecord{
+		{TxID: fresh, Status: arcade.StatusSeenOnNetwork},
+		{TxID: stale, Status: arcade.StatusSeenOnNetwork},
+	}))
+
+	// The fresh SEEN advanced.
+	require.Equal(t, wdk.TxStatusUnproven, h.txStatus(fresh))
+	freshKt := h.knownTx(fresh)
+	require.Equal(t, wdk.ProvenTxStatusUnconfirmed, freshKt.Status)
+	require.NotNil(t, freshKt.ArcadeStatus)
+	require.Equal(t, string(arcade.StatusSeenOnNetwork), *freshKt.ArcadeStatus)
+	require.Equal(t, utxostore.TierUnproven, h.tier(freshOp))
+
+	// The stale SEEN on a completed tx is fully a no-op: no regression anywhere.
+	require.Equal(t, wdk.TxStatusCompleted, h.txStatus(stale), "completed tx not regressed")
+	staleKt := h.knownTx(stale)
+	require.Equal(t, wdk.ProvenTxStatusCompleted, staleKt.Status)
+	require.NotNil(t, staleKt.ArcadeStatus)
+	require.Equal(t, string(arcade.StatusMined), *staleKt.ArcadeStatus, "arcade_status not regressed")
+	require.Equal(t, utxostore.TierMined, h.tier(staleOp), "mined tier not downgraded")
+}
+
+// TestApplyStatusBatch_SeenAndMinedTogether applies a SEEN (one txid) and a
+// MINED (another txid) in the SAME batch and asserts both land: the SEEN tx to
+// unproven/TierUnproven, the MINED tx to completed/TierMined with a stored,
+// header-verified proof.
+func TestApplyStatusBatch_SeenAndMinedTogether(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	seenTx := newTxID(0xB1)
+	seenOp := h.seedChangeTx(seenTx, wdk.TxStatusSending, wdk.ProvenTxStatusUnprocessed, 5000, utxostore.TierSending)
+
+	minedTx := newTxID(0xB2)
+	minedOp := h.seedChangeTx(minedTx, wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 7000, utxostore.TierUnproven)
+	const height = uint32(900001)
+	minedRec, root := minedRecord(t, minedTx, height)
+	h.hdrs.register(height, root)
+
+	require.NoError(t, h.p.ApplyStatusBatch(ctx, []arcade.TxRecord{
+		{TxID: seenTx, Status: arcade.StatusSeenOnNetwork},
+		minedRec,
+	}))
+
+	require.Equal(t, wdk.TxStatusUnproven, h.txStatus(seenTx))
+	require.Equal(t, wdk.ProvenTxStatusUnconfirmed, h.knownTx(seenTx).Status)
+	require.Equal(t, utxostore.TierUnproven, h.tier(seenOp))
+
+	require.Equal(t, wdk.TxStatusCompleted, h.txStatus(minedTx))
+	kt := h.knownTx(minedTx)
+	require.Equal(t, wdk.ProvenTxStatusCompleted, kt.Status)
+	require.NotEmpty(t, kt.MerklePath, "BUMP stored")
+	require.NotEmpty(t, kt.MerkleRoot, "verified root stored")
+	require.NotNil(t, kt.BlockHeight)
+	require.Equal(t, height, *kt.BlockHeight)
+	require.Equal(t, utxostore.TierMined, h.tier(minedOp))
+}
+
+// TestApplyStatusBatch_IdempotentReapply applies the same SEEN+MINED batch twice
+// and asserts the end state is unchanged and the MINED proof is header-verified
+// exactly once (the re-apply short-circuits at the terminal guard, so
+// verifyMinedBatch never re-runs it).
+func TestApplyStatusBatch_IdempotentReapply(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	seenTx := newTxID(0xC1)
+	seenOp := h.seedChangeTx(seenTx, wdk.TxStatusSending, wdk.ProvenTxStatusUnprocessed, 5000, utxostore.TierSending)
+
+	minedTx := newTxID(0xC2)
+	minedOp := h.seedChangeTx(minedTx, wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 7000, utxostore.TierUnproven)
+	const height = uint32(900002)
+	minedRec, root := minedRecord(t, minedTx, height)
+	h.hdrs.register(height, root)
+
+	batch := []arcade.TxRecord{
+		{TxID: seenTx, Status: arcade.StatusSeenOnNetwork},
+		minedRec,
+	}
+	require.NoError(t, h.p.ApplyStatusBatch(ctx, batch))
+	require.NoError(t, h.p.ApplyStatusBatch(ctx, batch), "second apply is a no-op")
+
+	require.Equal(t, wdk.TxStatusUnproven, h.txStatus(seenTx))
+	require.Equal(t, utxostore.TierUnproven, h.tier(seenOp))
+	require.Equal(t, wdk.TxStatusCompleted, h.txStatus(minedTx))
+	require.Equal(t, utxostore.TierMined, h.tier(minedOp))
+	require.EqualValues(t, 1, h.hdrs.verifyCalls.Load(),
+		"verification runs once; the re-apply short-circuits at the terminal guard")
+}
+
 // --- sweep tests -----------------------------------------------------------
 
 func TestAbortAbandoned(t *testing.T) {

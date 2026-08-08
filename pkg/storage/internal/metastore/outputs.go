@@ -334,6 +334,36 @@ func (r OutputsRepo) FindOutputs(ctx context.Context, args wdk.FindOutputsArgs) 
 	return r.collect(rows)
 }
 
+// FindChangeOutputsByTxIDs returns every CHANGE output whose parent
+// transaction's txid is in txids, in ONE query (each returned row carries its
+// parent txid in TxID). It is the bulk equivalent of the per-txid change lookup
+// FindOutputs performs, letting the async batch applier gather all change
+// outpoints for a whole apply-batch with a single round-trip.
+func (r OutputsRepo) FindChangeOutputsByTxIDs(ctx context.Context, txids []string) ([]OutputRow, error) {
+	if len(txids) == 0 {
+		return nil, nil
+	}
+	ph := make([]string, 0, len(txids))
+	vals := make([]any, 0, len(txids)+1)
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return nil, err
+		}
+		ph = append(ph, "?")
+		vals = append(vals, raw)
+	}
+	vals = append(vals, r.s.boolVal(true))
+	q := r.s.rebind("SELECT " + outputCols +
+		" FROM outputs o JOIN transactions t ON t.transaction_id = o.transaction_id" +
+		" WHERE t.txid IN (" + joinComma(ph) + ") AND o.change = ? ORDER BY o.output_id ASC")
+	rows, err := r.s.execer(ctx).QueryContext(ctx, q, vals...)
+	if err != nil {
+		return nil, fmt.Errorf("metastore: find change outputs by txids: %w", err)
+	}
+	return r.collect(rows)
+}
+
 func (r OutputsRepo) collect(rows *sql.Rows) ([]OutputRow, error) {
 	defer func() { _ = rows.Close() }()
 	var out []OutputRow

@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
 )
 
@@ -43,11 +41,13 @@ const (
 // started as a goroutine (Daemon.Start does, tracked by the wait group) and
 // returns only when ctx is canceled.
 //
-// Architecture (three concurrent actors sharing the cursor under cursorMu):
+// Architecture (two concurrent actors sharing the cursor under cursorMu):
 //   - this goroutine runs the reconnect loop and calls oracle.StreamStatus,
 //     whose onEvent only ENQUEUES into a bounded (1024) channel;
-//   - one applier goroutine drains the channel into batches (≤64);
-//   - a fresh bounded worker pool (8) applies each batch in parallel.
+//   - one applier goroutine drains the channel into batches (≤64) and hands each
+//     batch to storage.ApplyStatusBatch, which collapses the per-event DB round
+//     trips into one bulk load + one batched write transaction (the throughput
+//     win) while preserving per-txid arrival order and every apply guard.
 //
 // The cursor advances only to the newest non-empty event id of a fully-applied
 // batch, never regresses to "", and never advances past what was durably
@@ -125,49 +125,22 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 	d.logger.InfoContext(ctx, "arcade status event handler stopped")
 }
 
-// applyStatusBatch applies a batch with bounded concurrency, then persists the
-// replay cursor once — to the newest event that carries an id — after every
-// event has been attempted. A failed event never fails the batch (replaying it
-// is safe; the polls are the safety net), so the cursor still advances.
+// applyStatusBatch hands the whole batch to storage.ApplyStatusBatch (records in
+// ARRIVAL ORDER), then persists the replay cursor once — to the newest event
+// that carries an id. A failed batch never blocks the cursor (replaying it is
+// safe; the polls are the safety net), so the cursor still advances.
 //
-// Events are SHARDED BY TXID: every event for one txid runs IN ARRIVAL ORDER on
-// a single worker, while distinct txids run in parallel (the throughput win).
-// This is load-bearing, not an optimization. ApplyStatusUpdate's terminal /
-// lattice guards read the row OUTSIDE the write transaction, and three of its
-// writes are unconditional (Promote is not tier-monotonic and will LOWER a tier;
-// SetArcadeStatus and MarkSuspect are WHERE-txid-only). If a stale frame (SEEN /
-// REJECTED) and a MINED for the SAME txid ran on parallel workers and the stale
-// one committed last, it would downgrade the tier, regress arcade_status, or
-// clobber a completed tx to suspectFailed — corruption that does not self-heal
-// (a completed tx is excluded from the polls) and that M4.2's reject reconciler
-// would then act on. This is reachable on cursor-resume-after-outage, where the
-// backlog replay co-batches a txid's SEEN and MINED. Serializing per txid makes
-// the later-arriving frame's writes land last and win, restoring the guard
-// logic's implicit per-txid-serialized-apply assumption. (The queue drains FIFO
-// = SSE ns-id arrival order, so intra-shard order is arrival order.)
+// The per-txid arrival-order serialization that the terminal/lattice guards rely
+// on is now enforced inside ApplyStatusBatch (it collapses a txid's records to
+// its final surviving status, honoring supersession), so this method simply
+// preserves arrival order in the slice it passes down. (The queue drains FIFO =
+// SSE ns-id arrival order.)
 func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEvent, cursorMu *sync.Mutex, lastEventID *string) {
-	shards := make(map[string][]arcade.StatusEvent)
-	order := make([]string, 0, len(batch))
-	for _, ev := range batch {
-		txid := ev.Record.TxID
-		if _, seen := shards[txid]; !seen {
-			order = append(order, txid)
-		}
-		shards[txid] = append(shards[txid], ev)
+	records := make([]arcade.TxRecord, len(batch))
+	for i := range batch {
+		records[i] = batch[i].Record
 	}
-
-	g := new(errgroup.Group)
-	g.SetLimit(d.applyConcurrency)
-	for _, txid := range order {
-		events := shards[txid]
-		g.Go(func() error {
-			for _, ev := range events {
-				d.applyStatusEvent(ctx, ev) // in-order within the txid shard
-			}
-			return nil // a failed event never aborts the batch; the cursor still advances
-		})
-	}
-	_ = g.Wait()
+	d.applyRecords(ctx, records)
 
 	// Persist the cursor to the newest event that actually carries an id: an
 	// empty id must never overwrite a good cursor with "" (a restart would then
@@ -194,21 +167,21 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 	cursorMu.Unlock()
 }
 
-// applyStatusEvent applies one event, retrying transient DB contention
-// (deadlock / lock) that parallel appliers can form. Other failures are logged
-// and swallowed (replay is safe; the polls are the safety net).
-func (d *Daemon) applyStatusEvent(ctx context.Context, ev arcade.StatusEvent) {
+// applyRecords applies one batch's records through storage.ApplyStatusBatch,
+// retrying transient DB contention (deadlock / lock) — the whole batch is safe
+// to retry because ApplyStatusBatch is idempotent. Other failures are logged and
+// swallowed (replay is safe; the polls are the safety net).
+func (d *Daemon) applyRecords(ctx context.Context, records []arcade.TxRecord) {
 	var err error
 	for range applyDeadlockAttempts {
-		err = d.storage.ApplyStatusUpdate(ctx, ev.Record)
+		err = d.storage.ApplyStatusBatch(ctx, records)
 		if err == nil || !isTransientDBError(err) {
 			break
 		}
 	}
 	if err != nil {
-		d.logger.ErrorContext(ctx, "ApplyStatusUpdate failed",
-			slog.String("txID", ev.Record.TxID),
-			slog.String("eventID", ev.ID),
+		d.logger.ErrorContext(ctx, "ApplyStatusBatch failed",
+			slog.Int("batchSize", len(records)),
 			slog.String("error", err.Error()))
 	}
 }

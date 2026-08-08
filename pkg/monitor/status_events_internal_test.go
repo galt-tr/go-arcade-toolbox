@@ -1,17 +1,21 @@
 package monitor
 
-// White-box test for the batch applier's per-txid sharding (the concurrency fix
-// in applyStatusBatch). It co-batches, for the SAME txid, the four dangerous
-// orderings and asserts arrival-order wins with a MINED tx never clobbered by an
-// earlier-arrival stale frame — while distinct txids still run in parallel.
+// White-box test for the batch applier's per-txid serialization (the
+// concurrency fix). applyStatusBatch now hands the whole batch to
+// storage.ApplyStatusBatch, and that contract — records for one txid applied in
+// arrival order and never concurrently, distinct txids in parallel — is modeled
+// by modelStorage.ApplyStatusBatch here. The test co-batches, for the SAME txid,
+// the four dangerous orderings and asserts arrival-order wins with a MINED tx
+// never clobbered by an earlier-arrival stale frame — while distinct txids still
+// run in parallel.
 //
 // modelStorage faithfully reproduces the exact hazard ApplyStatusUpdate has: the
 // terminal/lattice guard is read from a snapshot taken OUTSIDE the write, three
 // of the writes are unconditional (the tier set can LOWER a tier; the
 // arcade-status and suspect writes are txid-only), and a sleep widens the
-// read→write window. Under the OLD unsharded applier these tests fail (parallel
-// same-txid workers race and a stale frame corrupts state); under per-txid
-// sharding they pass deterministically.
+// read→write window. Were same-txid records applied concurrently a stale frame
+// would corrupt state; the per-txid serialization makes these tests pass
+// deterministically.
 
 import (
 	"context"
@@ -126,6 +130,36 @@ func (m *modelStorage) stateOf(txid string) modelState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return *m.states[txid]
+}
+
+// ApplyStatusBatch models the real storage.ApplyStatusBatch contract that the
+// per-txid serialization now lives behind: records for one txid are applied IN
+// ARRIVAL ORDER on a single goroutine (never concurrently), while distinct txids
+// run in parallel. That keeps this white-box test's invariants — a MINED tx is
+// never clobbered by an earlier-arrival stale frame for the same txid, and the
+// cross-txid throughput parallelism is preserved.
+func (m *modelStorage) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord) error {
+	shards := map[string][]arcade.TxRecord{}
+	var order []string
+	for _, r := range recs {
+		if _, ok := shards[r.TxID]; !ok {
+			order = append(order, r.TxID)
+		}
+		shards[r.TxID] = append(shards[r.TxID], r)
+	}
+	var wg sync.WaitGroup
+	for _, txid := range order {
+		rs := shards[txid]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, r := range rs {
+				_ = m.ApplyStatusUpdate(ctx, r) // in-order within the txid shard
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
 }
 
 // unused-but-required MonitoredStorage surface.

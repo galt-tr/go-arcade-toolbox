@@ -37,6 +37,14 @@ type MonitoredStorage interface {
 	// with terminal/lattice guards.
 	ApplyStatusUpdate(ctx context.Context, rec arcade.TxRecord) error
 
+	// ApplyStatusBatch applies a whole SSE apply-batch of status records in one
+	// call with batched DB writes. It is EXACTLY EQUIVALENT to calling
+	// ApplyStatusUpdate on each rec in arrival order (same terminal/lattice
+	// guards, same per-txid outcome, idempotent) and is the high-throughput entry
+	// point the SSE apply pool uses; the poll fallbacks still call
+	// ApplyStatusUpdate per tx.
+	ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord) error
+
 	// SendWaitingTransactions broadcasts delayed (unsent) transactions and
 	// advances their state on acceptance.
 	SendWaitingTransactions(ctx context.Context, limit int) error
