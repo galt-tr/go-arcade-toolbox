@@ -60,18 +60,48 @@ The claim path is off the critical path: the hybrid now sustains **~1,450 TPS
 with zero backpressure**, bound by transaction signing (`ec.fieldVal.Square/Mul`,
 `ScalarBaseMult`) and HTTP broadcast — real work, not lock contention.
 
-## Remaining constraint (not the claim path, not PostgreSQL)
+## Fix B: self-replenishing change — bounds the ledger, halves the load
 
-At ~1,450 TPS the **local ledger grows unbounded** (`buyer_utxos` and the fuel
-pool grew ~1,450/s; the pool ballooned from its 60k target toward 780k). Each
-payment consumes one fuel coin and the keeper mints a replacement, so the system
-does ~2× create+broadcast per payment, and freshly-minted fuel sits at
-`TierSending` (unclaimable) during the SEEN lag, so the keeper over-mints. Next
-lever ("Fix B"): route each payment's change directly into the fuel pool so it
-self-replenishes 1:1 (the keeper then only tops up the value bled to fees),
-bounding the ledger and roughly halving the create+broadcast load. Arcade
-tstn-dev also 503-backpressures the combined broadcast rate at the very top end;
-a scaling-env arcade would lift that.
+The ~1,450 TPS plateau above still grew the local ledger unbounded: each payment
+consumed one fuel coin but its change landed in the `default` basket, so the
+keeper recycled `default→fuel` with a separate createAction+broadcast per payment
+(~2× create+broadcast load) and over-minted the pool (60k target → ~780k),
+because its claimable-inventory stop test excludes the large in-flight *reserved*
+population.
+
+Fix (`storage: self-replenish the fuel pool from payment change`): a throughput
+payment's change is routed straight back into the fuel `PoolBasket`, so the pool
+refills 1:1 (one coin spent, one minted back). The keeper drops to value top-up
+only. Re-measured on the same hybrid + real arcade, `tps=1500 workers=256`:
+
+| metric | before Fix B | after Fix B |
+|---|---|---|
+| Sustained create (clean 60 s window) | ~1,450 (then ledger-driven decline) | **1,501 TPS** |
+| Backpressure | 0 | 0 |
+| p95 | ~180 ms | ~174 ms |
+| Fuel-pool claimable | grew 60k → 780k | **pinned ~43.5k** (self-replenishing) |
+| `default` basket | accumulating | **flat (308)** |
+| Unspent working set (`buyer_utxos`) | grew ~1,450/s | **flat** |
+| Keeper mint events during blast | continuous (frantic) | **0** (pool never dropped below low-water) |
+
+So the fuel keeper is idle under steady state — the per-payment recycle
+create+broadcast is gone (~half the system load), and the unspent working set is
+bounded. The remaining spent-row accumulation in the UTXO store is
+mining-paced pruning (`RemoveSpentBy` on MINED); on tstn mining lags the blast
+window so spent rows linger, but on a chain that mines at pace they prune.
+
+## Combined result
+
+Fix A (unified claim cache + empty-bucket suppression) + Fix B (self-replenishing
+change) take the hybrid from a **~600 TPS hard ceiling** to **~1,500 TPS
+sustained with zero backpressure, an idle fuel keeper, and a bounded unspent
+working set** — bound by secp256k1 signing + HTTP broadcast, not lock contention
+or fuel starvation.
+
+Remaining headroom levers (not pursued here): arcade tstn-dev 503-backpressures
+the combined broadcast rate at the very top end (a scaling-env arcade would lift
+it), and PostgreSQL is not yet the binding constraint but would be profiled next
+now that claiming and fuel are off the critical path.
 
 ## CE caveat
 
