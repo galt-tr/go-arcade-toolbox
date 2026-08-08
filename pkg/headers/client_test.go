@@ -468,6 +468,28 @@ func TestCacheGuardAndEviction(t *testing.T) {
 	assert.Nil(t, c.cacheGet(700000), "evictFrom drops entries at/above the fork height")
 }
 
+// TestCacheRecentWhenDepthZero: a throughput deployment (cacheDepth 0) caches
+// recent headers up to the tip — the win that lets ~1000 proofs in one block
+// share a single header fetch — while heights above the tip stay uncached, and
+// a reorg still evicts recent cached headers (the SPV-safety invariant).
+func TestCacheRecentWhenDepthZero(t *testing.T) {
+	c := newTestClient(t, "http://127.0.0.1:1")
+	c.cacheDepth = 0 // cache everything at or below the tip
+
+	c.observeTipHeight(800100)
+	c.maybeCache(800100, &Header{Height: 800100}) // tip block: cached
+	c.maybeCache(800050, &Header{Height: 800050}) // recent, below tip: cached
+	c.maybeCache(800101, &Header{Height: 800101}) // above tip: NOT cached
+	assert.NotNil(t, c.cacheGet(800100), "tip-height header cached at depth 0")
+	assert.NotNil(t, c.cacheGet(800050), "recent header cached at depth 0")
+	assert.Nil(t, c.cacheGet(800101), "above-tip header never cached")
+
+	// SPV safety: a reorg still evicts recent cached headers at/above the fork.
+	c.evictFrom(800050)
+	assert.Nil(t, c.cacheGet(800050), "reorg evicts recent cached header")
+	assert.Nil(t, c.cacheGet(800100), "reorg evicts at/above the fork height")
+}
+
 // assertClosed drains ch and asserts it closes within the timeout.
 func assertClosed[T any](t *testing.T, ch <-chan T) {
 	t.Helper()

@@ -106,12 +106,14 @@ type heightResponse struct {
 //
 // # Header cache
 //
-// Headers at heights the server considers immutable (below tip-N; N defaults to
+// Headers at heights at or below tip-N (N = cacheDepth, default
 // [defaultCacheDepth]) are cached by height, so a repeated HeaderByHeight —
 // including the ones VerifyMerkleRoot drives — costs no HTTP round-trip. A reorg
 // event evicts every cached entry at or above its fork height (see
-// [Client.SubscribeReorg]); recent (mutable) heights are never cached, so they
-// are always re-fetched.
+// [Client.SubscribeReorg]). With the default depth only immutable heights are
+// cached; a throughput deployment may lower cacheDepth (see [WithCacheDepth]) to
+// cache recent heights too — the reorg eviction keeps that SPV-safe (see
+// [Client.maybeCache]).
 type Client struct {
 	logger    *slog.Logger
 	rest      *resty.Client
@@ -296,12 +298,19 @@ func (c *Client) cacheGet(height uint32) *Header {
 	return c.cache[height]
 }
 
-// maybeCache caches header only when height is immutable: strictly deeper than
-// tip-cacheDepth against the last-observed tip. Recent (still-reorgable) heights
-// and the case where no tip is yet known are never cached.
+// maybeCache caches header for any block at height <= tip-cacheDepth against the
+// last-observed tip; heights above the tip, and the case where no tip is yet
+// known, are never cached. With the default cacheDepth every cached header is
+// immutable (deep enough to never reorg). A high-throughput deployment MAY lower
+// cacheDepth (even to 0) to also cache recent, still-reorgable headers — the
+// win being that the ~thousand proofs sharing one block do a single header fetch
+// instead of one each. This stays SPV-safe: a reorg evicts every cached header
+// at or above its fork BEFORE any consumer acts on it (see SubscribeReorg), and
+// DemoteReorgedProofs re-verifies affected proofs, so a cached header can only be
+// an orphan for the brief, self-healing window until the reorg event lands.
 func (c *Client) maybeCache(height uint32, header *Header) {
 	tip := c.tipHeight.Load()
-	if tip <= c.cacheDepth || height >= tip-c.cacheDepth {
+	if tip == 0 || height+c.cacheDepth > tip {
 		return
 	}
 	c.cacheMu.Lock()
