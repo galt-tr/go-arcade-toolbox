@@ -430,6 +430,10 @@ func (r KnownTxRepo) TransitionSuspect(ctx context.Context, txid string, newStat
 }
 
 // SetProof records a mined transaction's proof and marks it completed/notified.
+// It also drops input_beef: once the merkle proof anchors the tx, its input
+// ancestry is no longer needed to build a descendant's BEEF (raw_tx + this proof
+// suffice), so clearing it here bounds the known_txs blob growth under sustained
+// load. raw_tx is kept (needed to reconstruct the tx when spending its outputs).
 func (r KnownTxRepo) SetProof(ctx context.Context, txid string, height uint32, blockHash, merklePath, merkleRoot []byte) error {
 	raw, err := encTxID(txid)
 	if err != nil {
@@ -438,7 +442,7 @@ func (r KnownTxRepo) SetProof(ctx context.Context, txid string, height uint32, b
 	q := r.s.rebind(
 		`UPDATE known_txs
 		 SET status = ?, was_broadcast = ` + r.s.boolTrueLiteral() + `, notified = ` + r.s.boolTrueLiteral() + `,
-		     block_height = ?, block_hash = ?, merkle_path = ?, merkle_root = ?, updated_at = ?
+		     block_height = ?, block_hash = ?, merkle_path = ?, merkle_root = ?, input_beef = NULL, updated_at = ?
 		 WHERE txid = ?`,
 	)
 	res, err := r.s.execer(ctx).ExecContext(ctx, q,

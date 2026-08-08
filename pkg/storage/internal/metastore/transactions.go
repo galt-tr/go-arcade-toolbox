@@ -291,6 +291,23 @@ func (r TransactionsRepo) UpdateStatusByTxID(ctx context.Context, txid string, s
 	return r.applyStatusUpdate(ctx, q, args, len(expectedCurrent) > 0)
 }
 
+// ClearInputBEEFByTxID drops the stored input BEEF for every row carrying txid
+// (display hex). Called once a tx is mined+proven: the merkle proof anchors it,
+// so the input ancestry is no longer needed to build a descendant's BEEF, and
+// clearing it bounds the transactions blob growth under sustained load. The
+// `input_beef IS NOT NULL` guard makes a re-apply a cheap no-op.
+func (r TransactionsRepo) ClearInputBEEFByTxID(ctx context.Context, txid string) error {
+	raw, err := encTxID(txid)
+	if err != nil {
+		return err
+	}
+	q := r.s.rebind("UPDATE transactions SET input_beef = NULL, updated_at = ? WHERE txid = ? AND input_beef IS NOT NULL")
+	if _, err := r.s.execer(ctx).ExecContext(ctx, q, r.s.encTime(r.s.now()), raw); err != nil {
+		return fmt.Errorf("metastore: clear input beef: %w", err)
+	}
+	return nil
+}
+
 func (r TransactionsRepo) applyStatusUpdate(ctx context.Context, q string, args []any, guarded bool) error {
 	res, err := r.s.execer(ctx).ExecContext(ctx, q, args...)
 	if err != nil {

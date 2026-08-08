@@ -230,6 +230,12 @@ func (p *Provider) applyMined(ctx context.Context, rec arcade.TxRecord) error {
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) {
 			return fmt.Errorf("storage: mined: mark completed: %w", err)
 		}
+		// The proof now anchors the tx, so its input BEEF ancestry is dead weight
+		// (see SetProof, which drops the known_txs copy). Drop the transactions
+		// copy too — the dominant blob under sustained load.
+		if err := p.meta.Transactions().ClearInputBEEFByTxID(ctx, txid); err != nil {
+			return fmt.Errorf("storage: mined: clear input beef: %w", err)
+		}
 		if err := p.promoteChangeByTxID(ctx, txid, utxostore.TierMined); err != nil {
 			return err
 		}
