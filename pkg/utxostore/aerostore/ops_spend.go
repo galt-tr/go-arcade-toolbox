@@ -170,6 +170,8 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 			}
 			return released, fmt.Errorf("aerostore: unspend %s: %w", op, aerr)
 		}
+		// The coin is claimable again (unless frozen); re-probe its bucket.
+		s.noteClaimable(u.UserID, u.Basket, u.Tier, u.Satoshis)
 		released++
 	}
 	return released, nil

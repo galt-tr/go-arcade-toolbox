@@ -41,10 +41,22 @@ type claimCache struct {
 // the snapshot cannot satisfy a request. Lock order is always refillMu → dataMu
 // (the refiller holds refillMu across its dataMu section); no goroutine ever
 // holds dataMu while acquiring refillMu, so the two never deadlock.
+//
+// probedEmpty records that the last whole-bucket probe returned zero records —
+// the bucket holds no claimable coin at all — so subsequent claims skip the
+// probe entirely (the funder's fast path walks always-empty tiers, e.g.
+// TierMined before anything settles, on every payment). It is CLEARED
+// event-driven by [claimCache.markClaimable] whenever a coin is made claimable
+// in this bucket (mint, unspend, unfreeze, release, promote-in), so a restored
+// coin is visible to the next claim. gen guards the refill/invalidation race: a
+// refiller only trusts an empty probe (sets probedEmpty) if gen is unchanged
+// across the probe, so a markClaimable that lands mid-probe forces a re-probe.
 type claimBucket struct {
-	dataMu   sync.Mutex
-	cands    []candidate
-	refillMu sync.Mutex
+	dataMu      sync.Mutex
+	cands       []candidate
+	probedEmpty bool
+	gen         uint64
+	refillMu    sync.Mutex
 }
 
 func newClaimCache(refill int) *claimCache {
@@ -62,6 +74,20 @@ func (cc *claimCache) bucket(claimKey string) *claimBucket {
 	return b
 }
 
+// markClaimable records that a coin was (or may have been) made claimable in
+// claimKey's bucket, so the next claim re-probes even if the bucket was last
+// seen empty. It bumps gen so an empty probe in flight cannot subsequently mark
+// the bucket empty and hide the new coin. Called AFTER the backing write commits
+// (the coin is visible to a probe), by every path that restores a claimKey:
+// mint, unspend, unfreeze, release, promote-in.
+func (cc *claimCache) markClaimable(claimKey string) {
+	b := cc.bucket(claimKey)
+	b.dataMu.Lock()
+	b.gen++
+	b.probedEmpty = false
+	b.dataMu.Unlock()
+}
+
 // take returns up to want cached candidates for claimKey that satisfy pred,
 // choosing by prefer when non-nil (best-fit: pass a<b for smallest-first, a>b
 // for largest-first; nil when any order is acceptable). It performs at most one
@@ -76,20 +102,33 @@ func (cc *claimCache) take(s *Store, claimKey string, pred func(uint64) bool, pr
 	}
 	b := cc.bucket(claimKey)
 
-	// Fast path: satisfy from the current snapshot without probing.
+	// Fast path: satisfy from the current snapshot without probing. A bucket
+	// known to hold no claimable coin at all (probedEmpty, cleared event-driven)
+	// returns short without a wasted probe.
 	b.dataMu.Lock()
 	out := b.pullLocked(pred, prefer, want)
+	knownEmpty := b.probedEmpty && len(b.cands) == 0
 	b.dataMu.Unlock()
-	if len(out) >= want {
+	if len(out) >= want || knownEmpty {
 		return out, nil
 	}
 
 	// Snapshot cannot satisfy the request: refill (single-flight) and retry.
 	if b.refillMu.TryLock() {
+		b.dataMu.Lock()
+		g := b.gen
+		b.dataMu.Unlock()
 		cands, err := s.probe(claimKey, nil, int64(cc.refill))
 		b.dataMu.Lock()
-		if err == nil && len(cands) > 0 {
-			b.cands = cands // REPLACE — bounded, no duplicate accumulation
+		if err == nil {
+			if len(cands) > 0 {
+				b.cands = cands // REPLACE — bounded, no duplicate accumulation
+				b.probedEmpty = false
+			} else if b.gen == g {
+				// Empty probe and no coin was made claimable while we probed:
+				// trust it. A racing markClaimable bumps gen, forcing a re-probe.
+				b.probedEmpty = true
+			}
 		}
 		more := b.pullLocked(pred, prefer, want-len(out))
 		b.dataMu.Unlock()

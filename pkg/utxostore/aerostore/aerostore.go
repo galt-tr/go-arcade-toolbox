@@ -520,6 +520,18 @@ func (s *Store) getRecord(op utxostore.Outpoint) (rec *as.Record, found bool, er
 	return r, true, nil
 }
 
+// noteClaimable tells the claim cache (when enabled) that a coin has been made
+// claimable in the (userID, basket, tier, value-bucket) it names, so a bucket
+// last seen empty is re-probed on the next claim. A no-op when the cache is
+// disabled. Callers invoke it AFTER the backing write commits so the coin is
+// already visible to a probe.
+func (s *Store) noteClaimable(userID int64, basket string, tier utxostore.Tier, sats uint64) {
+	if s.claimCache == nil {
+		return
+	}
+	s.claimCache.markClaimable(claimKeyFor(userID, basket, tier, bucketOf(sats)))
+}
+
 // restoreClaimKeyOp returns an operation that RESTORES the claimKey bin (making
 // the row claimable again), deriving the key's embedded tier from the record's
 // OWN live tier bin, but ONLY when skipWhen evaluates false — all evaluated

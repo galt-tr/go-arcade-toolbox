@@ -61,6 +61,7 @@ func (s *Store) mintOne(m *utxostore.Mint) error {
 	wp.RecordExistsAction = as.CREATE_ONLY
 	aerr := s.client.PutBins(wp, key, bins...)
 	if aerr == nil {
+		s.noteClaimable(m.UserID, m.Basket, m.Tier, m.Satoshis)
 		return nil
 	}
 	if !aerr.Matches(types.KEY_EXISTS_ERROR) {
@@ -222,11 +223,13 @@ func (s *Store) Unfreeze(_ context.Context, ops []utxostore.Outpoint) error {
 			removeBinOp(binFrozen),
 			restoreClaimKeyOp(as.ExpOr(as.ExpBinExists(binResBy), as.ExpBinExists(binSpentBy)), u),
 		)
-		if aerr != nil {
-			if aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
-				itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
-				continue
-			}
+		switch {
+		case aerr == nil:
+			// The coin may now be claimable again; re-probe its bucket.
+			s.noteClaimable(u.UserID, u.Basket, u.Tier, u.Satoshis)
+		case aerr.Matches(types.KEY_NOT_FOUND_ERROR):
+			itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
+		default:
 			itemErrs = append(itemErrs, fmt.Errorf("aerostore: unfreeze %s: %w", op, aerr))
 		}
 	}
@@ -283,6 +286,9 @@ func (s *Store) Promote(_ context.Context, ops []utxostore.Outpoint, to utxostor
 			}
 			return changed, fmt.Errorf("aerostore: promote %s: %w", op, aerr)
 		}
+		// If the row was claimable it is now claimable in the target tier's
+		// bucket; re-probe there (harmless if it was reserved/spent).
+		s.noteClaimable(u.UserID, u.Basket, to, u.Satoshis)
 		changed++
 	}
 	return changed, nil

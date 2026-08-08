@@ -414,5 +414,7 @@ func (s *Store) releaseRow(u *utxostore.UTXO, reservation string) (bool, error) 
 		}
 		return false, fmt.Errorf("aerostore: release %s: %w", u.Outpoint, aerr)
 	}
+	// The coin is claimable again (unless frozen); re-probe its bucket.
+	s.noteClaimable(u.UserID, u.Basket, u.Tier, u.Satoshis)
 	return true, nil
 }
