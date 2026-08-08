@@ -103,6 +103,52 @@ the combined broadcast rate at the very top end (a scaling-env arcade would lift
 it), and PostgreSQL is not yet the binding constraint but would be profiled next
 now that claiming and fuel are off the critical path.
 
+## The real ceiling was the workload, not the toolbox — ancestor-limit + promote-on-SEEN
+
+A closer look at the "backpressure" during the self-replenish runs showed it was
+NOT arcade capacity (we are on the scaling arcade, and the app's "backpressure"
+metric counts only `wdk.ErrNotEnoughFunds` — local fuel starvation — never a 503).
+The actual limiter was the **self-payment workload itself**: with change routed
+back into the pool (self-replenish), each payment spends the previous payment's
+change, forming one long linear **unconfirmed** chain. On a chain that mines far
+below the blast rate (tstn), nothing confirms, so the chain grows past
+**teranode's mempool ancestor limit**; arcade rejects the deepest tx
+(`ProcessTransaction (4): failed to validate`) and the rejection **cascades** to
+every descendant (`parent rejected (ancestor …)`).
+
+Two correctness fixes came out of this:
+
+- **promote-on-SEEN** (`storage: promote change ... on SEEN`): a 202 is
+  acceptance-for-processing, not validation, so change is promoted to claimable
+  only on the real SEEN status, never on the 202. A rejected parent never SEENs,
+  so its change never becomes claimable and no child spends a dead output. This
+  correctly refuses to build on unvalidated coins (and, as designed, couples pool
+  replenishment to SEEN-apply throughput).
+- **self-replenish is now opt-in** (`Throughput.RecycleChangeToPool`, default
+  off): routing change back to the pool is safe only when mining keeps unconfirmed
+  ancestry within the ancestor limit. Default is change→`default` (no chaining);
+  the keeper feeds the pool from confirmed deposits.
+
+**Clean measurement on a realistic workload.** Funded a fresh mined (depth-0)
+coin, fanned out a wide **independent, shallow-ancestry** fuel pool, and blasted
+with self-replenish OFF and keeper recycle OFF (`FUEL_RECYCLE_BASKET=off`), so
+every payment spends an independent coin and change is never respent — no growing
+chain:
+
+| metric | self-payment chain | independent shallow pool |
+|---|---|---|
+| Rejections | ~480/min steady, cascading | **0** |
+| Rate | ~1,450 then reject-starved | **~1,467 TPS** until the finite pool drained |
+
+Zero rejections confirms the deep self-payment chain was the *only* rejection
+source — not the toolbox. The rate held ~1,467 TPS until the pre-funded pool was
+consumed (a finite-fund limit, not a throughput wall); combined with the
+~1,450–1,680 TPS initial bursts of every prior run, the toolbox's realistic
+ceiling on this hybrid is **~1,500 TPS with zero rejections**, bound by signing +
+broadcast. Building a larger pre-fund for a longer sustained window is gated by
+promote-on-SEEN (the multi-level fan-out waits for each level's SEEN), which is a
+fan-out-bootstrap latency, not a throughput limit.
+
 ## CE caveat
 
 Aerospike **Community Edition** single node: durable-delete is unavailable
