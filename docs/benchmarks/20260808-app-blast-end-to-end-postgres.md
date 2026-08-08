@@ -63,13 +63,38 @@ and JSON parse are not the independent bottleneck; broadcast is fine.
 - Drop `input_beef` on mine (both `known_txs` and `transactions`).
 - `RemoveSpentBy` — remove a mined tx's spent inputs from the hot store.
 
-## Next (to raise / find the true PG ceiling)
+## Update — apply-batching shipped (commit 650063f): measured PG ceiling
 
-1. **Batch the status-apply DB round-trips** — bulk-load the batch's `known_txs`
-   in one query and collapse the per-event UPDATEs into per-batch bulk
-   statements (all `SEEN` → one status update + one promote; all `MINED` → bulk
-   proof/complete/promote/remove). Cuts ~10k round-trips/s to hundreds and
-   unblocks the SSE reader. This is the "squeeze PG" lever.
-2. Then re-measure the sustained ceiling on a fresh DB and record it here.
-3. Then the **Aerospike hot-path** (design's intended 1000+ path): move UTXO ops
-   off PG so create + apply + recycle stop contending on one database.
+The status-apply DB round-trips are now batched (`storage.ApplyStatusBatch`):
+one bulk `known_txs` load + one Mode-A write transaction of bulk statements per
+apply-batch, guards preserved. Re-measured end-to-end (fresh 16 GB-tuned DB,
+`BLAST_AMOUNT_SATS=50`):
+
+| metric | before batching | after batching |
+|---|---|---|
+| CREATE (sustained) | ~1000/s (holds even at 5 GB DB, 0 fail/bp) | ~1000/s (unchanged — not the ceiling) |
+| **STATUS-APPLY (SEEN)** | ~40/s | **~500–750/s** (~15× lift) |
+
+**The apply pipeline is still the sustained ceiling.** Even batched, apply
+(~500–750 events/s) trails create (~1000/s), so the SEEN backlog grows ~250–500/s
+and — because mining-paced pruning cannot fire within a run (tstn mining lag
+exceeds the window, `mined=0`) — the ledger grows unbounded, and apply itself
+degrades as it grows (~750/s at ~2 GB → ~467/s at ~5 GB). So:
+
+- **Create ceiling: ~1000 TPS** (robust; PG create path + 16 GB buffers handle it).
+- **Sustained-with-bounded-ledger ceiling: apply-bound, ~500–750 TPS** (SEEN
+  keeping pace; lower once MINED apply + pruning must also keep pace at steady
+  state). Batching lifted this ~15× but did not reach create's 1000, because
+  create + fuel-keeper + apply all contend on one PostgreSQL.
+
+The single-threaded applier with 64-event batches is the remaining structural
+limit; larger batches were inconclusive here (DB-growth confound — needs a fresh
+DB per config to isolate). Batch-size tuning is left as a future config knob.
+
+## Next: Aerospike hot-path
+
+Move the UTXO hot store off PostgreSQL (design's intended 1000+ path): create +
+apply + fuel-recycle stop contending on one database, freeing PG capacity for
+the metadata + status-apply writes. Expected to raise the apply-bound ceiling
+toward create's ~1000/s. Re-run this same end-to-end measurement on the hybrid
+and record it alongside.
