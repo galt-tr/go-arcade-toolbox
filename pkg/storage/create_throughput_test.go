@@ -200,3 +200,28 @@ func TestCreateAction_PrivacyRoutesThroughTieredWalk(t *testing.T) {
 	assert.Positive(t, h.spy.smallestCalls, "privacy funding must use the tiered smallest-sufficient walk")
 	assert.Equal(t, wdk.BasketNameForChange, h.spy.smallestBasket, "tiered walk must target the change basket")
 }
+
+// TestChangeDestinationBasket proves the self-replenishing routing: in the
+// throughput strategy a payment's change goes back into the fuel pool (so the
+// pool refills 1:1 without the keeper recycling per payment), while a fan-out
+// mint's change returns to its funding source and the privacy strategy keeps
+// change in the default basket.
+func TestChangeDestinationBasket(t *testing.T) {
+	const denom = 100_000
+	tp := newSpyHarness(t, WithUTXOManagement(throughputUTXOMgmt(denom)))
+
+	// Payment (no fuel shape) → the pool basket self-replenishes.
+	assert.Equal(t, "fuel", tp.p.changeDestinationBasket(nil),
+		"throughput payment change must route into the fuel pool")
+
+	// Fan-out leaf mint (destination = pool) → change returns to the reserve
+	// source, never the pool it is filling.
+	leaf := &wdk.ShapedChange{Count: 1, Satoshis: denom, Basket: "fuel"}
+	assert.Equal(t, "reserve", tp.p.changeDestinationBasket(leaf),
+		"fan-out leaf change must return to the reserve funding source")
+
+	// Privacy strategy: change stays in the default basket.
+	pv := newSpyHarness(t)
+	assert.Equal(t, wdk.BasketNameForChange, pv.p.changeDestinationBasket(nil),
+		"privacy change must stay in the default basket")
+}

@@ -299,7 +299,7 @@ func (p *Provider) persistCreateAction(
 		InputBeef:               primitives.ExplicitByteArray(inputBeefBytes),
 		Inputs:                  sdkInputs,
 		Outputs:                 sdkOutputs,
-		NoSendChangeOutputVouts: noSendChangeVouts(args.IsNoSend, plans, p.changeBasketName()),
+		NoSendChangeOutputVouts: noSendChangeVouts(args.IsNoSend, plans, p.changeDestinationBasket(args.Options.FuelShape)),
 		DerivationPrefix:        derivationPrefix,
 		Version:                 args.Version,
 		LockTime:                args.LockTime,
@@ -377,7 +377,7 @@ func (p *Provider) buildOutputPlans(args wdk.ValidCreateActionArgs, fundRes *fun
 	}
 
 	// Change outputs (ProvidedByStorage, wallet-derived BRC29 P2PKH).
-	changeName := p.changeBasketName()
+	changeName := p.changeDestinationBasket(args.Options.FuelShape)
 	changeValues := distributeChange(fundRes.ChangeAmount, fundRes.ChangeOutputsCount)
 	for _, v := range changeValues {
 		suffix, err := p.rand.Base64(derivationSuffixBytes)
@@ -464,6 +464,25 @@ func (p *Provider) fanOutSourceBasket(shape *wdk.ShapedChange) string {
 		return p.utxoMgmt.Throughput.ReserveBasket
 	}
 	return p.changeBasketName()
+}
+
+// changeDestinationBasket resolves which basket a create-action's change returns
+// to. In the throughput strategy a payment's change is routed straight into the
+// fuel PoolBasket so the pool self-replenishes 1:1 (one pool coin spent, one
+// change coin minted back) — this bounds the local ledger and removes the fuel
+// keeper's need to recycle change per payment. A fan-out mint (shape != nil) is
+// the exception: its change returns to the fan-out's own funding source, so a
+// leaf mint funded from the reserve cannot drain-then-refill the pool it fills.
+// The privacy strategy is unchanged: change stays in the default basket.
+func (p *Provider) changeDestinationBasket(shape *wdk.ShapedChange) string {
+	switch {
+	case shape != nil:
+		return p.fanOutSourceBasket(shape)
+	case p.utxoMgmt.Enabled():
+		return p.utxoMgmt.Throughput.PoolBasket
+	default:
+		return p.changeBasketName()
+	}
 }
 
 // spendTiers resolves the status-tier walk for funding.
