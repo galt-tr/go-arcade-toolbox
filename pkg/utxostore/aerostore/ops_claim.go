@@ -120,28 +120,30 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 		return nil, err
 	}
 
-	valueFilter := as.ExpGreaterEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(minSats))) //nolint:gosec // satoshi amounts are < 2^63
+	sufficient := func(sats uint64) bool { return sats >= minSats }
+	smallest := func(a, b uint64) bool { return a < b }
 	losses := 0
 	for b := bucketOf(minSats); b < bucketCount; b++ {
 		claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b)
-		cands, err := s.probe(claimKey, valueFilter, claimSample)
-		if err != nil {
-			return nil, err
-		}
-		if len(cands) == 0 {
-			continue
-		}
-		sort.Slice(cands, func(i, j int) bool { return cands[i].sats < cands[j].sats }) // smallest first
-		for _, c := range cands {
-			u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
-			if rerr != nil {
-				return nil, rerr
+		for {
+			cands, err := s.claimCands(claimKey, as.ExpGreaterEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(minSats))), sufficient, smallest, 1) //nolint:gosec // satoshi amounts are < 2^63
+			if err != nil {
+				return nil, err
 			}
-			if won {
-				return u, nil
+			if len(cands) == 0 {
+				break // bucket holds no more sufficient coins; walk up
 			}
-			if losses++; losses >= casBudget {
-				return nil, utxostore.ErrContention
+			for _, c := range cands {
+				u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
+				if rerr != nil {
+					return nil, rerr
+				}
+				if won {
+					return u, nil
+				}
+				if losses++; losses >= casBudget {
+					return nil, utxostore.ErrContention
+				}
 			}
 		}
 	}
@@ -149,6 +151,35 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 		return nil, utxostore.ErrContention // saw candidates, lost every race
 	}
 	return nil, nil // pool exhausted for this predicate
+}
+
+// claimCands returns up to want claimable candidates for claimKey that satisfy
+// pred, preferring by prefer (nil = any order). It draws from the amortised
+// claim cache when enabled — one whole-bucket probe feeds many claims — and
+// falls back to a direct value-filtered index probe (sorted by prefer) when the
+// cache is disabled. Either way the caller must still win the reserve CAS: the
+// candidates are only hints.
+func (s *Store) claimCands(claimKey string, valueFilter *as.Expression, pred func(uint64) bool, prefer func(a, b uint64) bool, want int) ([]candidate, error) {
+	if s.claimCache != nil {
+		return s.claimCache.take(s, claimKey, pred, prefer, want)
+	}
+	// Cache disabled: sample at least claimSample rows so best-fit stays a
+	// best-of-sample, then return the preferred `want`.
+	sample := int64(want)
+	if sample < claimSample {
+		sample = claimSample
+	}
+	cands, err := s.probe(claimKey, valueFilter, sample)
+	if err != nil {
+		return nil, err
+	}
+	if prefer != nil {
+		sort.Slice(cands, func(i, j int) bool { return prefer(cands[i].sats, cands[j].sats) })
+	}
+	if len(cands) > want {
+		cands = cands[:want]
+	}
+	return cands, nil
 }
 
 // ClaimLargestInsufficient implements [utxostore.Store]. It walks buckets
@@ -165,7 +196,8 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 		return nil, nil
 	}
 
-	valueFilter := as.ExpLess(as.ExpIntBin(binSats), as.ExpIntVal(int64(capSats))) //nolint:gosec // satoshi amounts are < 2^63
+	insufficient := func(sats uint64) bool { return sats < capSats }
+	largest := func(a, b uint64) bool { return a > b }
 	claimed := make([]*utxostore.UTXO, 0, limit)
 	losses := 0
 	for b := bucketOf(capSats - 1); b >= 0; b-- {
@@ -173,28 +205,34 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 			break
 		}
 		claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b)
-		cands, err := s.probe(claimKey, valueFilter, claimSample)
-		if err != nil {
-			return nil, err
-		}
-		if len(cands) == 0 {
-			continue
-		}
-		sort.Slice(cands, func(i, j int) bool { return cands[i].sats > cands[j].sats }) // largest first
-		for _, c := range cands {
-			if len(claimed) >= limit {
-				break
+		for len(claimed) < limit {
+			cands, err := s.claimCands(claimKey, as.ExpLess(as.ExpIntBin(binSats), as.ExpIntVal(int64(capSats))), insufficient, largest, limit-len(claimed)) //nolint:gosec // satoshi amounts are < 2^63
+			if err != nil {
+				return nil, err
 			}
-			u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
-			if rerr != nil {
-				return nil, rerr
+			if len(cands) == 0 {
+				break // bucket holds no more coins below the cap; walk down
 			}
-			if won {
-				claimed = append(claimed, u)
-				continue
+			progressed := false
+			for _, c := range cands {
+				if len(claimed) >= limit {
+					break
+				}
+				u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
+				if rerr != nil {
+					return nil, rerr
+				}
+				if won {
+					claimed = append(claimed, u)
+					progressed = true
+					continue
+				}
+				if losses++; losses >= casBudget && len(claimed) == 0 {
+					return nil, utxostore.ErrContention
+				}
 			}
-			if losses++; losses >= casBudget && len(claimed) == 0 {
-				return nil, utxostore.ErrContention
+			if !progressed {
+				break // whole batch lost the CAS race; stop churning this bucket
 			}
 		}
 	}
@@ -205,8 +243,10 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 }
 
 // ClaimExact implements [utxostore.Store]. Every coin of a given denomination
-// shares one bucket, so this is a single index probe filtered to sats ==
-// denomination. A result shorter than count is pool underflow, not an error.
+// shares one bucket, so candidates come from that bucket filtered to sats ==
+// denomination — served from the amortised claim cache (one whole-bucket probe
+// per batch) when enabled, or a direct index probe otherwise. A result shorter
+// than count is pool underflow, not an error.
 func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation string, denomination uint64, count int) ([]*utxostore.UTXO, error) {
 	if s.closed.Load() {
 		return nil, errClosed
@@ -220,72 +260,41 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 
 	valueFilter := as.ExpEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(denomination))) //nolint:gosec // satoshi amounts are < 2^63
 	claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, bucketOf(denomination))
-
-	if s.claimCache != nil {
-		return s.claimExactCached(claimKey, denomination, valueFilter, reservation, count)
-	}
-
-	maxRecords := int64(count * 4)
-	if maxRecords < claimSample {
-		maxRecords = claimSample
-	}
-	cands, err := s.probe(claimKey, valueFilter, maxRecords)
-	if err != nil {
-		return nil, err
-	}
+	exact := func(sats uint64) bool { return sats == denomination }
 
 	claimed := make([]*utxostore.UTXO, 0, count)
 	losses := 0
-	for _, c := range cands {
-		if len(claimed) >= count {
-			break
-		}
-		u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
-		if rerr != nil {
-			return nil, rerr
-		}
-		if won {
-			claimed = append(claimed, u)
-			continue
-		}
-		losses++
-	}
-	// Zero reserved despite candidates lost to concurrent claimers: retryable.
-	if len(claimed) == 0 && losses > 0 {
-		return nil, utxostore.ErrContention
-	}
-	return claimed, nil
-}
-
-// claimExactCached serves a ClaimExact from the amortised candidate cache: it
-// drains pre-probed candidates and reserves each with a single-record CAS,
-// issuing one claimKey index probe only when the queue empties. A short result
-// is pool underflow; an all-lost claim (candidates seen, none won) is
-// [utxostore.ErrContention] so the funder's outer retry re-drives it (a fresh
-// refill restores a high win rate well within the attempt budget).
-func (s *Store) claimExactCached(claimKey string, denomination uint64, valueFilter *as.Expression, reservation string, count int) ([]*utxostore.UTXO, error) {
-	cacheKey := exactCacheKey(claimKey, denomination)
-	claimed := make([]*utxostore.UTXO, 0, count)
-	losses := 0
-	maxAttempts := count*4 + casBudget
-	for attempts := 0; len(claimed) < count && attempts < maxAttempts; attempts++ {
-		c, ok, err := s.claimCache.pop(s, cacheKey, claimKey, valueFilter)
+	for len(claimed) < count {
+		// Exact matches are interchangeable, so no preference ordering — the
+		// cache serves any denomination coin, amortising the index probe.
+		cands, err := s.claimCands(claimKey, valueFilter, exact, nil, count-len(claimed))
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
+		if len(cands) == 0 {
 			break // pool underflow for this denomination
 		}
-		u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
-		if rerr != nil {
-			return nil, rerr
+		progressed := false
+		for _, c := range cands {
+			if len(claimed) >= count {
+				break
+			}
+			u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
+			if rerr != nil {
+				return nil, rerr
+			}
+			if won {
+				claimed = append(claimed, u)
+				progressed = true
+				continue
+			}
+			losses++
 		}
-		if won {
-			claimed = append(claimed, u)
-			continue
+		if !progressed {
+			break // whole batch lost the CAS race; stop (funder retries on ErrContention)
 		}
-		losses++
 	}
+	// Zero reserved despite candidates lost to concurrent claimers: retryable.
 	if len(claimed) == 0 && losses > 0 {
 		return nil, utxostore.ErrContention
 	}

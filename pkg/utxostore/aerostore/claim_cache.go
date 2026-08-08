@@ -1,41 +1,49 @@
 package aerostore
 
 import (
-	"strconv"
 	"sync"
-
-	as "github.com/aerospike/aerospike-client-go/v8"
 )
 
-// claimCache amortises the ClaimExact secondary-index probe. Denominated fuel
-// pools are the primary high-throughput claim path, and each claim was issuing
-// its own claimKey index query — on a single-node cluster the aerospike client
-// serialises those queries on a per-node routing lock, which is the dominant
-// cost profiled at the ~600 TPS hybrid ceiling. The cache turns per-claim
-// queries into per-batch queries: one index probe fills a bounded queue of
-// candidates that many concurrent ClaimExact calls then drain with direct
-// single-record CAS reserves, collapsing the query rate — and that lock
-// contention — by the refill batch factor.
+// claimCache amortises the per-claim claimKey secondary-index probe that is the
+// dominant cost of high-throughput claiming on Aerospike. Every claim used to
+// issue its own index query, and on a single-node cluster the aerospike client
+// serialises concurrent queries on a per-node routing lock — the bottleneck
+// profiled at the hybrid throughput ceiling. The cache turns per-claim queries
+// into per-batch queries: one whole-bucket probe fills a bounded snapshot that
+// many concurrent claims then drain with direct single-record CAS reserves, and
+// a per-bucket single-flight token collapses a thundering herd of concurrent
+// empty-snapshot claims to a single in-flight probe.
 //
-// Correctness rests on the reserve CAS, never on the cache. A queued candidate
+// One snapshot per claimKey (user|basket|tier|bucket) serves ALL claim shapes
+// for that bucket — ClaimExact, ClaimSmallestSufficient, ClaimLargestInsufficient
+// — because they differ only in a value predicate applied client-side, not in
+// which records the index returns. The refill fetches the whole bucket (no
+// server-side value filter) so a single probe feeds every shape.
+//
+// Correctness rests on the reserve CAS, never on the cache. A cached candidate
 // is only a hint: [Store.reserve] guards the exact claimKey, so any candidate
-// that was reserved, spent, frozen, removed, or retiered by Promote since it was
-// probed simply loses the CAS and is discarded. The queue can therefore hold
-// stale entries without ever handing out a coin twice, and — because the queue
-// is keyed by the exact denomination, not merely the shared log2 bucket — never
-// hands a coin of one denomination to a request for another that maps to the
-// same bucket.
+// reserved, spent, frozen, removed, or retiered by Promote since it was probed
+// loses the CAS and is discarded. Refill REPLACES the snapshot rather than
+// appending, so a coin can never be handed out twice and the buffer stays
+// bounded by the refill size regardless of pool size. The cache never suppresses
+// a probe based on staleness: a coin made claimable again (unspend, unfreeze,
+// release, mint, promote) is visible to the very next claim, because an empty
+// snapshot always re-probes.
 type claimCache struct {
-	refill  int
+	refill int
+
 	mu      sync.Mutex // guards buckets
 	buckets map[string]*claimBucket
 }
 
-// claimBucket is one denomination's candidate queue plus its refill token. The
-// channel gives lock-free multi-consumer draining; refillMu ensures exactly one
-// goroutine performs the index probe when the queue empties.
+// claimBucket is one claimKey's candidate snapshot. dataMu guards the snapshot;
+// refillMu is the single-flight token ensuring only one goroutine probes when
+// the snapshot cannot satisfy a request. Lock order is always refillMu → dataMu
+// (the refiller holds refillMu across its dataMu section); no goroutine ever
+// holds dataMu while acquiring refillMu, so the two never deadlock.
 type claimBucket struct {
-	ch       chan candidate
+	dataMu   sync.Mutex
+	cands    []candidate
 	refillMu sync.Mutex
 }
 
@@ -43,68 +51,101 @@ func newClaimCache(refill int) *claimCache {
 	return &claimCache{refill: refill, buckets: make(map[string]*claimBucket)}
 }
 
-// exactCacheKey namespaces a queue by the exact denomination so that two
-// denominations sharing a log2 bucket (hence one claimKey) never share a queue.
-func exactCacheKey(claimKey string, denomination uint64) string {
-	return claimKey + "|=" + strconv.FormatUint(denomination, 10)
-}
-
-func (cc *claimCache) bucket(cacheKey string) *claimBucket {
+func (cc *claimCache) bucket(claimKey string) *claimBucket {
 	cc.mu.Lock()
-	b := cc.buckets[cacheKey]
+	b := cc.buckets[claimKey]
 	if b == nil {
-		b = &claimBucket{ch: make(chan candidate, cc.refill)}
-		cc.buckets[cacheKey] = b
+		b = &claimBucket{}
+		cc.buckets[claimKey] = b
 	}
 	cc.mu.Unlock()
 	return b
 }
 
-// pop returns the next cached candidate for a denomination, refilling from a
-// single claimKey index probe (server-side filtered by valueFilter to the exact
-// denomination) when the queue is empty. ok is false only when the pool is
-// genuinely empty for this predicate — a short/underflow result, never an error
-// on its own. Exactly one goroutine refills at a time; the rest wait for it.
-func (cc *claimCache) pop(s *Store, cacheKey, claimKey string, valueFilter *as.Expression) (candidate, bool, error) {
-	b := cc.bucket(cacheKey)
+// take returns up to want cached candidates for claimKey that satisfy pred,
+// choosing by prefer when non-nil (best-fit: pass a<b for smallest-first, a>b
+// for largest-first; nil when any order is acceptable). It performs at most one
+// index probe — refilling and REPLACING the snapshot when the current one has
+// no matching candidate — so a caller that needs more loops over take, each
+// call costing at most one query. A short result means the bucket currently
+// holds no more matching claimable coins (pool underflow for this predicate),
+// never an error on its own.
+func (cc *claimCache) take(s *Store, claimKey string, pred func(uint64) bool, prefer func(a, b uint64) bool, want int) ([]candidate, error) {
+	if want <= 0 {
+		return nil, nil
+	}
+	b := cc.bucket(claimKey)
 
-	// Fast path: a candidate is already queued.
-	select {
-	case c := <-b.ch:
-		return c, true, nil
-	default:
+	// Fast path: satisfy from the current snapshot without probing.
+	b.dataMu.Lock()
+	out := b.pullLocked(pred, prefer, want)
+	b.dataMu.Unlock()
+	if len(out) >= want {
+		return out, nil
 	}
 
+	// Snapshot cannot satisfy the request: refill (single-flight) and retry.
 	if b.refillMu.TryLock() {
-		// We own the refill. Re-check first: another refiller may have filled
-		// the queue between our failed receive and acquiring the token.
-		defer b.refillMu.Unlock()
-		select {
-		case c := <-b.ch:
-			return c, true, nil
-		default:
+		cands, err := s.probe(claimKey, nil, int64(cc.refill))
+		b.dataMu.Lock()
+		if err == nil && len(cands) > 0 {
+			b.cands = cands // REPLACE — bounded, no duplicate accumulation
 		}
-		cands, err := s.probe(claimKey, valueFilter, int64(cc.refill))
+		more := b.pullLocked(pred, prefer, want-len(out))
+		b.dataMu.Unlock()
+		b.refillMu.Unlock()
 		if err != nil {
-			return candidate{}, false, err
+			return out, err
 		}
-		for _, c := range cands {
-			select {
-			case b.ch <- c:
-			default: // queue full (cap == refill); drop the surplus
-			}
-		}
+		out = append(out, more...)
 	} else {
-		// A refill is in flight; block until it completes, then take one if any
-		// remain after faster consumers.
+		// Another goroutine is refilling; wait for it, then take what remains.
+		// We do not initiate our own probe — that is what keeps refill
+		// single-flight under a thundering herd of empty-snapshot claims.
 		b.refillMu.Lock()
 		b.refillMu.Unlock() //nolint:staticcheck // intentional wait-then-release: gate on the in-flight refill
+		b.dataMu.Lock()
+		more := b.pullLocked(pred, prefer, want-len(out))
+		b.dataMu.Unlock()
+		out = append(out, more...)
 	}
+	return out, nil
+}
 
-	select {
-	case c := <-b.ch:
-		return c, true, nil
-	default:
-		return candidate{}, false, nil // pool empty for this predicate
+// pullLocked removes and returns up to want candidates matching pred from the
+// snapshot, choosing by prefer when non-nil. Caller must hold dataMu. Selection
+// is over the cached snapshot only, so best-fit is approximate ("best within the
+// sampled bucket") — the honest property Aerospike claiming documents.
+func (b *claimBucket) pullLocked(pred func(uint64) bool, prefer func(a, b uint64) bool, want int) []candidate {
+	if want <= 0 || len(b.cands) == 0 {
+		return nil
 	}
+	out := make([]candidate, 0, want)
+	for len(out) < want {
+		best := -1
+		for i := range b.cands {
+			if !pred(b.cands[i].sats) {
+				continue
+			}
+			if best == -1 {
+				best = i
+				if prefer == nil {
+					break // any match is acceptable
+				}
+				continue
+			}
+			if prefer(b.cands[i].sats, b.cands[best].sats) {
+				best = i
+			}
+		}
+		if best == -1 {
+			break // no matching candidate remains
+		}
+		out = append(out, b.cands[best])
+		last := len(b.cands) - 1
+		b.cands[best] = b.cands[last]
+		b.cands[last] = candidate{} // drop the *as.Record reference for GC
+		b.cands = b.cands[:last]
+	}
+	return out
 }
