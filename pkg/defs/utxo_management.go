@@ -93,6 +93,17 @@ type Throughput struct {
 	PoolBasket    string `mapstructure:"pool_basket"`
 	ReserveBasket string `mapstructure:"reserve_basket"`
 
+	// RecycleChangeToPool routes a payment's change straight back into the fuel
+	// pool so it self-replenishes 1:1 (bounding the ledger and removing the
+	// keeper's per-payment recycle). This chains each payment onto the previous
+	// one's change, so it is SAFE ONLY when the chain confirms fast enough to
+	// keep unconfirmed ancestry within the network's mempool ancestor limit —
+	// i.e. mining keeps pace. On a backlogged chain a sustained self-payment
+	// blast would grow the unconfirmed chain past that limit and be rejected, so
+	// this defaults OFF (change goes to the default basket; the keeper feeds the
+	// pool from confirmed deposits, keeping ancestry shallow).
+	RecycleChangeToPool bool `mapstructure:"recycle_change_to_pool"`
+
 	// FanoutOutputsPerTx is the number of fuel outputs per leaf fan-out tx.
 	FanoutOutputsPerTx uint64 `mapstructure:"fanout_outputs_per_tx"`
 	// FanoutMaxTxsPerRound caps LEAF fan-out transactions per top-up round.

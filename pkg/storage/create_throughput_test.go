@@ -208,16 +208,25 @@ func TestCreateAction_PrivacyRoutesThroughTieredWalk(t *testing.T) {
 // change in the default basket.
 func TestChangeDestinationBasket(t *testing.T) {
 	const denom = 100_000
-	tp := newSpyHarness(t, WithUTXOManagement(throughputUTXOMgmt(denom)))
 
-	// Payment (no fuel shape) → the pool basket self-replenishes.
-	assert.Equal(t, "fuel", tp.p.changeDestinationBasket(nil),
-		"throughput payment change must route into the fuel pool")
+	// Throughput, self-replenish OFF (default): payment change stays in the
+	// default basket — no chaining onto the previous payment's change.
+	tp := newSpyHarness(t, WithUTXOManagement(throughputUTXOMgmt(denom)))
+	assert.Equal(t, wdk.BasketNameForChange, tp.p.changeDestinationBasket(nil),
+		"throughput payment change stays in default when self-replenish is off")
+
+	// Throughput, self-replenish ON (opt-in): payment change routes into the
+	// fuel pool so it refills 1:1.
+	mgmt := throughputUTXOMgmt(denom)
+	mgmt.Throughput.RecycleChangeToPool = true
+	tpOn := newSpyHarness(t, WithUTXOManagement(mgmt))
+	assert.Equal(t, "fuel", tpOn.p.changeDestinationBasket(nil),
+		"self-replenish routes payment change into the fuel pool")
 
 	// Fan-out leaf mint (destination = pool) → change returns to the reserve
 	// source, never the pool it is filling.
 	leaf := &wdk.ShapedChange{Count: 1, Satoshis: denom, Basket: "fuel"}
-	assert.Equal(t, "reserve", tp.p.changeDestinationBasket(leaf),
+	assert.Equal(t, "reserve", tpOn.p.changeDestinationBasket(leaf),
 		"fan-out leaf change must return to the reserve funding source")
 
 	// Privacy strategy: change stays in the default basket.

@@ -478,7 +478,9 @@ func (p *Provider) changeDestinationBasket(shape *wdk.ShapedChange) string {
 	switch {
 	case shape != nil:
 		return p.fanOutSourceBasket(shape)
-	case p.utxoMgmt.Enabled():
+	case p.utxoMgmt.Enabled() && p.utxoMgmt.Throughput.RecycleChangeToPool:
+		// Opt-in self-replenish: only safe when mining keeps unconfirmed
+		// ancestry within the mempool ancestor limit (see RecycleChangeToPool).
 		return p.utxoMgmt.Throughput.PoolBasket
 	default:
 		return p.changeBasketName()
