@@ -72,13 +72,19 @@ func (s *Store) probe(claimKey string, valueFilter *as.Expression, maxRecords in
 }
 
 // reserve performs the single-record CAS that marks a candidate reserved: it
-// sets resBy/resAt and removes claimKey iff claimKey is still present. Returns
-// (utxo, true) on success, (nil, false) on FILTERED_OUT (lost the race), and a
-// non-nil error only for a genuine backend failure.
-func (s *Store) reserve(c candidate, reservation string, nowMs int64) (*utxostore.UTXO, bool, error) {
+// sets resBy/resAt and removes claimKey iff the row still carries EXACTLY the
+// claimKey it was probed under. Guarding the exact value (not merely its
+// existence) is what makes a cached candidate safe: a coin reserved, spent,
+// frozen, removed, or retiered by Promote since the probe (Promote rewrites
+// claimKey to the new tier) no longer matches, so the CAS filters out and we
+// treat it as a lost race rather than reserving a coin whose live tier has
+// drifted from the snapshot we would return. Returns (utxo, true) on success,
+// (nil, false) on a lost race (FILTERED_OUT, or KEY_NOT_FOUND if the record was
+// durably deleted), and a non-nil error only for a genuine backend failure.
+func (s *Store) reserve(c candidate, claimKey, reservation string, nowMs int64) (*utxostore.UTXO, bool, error) {
 	wp := as.NewWritePolicy(0, 0)
 	wp.RecordExistsAction = as.UPDATE_ONLY
-	wp.FilterExpression = as.ExpBinExists(binClaimKey)
+	wp.FilterExpression = as.ExpEq(as.ExpStringBin(binClaimKey), as.ExpStringVal(claimKey))
 
 	_, aerr := s.client.Operate(
 		wp, c.rec.Key,
@@ -87,7 +93,7 @@ func (s *Store) reserve(c candidate, reservation string, nowMs int64) (*utxostor
 		removeBinOp(binClaimKey),
 	)
 	if aerr != nil {
-		if aerr.Matches(types.FILTERED_OUT) {
+		if aerr.Matches(types.FILTERED_OUT) || aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
 			return nil, false, nil // lost the race
 		}
 		return nil, false, fmt.Errorf("aerostore: reserve: %w", aerr)
@@ -117,7 +123,8 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 	valueFilter := as.ExpGreaterEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(minSats))) //nolint:gosec // satoshi amounts are < 2^63
 	losses := 0
 	for b := bucketOf(minSats); b < bucketCount; b++ {
-		cands, err := s.probe(claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b), valueFilter, claimSample)
+		claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b)
+		cands, err := s.probe(claimKey, valueFilter, claimSample)
 		if err != nil {
 			return nil, err
 		}
@@ -126,7 +133,7 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 		}
 		sort.Slice(cands, func(i, j int) bool { return cands[i].sats < cands[j].sats }) // smallest first
 		for _, c := range cands {
-			u, won, rerr := s.reserve(c, reservation, s.nowMillis())
+			u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
 			if rerr != nil {
 				return nil, rerr
 			}
@@ -165,7 +172,8 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 		if len(claimed) >= limit {
 			break
 		}
-		cands, err := s.probe(claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b), valueFilter, claimSample)
+		claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b)
+		cands, err := s.probe(claimKey, valueFilter, claimSample)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +185,7 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 			if len(claimed) >= limit {
 				break
 			}
-			u, won, rerr := s.reserve(c, reservation, s.nowMillis())
+			u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
 			if rerr != nil {
 				return nil, rerr
 			}
@@ -213,6 +221,10 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	valueFilter := as.ExpEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(denomination))) //nolint:gosec // satoshi amounts are < 2^63
 	claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, bucketOf(denomination))
 
+	if s.claimCache != nil {
+		return s.claimExactCached(claimKey, denomination, valueFilter, reservation, count)
+	}
+
 	maxRecords := int64(count * 4)
 	if maxRecords < claimSample {
 		maxRecords = claimSample
@@ -228,7 +240,7 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 		if len(claimed) >= count {
 			break
 		}
-		u, won, rerr := s.reserve(c, reservation, s.nowMillis())
+		u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
 		if rerr != nil {
 			return nil, rerr
 		}
@@ -239,6 +251,41 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 		losses++
 	}
 	// Zero reserved despite candidates lost to concurrent claimers: retryable.
+	if len(claimed) == 0 && losses > 0 {
+		return nil, utxostore.ErrContention
+	}
+	return claimed, nil
+}
+
+// claimExactCached serves a ClaimExact from the amortised candidate cache: it
+// drains pre-probed candidates and reserves each with a single-record CAS,
+// issuing one claimKey index probe only when the queue empties. A short result
+// is pool underflow; an all-lost claim (candidates seen, none won) is
+// [utxostore.ErrContention] so the funder's outer retry re-drives it (a fresh
+// refill restores a high win rate well within the attempt budget).
+func (s *Store) claimExactCached(claimKey string, denomination uint64, valueFilter *as.Expression, reservation string, count int) ([]*utxostore.UTXO, error) {
+	cacheKey := exactCacheKey(claimKey, denomination)
+	claimed := make([]*utxostore.UTXO, 0, count)
+	losses := 0
+	maxAttempts := count*4 + casBudget
+	for attempts := 0; len(claimed) < count && attempts < maxAttempts; attempts++ {
+		c, ok, err := s.claimCache.pop(s, cacheKey, claimKey, valueFilter)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break // pool underflow for this denomination
+		}
+		u, won, rerr := s.reserve(c, claimKey, reservation, s.nowMillis())
+		if rerr != nil {
+			return nil, rerr
+		}
+		if won {
+			claimed = append(claimed, u)
+			continue
+		}
+		losses++
+	}
 	if len(claimed) == 0 && losses > 0 {
 		return nil, utxostore.ErrContention
 	}

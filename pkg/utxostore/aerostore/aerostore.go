@@ -96,6 +96,11 @@ type Store struct {
 	logger         *slog.Logger
 	durableDeletes bool
 
+	// claimCache amortises ClaimExact's claimKey index probe across many claims.
+	// nil when disabled (WithClaimCache(0)), in which case ClaimExact falls back
+	// to a fresh probe per call.
+	claimCache *claimCache
+
 	// restoreRaceHook, when non-nil, is invoked by the release/unspend/unfreeze
 	// restore paths immediately BEFORE their server-side restore Operate. It is
 	// a TEST-ONLY seam for deterministically landing a concurrent Promote inside
@@ -118,7 +123,15 @@ type config struct {
 	password       string
 	durableDeletes *bool // nil = auto-detect from server edition
 	indexTimeout   time.Duration
+	claimCacheSize int // ClaimExact candidate-cache refill batch; <=0 disables
 }
+
+// defaultClaimCacheSize is the ClaimExact candidate-cache refill batch: one
+// index probe fetches this many candidates, which are then served to that many
+// claims via direct CAS reserves before the next probe. Sized to keep the
+// per-claim index-query rate (and its single-node routing-lock contention) low
+// while bounding queued memory to O(refill) records per live denomination.
+const defaultClaimCacheSize = 512
 
 // WithClock overrides the store's clock (used for ReservedAt and CreatedAt).
 // Intended for tests that need deterministic timestamps.
@@ -141,15 +154,24 @@ func WithAuth(user, password string) Option {
 // want to assert the invariant explicitly.
 func WithDurableDeletes(on bool) Option { return func(c *config) { c.durableDeletes = &on } }
 
+// WithClaimCache sets the ClaimExact candidate-cache refill batch size. A single
+// claimKey index probe fetches up to n candidates that subsequent ClaimExact
+// calls drain with direct CAS reserves, collapsing the per-claim query rate that
+// otherwise serialises on the aerospike client's per-node query-routing lock.
+// n <= 0 disables the cache (a fresh probe per claim). Defaults to
+// [defaultClaimCacheSize].
+func WithClaimCache(n int) Option { return func(c *config) { c.claimCacheSize = n } }
+
 // New connects to the Aerospike cluster at host:port serving namespace, runs
 // the fund-safety and edition checks, ensures the secondary indexes exist, and
 // returns a ready store. It fails if the namespace's default-ttl is not 0.
 func New(ctx context.Context, host string, port int, namespace string, opts ...Option) (*Store, error) {
 	cfg := config{
-		now:          time.Now,
-		logger:       slog.Default(),
-		set:          DefaultSet,
-		indexTimeout: 30 * time.Second,
+		now:            time.Now,
+		logger:         slog.Default(),
+		set:            DefaultSet,
+		indexTimeout:   30 * time.Second,
+		claimCacheSize: defaultClaimCacheSize,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -173,6 +195,9 @@ func New(ctx context.Context, host string, port int, namespace string, opts ...O
 		set:       cfg.set,
 		now:       cfg.now,
 		logger:    cfg.logger.With("component", "aerostore"),
+	}
+	if cfg.claimCacheSize > 0 {
+		s.claimCache = newClaimCache(cfg.claimCacheSize)
 	}
 
 	if err := s.checkFundSafety(ctx); err != nil {
