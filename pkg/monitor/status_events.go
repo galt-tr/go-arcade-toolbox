@@ -28,9 +28,9 @@ const sseReconnectBackoff = time.Second
 // persistence keeps up while preserving replay safety (events are idempotent;
 // the cursor advances only to the last event of a fully-applied batch).
 const (
-	applyWorkers   = 8
-	applyBatchMax  = 64
-	applyQueueSize = 1024
+	defaultApplyWorkers = 8
+	applyBatchMax       = 64
+	applyQueueSize      = 1024
 
 	// applyDeadlockAttempts bounds the retry of a transient (deadlock/lock)
 	// apply failure; the victim is safe to retry immediately.
@@ -157,7 +157,7 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 	}
 
 	g := new(errgroup.Group)
-	g.SetLimit(applyWorkers)
+	g.SetLimit(d.applyConcurrency)
 	for _, txid := range order {
 		events := shards[txid]
 		g.Go(func() error {

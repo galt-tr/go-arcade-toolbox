@@ -67,6 +67,7 @@ type Daemon struct {
 	staleReservationTTL time.Duration
 	suspectGrace        time.Duration
 	maxQuarantine       time.Duration
+	applyConcurrency    int // parallel SSE status-apply workers (WithApplyConcurrency)
 
 	startLock sync.Mutex
 	started   bool
@@ -103,6 +104,7 @@ func NewDaemon(
 		distributedLock:     true,
 		now:                 time.Now,
 		limits:              limits{sendWaiting: defaultBatchLimit, abort: defaultBatchLimit, sync: defaultBatchLimit, proof: defaultBatchLimit, rejectRelease: defaultBatchLimit},
+		applyConcurrency:    defaultApplyWorkers,
 		failAbandonedAge:    defaultFailAbandonedAge,
 		staleReservationTTL: defaultStaleReservationTTL,
 		suspectGrace:        cfg.Reconciler.SuspectGrace(),

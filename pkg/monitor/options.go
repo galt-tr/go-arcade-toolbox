@@ -22,6 +22,19 @@ func WithBatchLimit(n int) Option {
 	}
 }
 
+// WithApplyConcurrency sets how many SSE status events apply in parallel (still
+// sharded by txid, so per-txid order is preserved). Once recent block headers
+// are cached (see [headers.WithCacheDepth]), proof application is DB-bound, so a
+// sustained ~1000-TPS deployment must raise this above the default 8 for the
+// apply pipeline to keep pace with mining. A non-positive value is ignored.
+func WithApplyConcurrency(n int) Option {
+	return func(d *Daemon) {
+		if n > 0 {
+			d.applyConcurrency = n
+		}
+	}
+}
+
 // WithReconcilerWindows overrides the reject→release reconciler's grace window
 // (suspect age / two-pass separation) and max-quarantine ceiling
 // (escalate-to-stuck). Non-positive values are ignored. Intended for
