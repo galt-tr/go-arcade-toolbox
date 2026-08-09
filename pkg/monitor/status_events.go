@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"hash/fnv"
 	"log/slog"
 	"strings"
 	"sync"
@@ -27,8 +28,21 @@ const sseReconnectBackoff = time.Second
 // the cursor advances only to the last event of a fully-applied batch).
 const (
 	defaultApplyWorkers = 8
-	applyBatchMax       = 64
-	applyQueueSize      = 1024
+	// applyBatchMax is the max events drained into one batch before applying.
+	// Larger batches amortize the bulk load/write and give the sharded apply
+	// more to parallelize (a mined block delivers thousands of MINED events at
+	// once — they must clear in seconds, not back up the reader).
+	applyBatchMax = 512
+	// applyQueueSize is the reader→applier hand-off buffer. It must be large
+	// enough that a burst (a freshly mined block's worth of events) is absorbed
+	// without onEvent blocking — a blocked reader stops draining the socket, so
+	// arcade back-pressures and SEEN/MINED events are missed entirely.
+	applyQueueSize = 16384
+	// applyShards is the number of parallel apply workers a batch is fanned out
+	// across, keyed by txid so a given tx's events always land on the same shard
+	// (preserving the per-txid arrival order the terminal/lattice guards need)
+	// while distinct txids apply concurrently.
+	applyShards = 8
 
 	// applyDeadlockAttempts bounds the retry of a transient (deadlock/lock)
 	// apply failure; the victim is safe to retry immediately.
@@ -43,11 +57,15 @@ const (
 //
 // Architecture (two concurrent actors sharing the cursor under cursorMu):
 //   - this goroutine runs the reconnect loop and calls oracle.StreamStatus,
-//     whose onEvent only ENQUEUES into a bounded (1024) channel;
-//   - one applier goroutine drains the channel into batches (≤64) and hands each
-//     batch to storage.ApplyStatusBatch, which collapses the per-event DB round
-//     trips into one bulk load + one batched write transaction (the throughput
-//     win) while preserving per-txid arrival order and every apply guard.
+//     whose onEvent only ENQUEUES into a large (applyQueueSize) channel so a
+//     burst never blocks the reader (a blocked reader stops draining the socket,
+//     so arcade back-pressures and events are missed);
+//   - one applier goroutine drains the channel into batches (≤applyBatchMax) and,
+//     per batch, fans the records out across applyShards workers keyed by txid —
+//     distinct txids apply concurrently through storage.ApplyStatusBatch, while a
+//     given txid's events stay on one shard so their arrival order (and every
+//     apply guard) is preserved. Sharded parallelism + bulk batching together
+//     clear a mined block's thousand-event burst in seconds.
 //
 // The cursor advances only to the newest non-empty event id of a fully-applied
 // batch, never regresses to "", and never advances past what was durably
@@ -167,11 +185,47 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 	cursorMu.Unlock()
 }
 
-// applyRecords applies one batch's records through storage.ApplyStatusBatch,
-// retrying transient DB contention (deadlock / lock) — the whole batch is safe
-// to retry because ApplyStatusBatch is idempotent. Other failures are logged and
-// swallowed (replay is safe; the polls are the safety net).
+// applyRecords applies one batch by fanning it out across applyShards workers,
+// keyed by txid: a given txid's records always go to the same shard (so their
+// arrival order — which the terminal/lattice guards depend on — is preserved),
+// while distinct txids apply concurrently. Shards hold disjoint txid sets, so
+// their ApplyStatusBatch transactions never conflict. This multiplies apply
+// throughput so the reader's hand-off buffer drains fast enough that onEvent
+// never blocks (a blocked reader = missed SSE events). A single shard, or a
+// batch too small to shard, applies inline without spawning goroutines.
 func (d *Daemon) applyRecords(ctx context.Context, records []arcade.TxRecord) {
+	if len(records) == 0 {
+		return
+	}
+	if len(records) <= applyBatchMax/applyShards || applyShards <= 1 {
+		d.applyShard(ctx, records)
+		return
+	}
+
+	shards := make([][]arcade.TxRecord, applyShards)
+	for _, r := range records {
+		s := shardOf(r.TxID)
+		shards[s] = append(shards[s], r)
+	}
+	var wg sync.WaitGroup
+	for i := range shards {
+		if len(shards[i]) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(recs []arcade.TxRecord) {
+			defer wg.Done()
+			d.applyShard(ctx, recs)
+		}(shards[i])
+	}
+	wg.Wait()
+}
+
+// applyShard applies one shard's records (a disjoint txid set) through
+// storage.ApplyStatusBatch, retrying transient DB contention — the batch is
+// idempotent so retry is safe. Other failures are logged and swallowed (replay
+// is safe; the polls are the safety net).
+func (d *Daemon) applyShard(ctx context.Context, records []arcade.TxRecord) {
 	var err error
 	for range applyDeadlockAttempts {
 		err = d.storage.ApplyStatusBatch(ctx, records)
@@ -184,6 +238,15 @@ func (d *Daemon) applyRecords(ctx context.Context, records []arcade.TxRecord) {
 			slog.Int("batchSize", len(records)),
 			slog.String("error", err.Error()))
 	}
+}
+
+// shardOf maps a txid to one of applyShards buckets. FNV-1a over the txid string
+// spreads txids evenly and is stable, so every event for a txid routes to the
+// same shard within a batch.
+func shardOf(txid string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(txid))
+	return int(h.Sum32() % applyShards)
 }
 
 // isTransientDBError reports whether err looks like retryable DB contention
