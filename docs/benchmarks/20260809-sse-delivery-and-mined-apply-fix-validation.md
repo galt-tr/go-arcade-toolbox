@@ -73,15 +73,23 @@ With the toolbox off the critical path, the remaining limits are all cluster-sid
   teranode's block assembly put only ~101.5k of the 215k in one block (the rest
   stay SEEN for the next block). Block-processing throughput, not the toolbox.
 
-- **chaintracks ↔ teranode fork at height 764 (found this run).** chaintracks's
-  active 764 (`12114cd0…`) diverged from teranode/arcade's canonical 764
-  (`5a55997b…`, which chaintracks holds only as an orphan) — a regtest
-  competing-block artifact after chaintracks's rough from-genesis re-sync. Arcade
-  builds every 764 proof against `5a55997b`, so the toolbox — correctly — refuses
-  to store proofs it cannot verify against its trusted headers (chaintracks),
-  leaving ~92,700 mined txs stuck at SEEN locally and the proof-poll re-verifying
-  them futilely. This is the SPV trust anchor working as designed; it auto-heals
-  the instant chaintracks converges to teranode's chain.
+- **arcade serving orphaned-block proofs after a 764 block-competition (found
+  this run).** Two blocks competed at 764: canonical `12114cd0` and orphan
+  `5a55997b`. teranode's `lastblocks` and chaintracks agree block-for-block
+  763→769 that 764 = `12114cd0` (chaintracks is correct and consistent). But
+  arcade's per-tx `GetTx.blockHash` still maps ~92,700 txs to the **orphan**
+  `5a55997b`, so it serves proofs computing to the orphan's root; the toolbox
+  verifies them against the canonical `12114cd0` header from chaintracks →
+  mismatch → **correctly rejects** ("merkle root failed header verification").
+  The 101,555 that applied got canonical-`12114cd0` proofs (stored block_hash
+  confirms). The toolbox and chaintracks are both correct — the toolbox refuses
+  to record a tx as mined in a block that is not on the canonical chain. This is
+  an **arcade** post-competition tx→block index inconsistency (it must re-point
+  mined txs to the canonical block after a reorg, or SPV clients rightly reject
+  its stale proofs); it does NOT self-heal until arcade re-serves the canonical
+  proof (or, if those txs are only in the orphan, they were reorged out and need
+  re-mining). NB: do not treat arcade `GetTx.blockHash` as canonical — compare
+  teranode `/api/v1/lastblocks` vs chaintracks `/header/height/N` block-for-block.
 
 - **~13 txs stuck at RECEIVED in arcade** (0.006 %) — teranode never advanced
   them past the 202 (never SEEN/propagated). The toolbox has no status to apply.
