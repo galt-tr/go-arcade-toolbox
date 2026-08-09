@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -537,12 +538,45 @@ func (p *Provider) verifyMinedBatch(ctx context.Context, recs []arcade.TxRecord)
 	if len(recs) == 0 {
 		return nil
 	}
+
+	// Memoize header verification by (height, root) for the life of this batch.
+	// Every MINED tx in a block computes the SAME merkle root at the SAME height,
+	// so without this each tx re-runs VerifyMerkleRoot -> HeaderByHeight; recent
+	// (tip) block headers are intentionally uncached by the headers client (reorg
+	// safety), so a block's worth of MINED events would otherwise re-fetch the one
+	// block header once per tx (the ~28 apply/s, ~16-minute-lag bottleneck seen at
+	// 1500 TPS). Keying on the root (not just height) keeps a malformed BUMP's
+	// divergent root honestly re-verified. The fetch runs under the lock so a
+	// concurrent burst collapses to one HeaderByHeight per block, not one per
+	// verify goroutine.
+	type vKey struct {
+		height uint32
+		root   chainhash.Hash
+	}
+	type vRes struct {
+		ok  bool
+		err error
+	}
+	var vmu sync.Mutex
+	vcache := make(map[vKey]vRes)
+	verify := func(ctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
+		key := vKey{height: height, root: *root}
+		vmu.Lock()
+		defer vmu.Unlock()
+		if r, ok := vcache[key]; ok {
+			return r.ok, r.err
+		}
+		ok, err := p.hdrs.VerifyMerkleRoot(ctx, root, height)
+		vcache[key] = vRes{ok: ok, err: err}
+		return ok, err
+	}
+
 	results := make([]*minedProof, len(recs))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(minedVerifyConcurrency)
 	for i := range recs {
 		g.Go(func() error {
-			results[i] = p.verifyMinedOne(gctx, recs[i])
+			results[i] = p.verifyMinedOne(gctx, recs[i], verify)
 			return nil
 		})
 	}
@@ -562,7 +596,7 @@ func (p *Provider) verifyMinedBatch(ctx context.Context, recs []arcade.TxRecord)
 // defer/skip/bad case. Unlike applyMined it never returns a hard error — a
 // missing headers source is logged and deferred so a global misconfig cannot
 // fail sibling txids' writes; hdrs is required in practice.
-func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord) *minedProof {
+func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord, verify func(context.Context, *chainhash.Hash, uint32) (bool, error)) *minedProof {
 	txid := rec.TxID
 	if len(rec.MerklePath) == 0 {
 		p.logger.DebugContext(ctx, "mined event without merkle path; deferring to proof poll", slog.String("txid", txid))
@@ -596,7 +630,7 @@ func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord) *min
 			slog.String("txid", txid), slog.String("error", err.Error()))
 		return nil
 	}
-	ok, verr := p.hdrs.VerifyMerkleRoot(ctx, root, mp.BlockHeight)
+	ok, verr := verify(ctx, root, mp.BlockHeight)
 	if verr != nil {
 		p.logger.DebugContext(ctx, "merkle root not yet verifiable; deferring to proof poll",
 			slog.String("txid", txid), slog.String("error", verr.Error()))
