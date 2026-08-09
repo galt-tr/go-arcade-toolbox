@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/txtrace"
 )
 
 // LastEventIDKey is the key_values key holding the SSE replay cursor across
@@ -158,7 +159,10 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 	for i := range batch {
 		records[i] = batch[i].Record
 	}
+	applyStart := time.Now()
 	d.applyRecords(ctx, records)
+	applyDone := time.Now()
+	d.traceBatch(batch, applyStart, applyDone)
 
 	// Persist the cursor to the newest event that actually carries an id: an
 	// empty id must never overwrite a good cursor with "" (a restart would then
@@ -183,6 +187,71 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 	cursorMu.Lock()
 	*lastEventID = cursorID
 	cursorMu.Unlock()
+}
+
+// traceBatch emits opt-in txtrace lines for an applied batch: one "mined_batch"
+// summary per block height present (so a block's MINED burst is measured as a
+// whole, not fragmented across the apply shards) and one "applied" line per
+// marked (sampled) txid. A batch with no MINED records and no marked txids does
+// a single O(batch) scan and emits nothing, so it is safe on the hot path.
+func (d *Daemon) traceBatch(batch []arcade.StatusEvent, applyStart, applyDone time.Time) {
+	type blockAgg struct {
+		count            int
+		recvMin, recvMax time.Time
+		arcadeTsMin      time.Time
+	}
+	var mined map[uint64]*blockAgg
+	for i := range batch {
+		rec := batch[i].Record
+		recvAt := batch[i].RecvAt
+		if rec.Status == arcade.StatusMined {
+			if mined == nil {
+				mined = make(map[uint64]*blockAgg)
+			}
+			a := mined[rec.BlockHeight]
+			if a == nil {
+				a = &blockAgg{}
+				mined[rec.BlockHeight] = a
+			}
+			a.count++
+			if !recvAt.IsZero() {
+				if a.recvMin.IsZero() || recvAt.Before(a.recvMin) {
+					a.recvMin = recvAt
+				}
+				if recvAt.After(a.recvMax) {
+					a.recvMax = recvAt
+				}
+			}
+			if !rec.Timestamp.IsZero() && (a.arcadeTsMin.IsZero() || rec.Timestamp.Before(a.arcadeTsMin)) {
+				a.arcadeTsMin = rec.Timestamp
+			}
+		}
+		if txtrace.Marked(rec.TxID) {
+			txtrace.Emit(d.logger, "applied", rec.TxID,
+				"status", string(rec.Status),
+				"recv_at", tsOrEmpty(recvAt),
+				"applied_at", applyDone.Format(time.RFC3339Nano))
+		}
+	}
+	for h, a := range mined {
+		txtrace.Emit(d.logger, "mined_batch", "",
+			"height", h,
+			"count", a.count,
+			"recv_min", tsOrEmpty(a.recvMin),
+			"recv_max", tsOrEmpty(a.recvMax),
+			"arcade_ts_min", tsOrEmpty(a.arcadeTsMin),
+			"apply_start", applyStart.Format(time.RFC3339Nano),
+			"apply_done", applyDone.Format(time.RFC3339Nano))
+	}
+}
+
+// tsOrEmpty formats t as RFC3339Nano, or "" when zero, so a trace line never
+// carries a misleading "0001-01-01T..." timestamp.
+func tsOrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
 }
 
 // applyRecords applies one batch by fanning it out across applyShards workers,

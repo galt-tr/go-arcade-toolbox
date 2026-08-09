@@ -113,6 +113,10 @@ type StatusEvent struct {
 	// intermediate frames may carry only the identifying/status fields; the
 	// full proof fields (merklePath, rawTx) are guaranteed via GetTx.
 	Record TxRecord
+	// RecvAt is the local wall-clock time the SSE frame was decoded off the
+	// wire (stamped by the client on delivery). Zero if unset. Used only for
+	// latency tracing; it never affects apply semantics.
+	RecvAt time.Time
 }
 
 // Health is the minimal liveness/freshness view from Arcade's GET /health. It

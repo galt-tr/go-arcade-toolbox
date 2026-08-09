@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/txtrace"
 )
 
 // defaultRetryAfter is used when Arcade replies 503 without a parsable
@@ -198,6 +199,13 @@ func (c *Client) Broadcast(ctx context.Context, txid string, ef []byte) (*Broadc
 // [BroadcastResult] contract (202 -> early result; 4xx -> final rejection with
 // err nil; 503 -> *BackpressureError; >=500/transport -> plain error).
 func (c *Client) broadcast(ctx context.Context, txid string, ef []byte) (*BroadcastResult, error) {
+	// Trace the sampled tx's POST /tx boundary (create-stack ctx flag) or a
+	// marked txid (covers a deferred/monitor-driven broadcast). Cheap guard.
+	traced := txtrace.Sampled(ctx) || txtrace.Marked(txid)
+	if traced {
+		txtrace.Emit(c.logger, "broadcast_post", txid)
+	}
+
 	rec := &TxRecord{}
 	apiErr := &apiError{}
 
@@ -209,7 +217,15 @@ func (c *Client) broadcast(ctx context.Context, txid string, ef []byte) (*Broadc
 		SetError(apiErr).
 		Post(c.broadcastURL)
 	if err != nil {
+		if traced {
+			txtrace.Emit(c.logger, "broadcast_error", txid, "error", err.Error())
+		}
 		return nil, wrapTransportError(err)
+	}
+	if traced {
+		txtrace.Emit(c.logger, "broadcast_accepted", txid,
+			"http_status", response.StatusCode(),
+			"arcade_status", string(rec.Status))
 	}
 
 	switch {

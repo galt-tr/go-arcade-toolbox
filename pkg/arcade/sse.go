@@ -10,6 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/txtrace"
 )
 
 const (
@@ -104,6 +105,9 @@ func (c *Client) StreamStatus(ctx context.Context, lastEventID string, onEvent f
 // no txid) are skipped without killing the stream. On delivery it advances
 // lastEventID (the resume cursor).
 func (c *Client) dispatchFrame(ctx context.Context, f sse.Frame, lastEventID *string, onEvent func(StatusEvent) error) bool {
+	// Stamp wire-arrival time before any parsing so it reflects when the frame
+	// landed, not when apply got to it.
+	recvAt := time.Now()
 	if f.Data == "" {
 		return false
 	}
@@ -125,7 +129,15 @@ func (c *Client) dispatchFrame(ctx context.Context, f sse.Frame, lastEventID *st
 		return false
 	}
 
-	if err := onEvent(StatusEvent{ID: f.ID, Record: record}); err != nil {
+	if txtrace.Marked(record.TxID) {
+		txtrace.Emit(c.logger, "sse_recv", record.TxID,
+			"status", string(record.Status),
+			"recv_at", recvAt.Format(time.RFC3339Nano),
+			"arcade_event_id", f.ID,
+			"arcade_ts", record.Timestamp.Format(time.RFC3339Nano))
+	}
+
+	if err := onEvent(StatusEvent{ID: f.ID, Record: record, RecvAt: recvAt}); err != nil {
 		c.logger.ErrorContext(
 			ctx, "arcade status event handler failed",
 			slog.String("eventID", f.ID),
