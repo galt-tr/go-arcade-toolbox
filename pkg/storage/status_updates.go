@@ -1001,31 +1001,62 @@ func (p *Provider) CheckProofs(ctx context.Context, limit int) error {
 	return p.pollAndApply(ctx, unproven)
 }
 
-// pollAndApply fetches each tx's authoritative record via GetTx and applies it.
-// A not-found tx is skipped; a transport error is logged and skipped (the next
-// sweep retries).
+// pollPeers bounds concurrent GetTx calls in the poll fallback. GetTx is a
+// stateless HTTP read that arcade serves concurrently, so polling serially caps
+// recovery near the per-request latency (a stuck-status backlog then never
+// drains). Fanning the fetches out lets one sweep re-fetch its whole batch in
+// roughly a single round-trip.
+const pollPeers = 16
+
+// pollAndApply fetches each tx's authoritative record via GetTx — concurrently,
+// bounded by pollPeers — then applies all successful results in one bulk
+// ApplyStatusBatch. This is the recovery path for statuses the live SSE stream
+// missed or that arcade dropped; polling one-at-a-time was far too slow to clear
+// a backlog. A not-found tx is skipped; a transport error is logged and skipped
+// (the next sweep retries). Order does not matter: the records are independent
+// and ApplyStatusBatch is idempotent and guard-checked per txid.
 func (p *Provider) pollAndApply(ctx context.Context, kts []metastore.KnownTx) error {
+	if len(kts) == 0 {
+		return nil
+	}
+	recs := make([]arcade.TxRecord, len(kts)) // one slot per input; empty TxID = skip
+	var g errgroup.Group
+	g.SetLimit(pollPeers)
 	for i := range kts {
-		if err := ctx.Err(); err != nil {
-			return err
+		if ctx.Err() != nil {
+			break
 		}
-		txid := kts[i].TxID
-		rec, err := p.oracle.GetTx(ctx, txid)
-		switch {
-		case errors.Is(err, arcade.ErrTxNotFound):
-			continue
-		case err != nil:
-			p.logger.DebugContext(ctx, "poll: GetTx failed", slog.String("txid", txid), slog.String("error", err.Error()))
-			continue
-		case rec == nil:
-			continue
+		i := i
+		g.Go(func() error {
+			txid := kts[i].TxID
+			rec, err := p.oracle.GetTx(ctx, txid)
+			switch {
+			case errors.Is(err, arcade.ErrTxNotFound), rec == nil:
+				return nil
+			case err != nil:
+				p.logger.DebugContext(ctx, "poll: GetTx failed", slog.String("txid", txid), slog.String("error", err.Error()))
+				return nil
+			}
+			if rec.TxID == "" {
+				rec.TxID = txid
+			}
+			recs[i] = *rec // distinct index per goroutine: no shared write
+			return nil
+		})
+	}
+	_ = g.Wait() // per-tx errors are logged and skipped inside; Wait never returns non-nil
+
+	batch := make([]arcade.TxRecord, 0, len(recs))
+	for i := range recs {
+		if recs[i].TxID != "" {
+			batch = append(batch, recs[i])
 		}
-		if rec.TxID == "" {
-			rec.TxID = txid
-		}
-		if err := p.ApplyStatusUpdate(ctx, *rec); err != nil {
-			p.logger.WarnContext(ctx, "poll: apply failed", slog.String("txid", txid), slog.String("error", err.Error()))
-		}
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	if err := p.ApplyStatusBatch(ctx, batch); err != nil {
+		p.logger.WarnContext(ctx, "poll: apply batch failed", slog.Int("batch", len(batch)), slog.String("error", err.Error()))
 	}
 	return nil
 }
