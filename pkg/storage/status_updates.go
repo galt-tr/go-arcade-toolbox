@@ -472,6 +472,30 @@ func (p *Provider) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord)
 	//     (header I/O), exactly like applyMined; only verified proofs are written.
 	verified := p.verifyMinedBatch(ctx, minedRecs)
 
+	// Resolve each verified proof's spent inputs from its local raw tx (also
+	// OUTSIDE the write transaction — pure in-memory parsing) so applyMinedBatch
+	// can prune the spent inputs with a batched delete-by-outpoint instead of a
+	// per-tx full-set scan (RemoveSpentBy). A proof whose raw tx is absent or
+	// unparseable keeps spentOps nil and falls back to the scan.
+	for i := range verified {
+		kt, ok := known[verified[i].rec.TxID]
+		if !ok || len(kt.RawTx) == 0 {
+			continue
+		}
+		tx, terr := transaction.NewTransactionFromBytes(kt.RawTx)
+		if terr != nil {
+			continue
+		}
+		ops := make([]utxostore.Outpoint, 0, len(tx.Inputs))
+		for _, in := range tx.Inputs {
+			if in.SourceTXID == nil {
+				continue
+			}
+			ops = append(ops, utxostore.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex})
+		}
+		verified[i].spentOps = ops
+	}
+
 	// 5b. One Mode-A transaction for every batched write.
 	if len(seenRecs) > 0 || len(verified) > 0 || len(rejectedRecs) > 0 || len(arcadeOnly) > 0 {
 		if err := p.meta.Do(ctx, func(ctx context.Context) error {
@@ -527,6 +551,11 @@ type minedProof struct {
 	blockHash []byte
 	mpBytes   []byte
 	root      []byte
+	// spentOps are the tx's input outpoints, resolved from its local raw tx, so
+	// the MINED apply can prune the spent inputs with a batched delete-by-outpoint
+	// instead of a per-tx full-set scan. Nil when the raw tx was unavailable or
+	// unparseable — the apply then falls back to the RemoveSpentBy scan.
+	spentOps []utxostore.Outpoint
 }
 
 // verifyMinedBatch header-verifies each MINED record's merkle root (in parallel,
@@ -720,13 +749,30 @@ func (p *Provider) applyMinedBatch(ctx context.Context, proofs []minedProof) err
 			return fmt.Errorf("storage: batch mined: promote change: %w", err)
 		}
 	}
-	// Remove the spent inputs of each mined (terminal) tx. Looping the existing
-	// per-tx RemoveSpentBy is acceptable (low relative frequency, and avoids
-	// widening the utxostore.Store interface across its three backends);
-	// idempotent on a re-apply.
+	// Remove the spent inputs of each mined (terminal) tx. Prefer ONE batched
+	// delete-by-outpoint over the resolved inputs (O(inputs), single-record PK
+	// deletes) — the old per-tx RemoveSpentBy runs a full aerospike set-scan per
+	// tx (O(set-size)), which dominates MINED apply under a large block. Proofs
+	// whose inputs could not be resolved (no local raw tx) fall back to the scan.
+	// Remove(force) is idempotent (no-ops on already-removed outpoints), so a
+	// re-apply is safe.
+	allSpent := make([]utxostore.Outpoint, 0, len(proofs))
+	var scanFallback []*minedProof
 	for i := range proofs {
-		if _, err := p.utxo.RemoveSpentBy(ctx, proofs[i].txidHash); err != nil {
-			return fmt.Errorf("storage: batch mined: remove spent inputs %s: %w", proofs[i].rec.TxID, err)
+		if len(proofs[i].spentOps) == 0 {
+			scanFallback = append(scanFallback, &proofs[i])
+			continue
+		}
+		allSpent = append(allSpent, proofs[i].spentOps...)
+	}
+	if len(allSpent) > 0 {
+		if err := p.utxo.Remove(ctx, allSpent, true); err != nil {
+			return fmt.Errorf("storage: batch mined: remove spent inputs: %w", err)
+		}
+	}
+	for _, pr := range scanFallback {
+		if _, err := p.utxo.RemoveSpentBy(ctx, pr.txidHash); err != nil {
+			return fmt.Errorf("storage: batch mined: remove spent inputs %s: %w", pr.rec.TxID, err)
 		}
 	}
 	return nil
