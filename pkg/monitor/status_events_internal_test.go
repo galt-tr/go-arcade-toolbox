@@ -19,6 +19,8 @@ package monitor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -53,6 +55,13 @@ type modelStorage struct {
 	totalActive         int
 	maxActive           int
 	sameTxidConcurrency atomic.Bool
+
+	// batchCalls counts ApplyStatusBatch invocations — one per non-empty apply
+	// shard — so a test can observe how wide the fan-out actually was.
+	batchCalls atomic.Int32
+	// batchErr, when set, fails every ApplyStatusBatch (the "the database is
+	// down mid-batch" case the replay cursor must not skip past).
+	batchErr error
 }
 
 func newModelStorage(seed []string) *modelStorage {
@@ -139,6 +148,10 @@ func (m *modelStorage) stateOf(txid string) modelState {
 // never clobbered by an earlier-arrival stale frame for the same txid, and the
 // cross-txid throughput parallelism is preserved.
 func (m *modelStorage) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord) error {
+	m.batchCalls.Add(1)
+	if m.batchErr != nil {
+		return m.batchErr
+	}
 	shards := map[string][]arcade.TxRecord{}
 	var order []string
 	for _, r := range recs {
@@ -244,4 +257,94 @@ func TestApplyStatusBatch_ShardsByTxidArrivalOrderWins(t *testing.T) {
 
 	// Cursor advanced to the last event id of the batch.
 	require.Equal(t, d+"-"+string(arcade.StatusRejected), cursor)
+}
+
+// TestApplyShards_FollowsWithApplyConcurrency proves the knob is LIVE. The shard
+// count used to be a hardcoded `applyShards = 8` const while WithApplyConcurrency
+// wrote a field nothing ever read, so a deployment that raised it still applied
+// through 8 workers: the 16384-slot hand-off queue saturated, onEvent blocked the
+// SSE reader, and arcade dropped events for us (~25k/s of "dropped events for
+// slow SSE client") — which is how transactions ended up with no arcade status.
+func TestApplyShards_FollowsWithApplyConcurrency(t *testing.T) {
+	newDaemon := func(t *testing.T, opts ...Option) *Daemon {
+		t.Helper()
+		opts = append([]Option{WithoutDistributedLock()}, opts...)
+		d, err := NewDaemon(logging.NewTestLogger(t), newModelStorage(nil), nil, nil, defs.DefaultMonitorConfig(), opts...)
+		require.NoError(t, err)
+		return d
+	}
+
+	require.Equal(t, defaultApplyWorkers, newDaemon(t).applyShards(), "unset falls back to the default")
+	require.Equal(t, 64, newDaemon(t, WithApplyConcurrency(64)).applyShards(), "the configured value is what the pipeline uses")
+	require.Equal(t, 1, newDaemon(t, WithApplyConcurrency(1)).applyShards())
+	require.Equal(t, defaultApplyWorkers, newDaemon(t, WithApplyConcurrency(0)).applyShards(), "non-positive is ignored")
+}
+
+// TestApplyRecords_FansOutAcrossConfiguredShards is the behavioral half: the
+// number of concurrent ApplyStatusBatch calls a single batch is split into
+// tracks the configured concurrency, not the old constant.
+func TestApplyRecords_FansOutAcrossConfiguredShards(t *testing.T) {
+	records := make([]arcade.TxRecord, applyBatchMax)
+	for i := range records {
+		records[i] = arcade.TxRecord{TxID: fmt.Sprintf("%064x", i), Status: arcade.StatusSeenOnNetwork}
+	}
+
+	fanOut := func(t *testing.T, conc int) int {
+		t.Helper()
+		store := newModelStorage(nil)
+		opts := []Option{WithoutDistributedLock()}
+		if conc > 0 {
+			opts = append(opts, WithApplyConcurrency(conc))
+		}
+		d, err := NewDaemon(logging.NewTestLogger(t), store, nil, nil, defs.DefaultMonitorConfig(), opts...)
+		require.NoError(t, err)
+		require.NoError(t, d.applyRecords(context.Background(), records))
+		return int(store.batchCalls.Load())
+	}
+
+	require.Equal(t, 1, fanOut(t, 1), "one worker applies the batch inline, in a single call")
+	require.LessOrEqual(t, fanOut(t, 0), defaultApplyWorkers, "the default is still 8 shards")
+
+	wide := fanOut(t, 32)
+	require.Greater(t, wide, defaultApplyWorkers,
+		"a batch must fan out past the old hardcoded 8 when WithApplyConcurrency raises it")
+	require.LessOrEqual(t, wide, 32)
+}
+
+// TestApplyStatusBatch_FailedApplyHoldsCursor proves the replay cursor never
+// advances past events that were not applied. It used to advance
+// unconditionally — "replay is safe, the polls are the safety net" — but the
+// polls could not reach a row that never got a status, so a failed batch's
+// events were lost for good and its transactions diverged from arcade forever.
+// Holding the cursor at the last FULLY-applied event means the worst case is
+// re-delivery of already-applied (idempotent) events.
+func TestApplyStatusBatch_FailedApplyHoldsCursor(t *testing.T) {
+	const txid = "aaaa"
+	store := newModelStorage([]string{txid})
+	store.batchErr = errors.New("connection reset by peer")
+	dmn, err := NewDaemon(logging.NewTestLogger(t), store, nil, nil, defs.DefaultMonitorConfig(), WithoutDistributedLock())
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	cursor := "id-before"
+	batch := []arcade.StatusEvent{rec(txid, arcade.StatusMined)}
+
+	dmn.applyStatusBatch(context.Background(), batch, &mu, &cursor)
+	require.Equal(t, "id-before", cursor, "the in-memory cursor must not move past a failed batch")
+	_, ok, _ := store.GetKeyValue(context.Background(), LastEventIDKey)
+	require.False(t, ok, "the persisted cursor must not move past a failed batch")
+
+	// Once the apply succeeds the cursor resumes advancing normally.
+	store.batchErr = nil
+	dmn.applyStatusBatch(context.Background(), batch, &mu, &cursor)
+	require.Equal(t, txid+"-"+string(arcade.StatusMined), cursor)
+	require.Equal(t, cursor, string(mustKV(t, store, LastEventIDKey)))
+}
+
+func mustKV(t *testing.T, m *modelStorage, key string) []byte {
+	t.Helper()
+	v, ok, err := m.GetKeyValue(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, ok, "key %s persisted", key)
+	return v
 }

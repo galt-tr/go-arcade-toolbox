@@ -90,6 +90,8 @@ func runMetastoreSuite(t *testing.T, factory storeFactory) {
 	t.Run("Transactions_ListActions", func(t *testing.T) { testTransactions(t, factory) })
 	t.Run("Outputs_ListOutputs_Seam", func(t *testing.T) { testOutputs(t, factory) })
 	t.Run("KnownTx_SuspectFailed", func(t *testing.T) { testKnownTx(t, factory) })
+	t.Run("KnownTx_PollProgressAndRepair", func(t *testing.T) { testKnownTxPollProgress(t, factory) })
+	t.Run("KnownTx_BulkMutatorsOverlappingTxIDs", func(t *testing.T) { testKnownTxBulkOverlap(t, factory) })
 	t.Run("SyncState_RoundTrip", func(t *testing.T) { testSyncState(t, factory) })
 	t.Run("KeyValue", func(t *testing.T) { testKeyValue(t, factory) })
 	t.Run("Certificates", func(t *testing.T) { testCertificates(t, factory) })
@@ -474,6 +476,152 @@ func knownTxIDs(rows []metastore.KnownTx) []string {
 		out[i] = r.TxID
 	}
 	return out
+}
+
+// testKnownTxPollProgress is the repository-level regression test for the
+// stranded-transaction incident: a 30-minute 1000-TPS run left 23,745 known txs
+// with an EMPTY arcade_status and the count never drained, because the poll
+// ordered its work list by updated_at and a row it could not apply wrote nothing
+// — so the same head rows were re-selected every single tick and everything
+// behind them was never SELECTed at all.
+//
+// It asserts the two halves of the fix:
+//
+//   - PROGRESS: with more rows than the batch limit and NOTHING ever applied,
+//     consecutive ticks must hand back rows behind the head (MarkPolled records
+//     the attempt; the finders order by that stamp), so every row is reached.
+//   - REPAIR: a row with a perfectly good local status but no arcade status is
+//     findable by its own query and leaves that list once arcade's status lands.
+func testKnownTxPollProgress(t *testing.T, factory storeFactory) {
+	ctx := context.Background()
+	clock := &manualClock{t: baseTime}
+	s := factory(t, metastore.WithClock(clock.now))
+
+	const (
+		rows  = 5
+		batch = 2
+		ticks = 3 // ticks*batch >= rows: enough to reach every row exactly once
+	)
+	txids := make([]string, 0, rows)
+	for range rows {
+		id := randTxID(t)
+		require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{TxID: id, Status: wdk.ProvenTxStatusUnconfirmed}))
+		txids = append(txids, id)
+	}
+	cutoff := baseTime.Add(24 * time.Hour) // every row is "stale"
+
+	selected := map[string]int{}
+	var head []string
+	for tick := range ticks {
+		got, fErr := s.KnownTx().FindByStatusOlderThan(ctx, cutoff, batch, wdk.ProvenTxStatusUnconfirmed)
+		require.NoError(t, fErr)
+		require.Len(t, got, batch, "tick %d must select a full batch", tick)
+		ids := knownTxIDs(got)
+		if tick == 0 {
+			head = ids
+		} else {
+			require.NotEqual(t, head, ids,
+				"tick %d re-selected the head batch: the poll is not making progress and the backlog is frozen", tick)
+		}
+		for _, id := range ids {
+			selected[id]++
+		}
+		// The poll applied NOTHING (no status was written) — it only records that
+		// it attempted these rows. That alone must be enough to advance.
+		require.NoError(t, s.KnownTx().MarkPolled(ctx, ids))
+		clock.advance(time.Minute)
+	}
+	require.Len(t, selected, rows,
+		"%d ticks of %d must reach all %d rows; a shorter reach means the head is starving the tail", ticks, batch, rows)
+
+	// MarkPolled is an ATTEMPT stamp, not a state change: updated_at must not move
+	// (the resend grace and the staleness cutoff both read it as "last changed").
+	after, found, err := s.KnownTx().FindByTxID(ctx, txids[0])
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, baseTime.UTC(), after.UpdatedAt.UTC(), "MarkPolled must not touch updated_at")
+
+	// --- repair list -------------------------------------------------------
+	stranded, err := s.KnownTx().FindMissingArcadeStatus(ctx, cutoff, rows, wdk.ProvenTxStatusUnconfirmed)
+	require.NoError(t, err)
+	require.ElementsMatch(t, txids, knownTxIDs(stranded), "every row is diverged: none ever got an arcade status")
+
+	n, err := s.KnownTx().CountMissingArcadeStatus(ctx, wdk.ProvenTxStatusUnconfirmed)
+	require.NoError(t, err)
+	require.Equal(t, rows, n)
+
+	// Once arcade's status lands, the row is repaired and leaves the list.
+	require.NoError(t, s.KnownTx().SetArcadeStatus(ctx, txids[0], "MINED"))
+	stranded, err = s.KnownTx().FindMissingArcadeStatus(ctx, cutoff, rows, wdk.ProvenTxStatusUnconfirmed)
+	require.NoError(t, err)
+	require.NotContains(t, knownTxIDs(stranded), txids[0], "a repaired row leaves the repair list")
+	require.Len(t, stranded, rows-1)
+
+	// An empty-string arcade status is "missing" exactly like NULL.
+	require.NoError(t, s.KnownTx().SetArcadeStatus(ctx, txids[0], ""))
+	stranded, err = s.KnownTx().FindMissingArcadeStatus(ctx, cutoff, rows, wdk.ProvenTxStatusUnconfirmed)
+	require.NoError(t, err)
+	require.Contains(t, knownTxIDs(stranded), txids[0], "an empty arcade status counts as missing, like NULL")
+
+	// A terminal row is out of scope for the repair sweep (it is not pollable).
+	require.NoError(t, s.KnownTx().UpdateStatus(ctx, txids[1], wdk.ProvenTxStatusCompleted))
+	stranded, err = s.KnownTx().FindMissingArcadeStatus(ctx, cutoff, rows, wdk.ProvenTxStatusUnconfirmed)
+	require.NoError(t, err)
+	require.NotContains(t, knownTxIDs(stranded), txids[1])
+}
+
+// testKnownTxBulkOverlap drives the bulk mutators concurrently over OVERLAPPING
+// txid sets — the shape that deadlocked in production (SQLSTATE 40P01) when each
+// statement was free to lock its rows in arrival order. With every set-based
+// mutator binding and locking in ascending storage-txid order a lock-order
+// inversion is impossible, so all of these must complete cleanly.
+func testKnownTxBulkOverlap(t *testing.T, factory storeFactory) {
+	ctx := context.Background()
+	s := factory(t)
+
+	const rows = 24
+	txids := make([]string, 0, rows)
+	for range rows {
+		id := randTxID(t)
+		require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{TxID: id, Status: wdk.ProvenTxStatusUnconfirmed}))
+		txids = append(txids, id)
+	}
+
+	// Two writers over sets that overlap in the middle, each presenting its half
+	// in the OPPOSITE arrival order — the classic inversion.
+	forward := txids[:16]
+	reverse := make([]string, 0, 16)
+	for i := len(txids) - 1; i >= 8; i-- {
+		reverse = append(reverse, txids[i])
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i, work := range []func() error{
+		func() error { return s.KnownTx().BulkSetArcadeStatus(ctx, forward, "SEEN_ON_NETWORK") },
+		func() error { return s.KnownTx().BulkSetArcadeStatus(ctx, reverse, "SEEN_ON_NETWORK") },
+		func() error { return s.KnownTx().MarkPolled(ctx, forward) },
+		func() error { return s.KnownTx().MarkPolled(ctx, reverse) },
+	} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = work()
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "concurrent bulk mutator %d", i)
+	}
+
+	// And the writes landed: every txid carries the arcade status.
+	for _, id := range txids {
+		kt, found, err := s.KnownTx().FindByTxID(ctx, id)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.NotNil(t, kt.ArcadeStatus, "txid %s", id)
+		require.Equal(t, "SEEN_ON_NETWORK", *kt.ArcadeStatus)
+	}
 }
 
 func testSyncState(t *testing.T, factory storeFactory) {

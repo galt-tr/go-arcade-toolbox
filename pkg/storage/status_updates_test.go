@@ -10,6 +10,7 @@ package storage_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -582,6 +583,97 @@ func TestSynchronizeTransactionStatuses_PromotesMined(t *testing.T) {
 	require.NoError(t, h.p.SynchronizeTransactionStatuses(ctx, 10))
 
 	require.Equal(t, wdk.TxStatusCompleted, h.txStatus(txid))
+	require.Equal(t, utxostore.TierMined, h.tier(op))
+}
+
+// TestSynchronizeTransactionStatuses_NeverStrandsBehindTheHead is THE regression
+// test for the 2026-08-10 incident: after a 30-minute 1000-TPS run, 23,745
+// transactions sat with an empty arcade_status and the count never moved, while
+// arcade (the source of truth) had every one of them as MINED. The cause was
+// head-of-line blocking in this sweep — it ordered its work list by updated_at,
+// and a row it could not apply wrote nothing, so the same head rows were
+// re-selected on every tick and the rest of the backlog was never SELECTed.
+//
+// Here the poll can NEVER apply anything (GetTx always fails), so progress has
+// to come from recording the ATTEMPT alone: with more rows than the batch limit,
+// consecutive ticks must reach the rows BEHIND the head.
+func TestSynchronizeTransactionStatuses_NeverStrandsBehindTheHead(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	const (
+		rows  = 6
+		limit = 2
+		ticks = 3 // ticks*limit == rows: a perfect round-robin reaches every row
+	)
+	for i := range rows {
+		h.seedChangeTx(newTxID(byte(0xA0+i)), wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 5000, utxostore.TierUnproven)
+	}
+
+	var mu sync.Mutex
+	polled := map[string]int{}
+	h.oracle.getTx = func(_ context.Context, id string) (*arcade.TxRecord, error) {
+		mu.Lock()
+		polled[id]++
+		mu.Unlock()
+		return nil, fmt.Errorf("arcade unreachable")
+	}
+
+	h.now = h.now.Add(5 * time.Minute) // every row is now stale enough to poll
+	for range ticks {
+		require.NoError(t, h.p.SynchronizeTransactionStatuses(ctx, limit))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, polled, rows,
+		"%d ticks of %d reached only %d of %d rows: the rows behind the head are stranded", ticks, limit, len(polled), rows)
+}
+
+// TestSynchronizeTransactionStatuses_RepairsMissingArcadeStatus proves the
+// dedicated repair path: a transaction with a perfectly valid LOCAL status but
+// NO arcade status is reached and repaired even when the general staleness work
+// list is already full of rows that sort ahead of it. That is the shape of the
+// 23,745 diverged rows — without its own query (its own index, its own budget) a
+// stranded row sitting behind a saturated backlog is never picked up.
+func TestSynchronizeTransactionStatuses_RepairsMissingArcadeStatus(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	// Four decoys that ALREADY have an arcade status. They are seeded first (so
+	// they sort ahead on updated_at) and there are more of them than the batch
+	// limit, so they alone consume the whole staleness page.
+	const limit = 2
+	for i := range 4 {
+		decoy := newTxID(byte(0x10 + i))
+		h.seedChangeTx(decoy, wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 5000, utxostore.TierUnproven)
+		require.NoError(t, h.meta.KnownTx().SetArcadeStatus(ctx, decoy, string(arcade.StatusSeenOnNetwork)))
+	}
+
+	// The stranded row: seeded last (newest updated_at) with the highest txid, so
+	// it is dead last in the staleness order and unreachable at limit=2.
+	stranded := newTxID(0xFE)
+	op := h.seedChangeTx(stranded, wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 7000, utxostore.TierUnproven)
+	require.Nil(t, h.knownTx(stranded).ArcadeStatus, "the stranded row starts with no arcade status")
+
+	const height = uint32(890000)
+	rec, root := minedRecord(t, stranded, height)
+	h.hdrs.register(height, root)
+	h.oracle.getTx = func(_ context.Context, id string) (*arcade.TxRecord, error) {
+		if id == stranded {
+			r := rec
+			return &r, nil
+		}
+		return &arcade.TxRecord{TxID: id, Status: arcade.StatusSeenOnNetwork}, nil
+	}
+
+	h.now = h.now.Add(5 * time.Minute)
+	require.NoError(t, h.p.SynchronizeTransactionStatuses(ctx, limit))
+
+	kt := h.knownTx(stranded)
+	require.NotNil(t, kt.ArcadeStatus, "the repair sweep must reach a row with no arcade status in ONE tick")
+	require.Equal(t, string(arcade.StatusMined), *kt.ArcadeStatus)
+	require.Equal(t, wdk.TxStatusCompleted, h.txStatus(stranded))
 	require.Equal(t, utxostore.TierMined, h.tier(op))
 }
 

@@ -314,21 +314,20 @@ func (r TransactionsRepo) ClearInputBEEFByTxID(ctx context.Context, txid string)
 // [TransactionsRepo.UpdateStatusByTxID] — but as ONE set-based UPDATE with no
 // ErrStatusUpdateSkipped bookkeeping: rows that fail the precondition are simply
 // not updated, which is how the async batch applier tolerates the skip.
+//
+// The txids are bound (and, on PostgreSQL, locked) in ascending storage order —
+// see lockorder.go. transactions.txid is NOT unique (one txid can have a row per
+// user), so the lock ordering falls back to the primary key to stay total.
 func (r TransactionsRepo) BulkUpdateStatusByTxIDs(ctx context.Context, txids []string, status wdk.TxStatus, expectedCurrent ...wdk.TxStatus) error {
 	if len(txids) == 0 {
 		return nil
 	}
-	args := []any{string(status), r.s.encTime(r.s.now())}
-	ph := make([]string, 0, len(txids))
-	for _, t := range txids {
-		raw, err := encTxID(t)
-		if err != nil {
-			return err
-		}
-		ph = append(ph, "?")
-		args = append(args, raw)
+	ids, err := txidArgs(txids)
+	if err != nil {
+		return err
 	}
-	conds := []string{"txid IN (" + joinComma(ph) + ")"}
+	args := append([]any{string(status), r.s.encTime(r.s.now())}, ids...)
+	conds := []string{r.s.txidLockOrderedIn("transactions", "txid, transaction_id", len(ids))}
 	if len(expectedCurrent) > 0 {
 		conds = append(conds, "status IN ("+inPlaceholders(len(expectedCurrent))+")")
 		for _, st := range expectedCurrent {
@@ -345,23 +344,21 @@ func (r TransactionsRepo) BulkUpdateStatusByTxIDs(ctx context.Context, txids []s
 // BulkClearInputBEEFByTxIDs drops the stored input BEEF for every transaction
 // row whose txid is in txids (the `input_beef IS NOT NULL` guard makes it a
 // cheap no-op for rows already cleared). It is the set-based form of
-// [TransactionsRepo.ClearInputBEEFByTxID] used by the mined batch writer.
+// [TransactionsRepo.ClearInputBEEFByTxID] used by the mined batch writer. The
+// txids are bound (and, on PostgreSQL, locked) in ascending storage order — see
+// lockorder.go.
 func (r TransactionsRepo) BulkClearInputBEEFByTxIDs(ctx context.Context, txids []string) error {
 	if len(txids) == 0 {
 		return nil
 	}
-	args := []any{r.s.encTime(r.s.now())}
-	ph := make([]string, 0, len(txids))
-	for _, t := range txids {
-		raw, err := encTxID(t)
-		if err != nil {
-			return err
-		}
-		ph = append(ph, "?")
-		args = append(args, raw)
+	ids, err := txidArgs(txids)
+	if err != nil {
+		return err
 	}
-	q := r.s.rebind("UPDATE transactions SET input_beef = NULL, updated_at = ? WHERE txid IN (" +
-		joinComma(ph) + ") AND input_beef IS NOT NULL")
+	args := append([]any{r.s.encTime(r.s.now())}, ids...)
+	q := r.s.rebind("UPDATE transactions SET input_beef = NULL, updated_at = ? WHERE " +
+		r.s.txidLockOrderedIn("transactions", "txid, transaction_id", len(ids)) +
+		" AND input_beef IS NOT NULL")
 	if _, err := r.s.execer(ctx).ExecContext(ctx, q, args...); err != nil {
 		return fmt.Errorf("metastore: bulk clear input beef: %w", err)
 	}

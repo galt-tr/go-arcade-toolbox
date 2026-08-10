@@ -108,6 +108,26 @@ poll fallback and the source of terminal history — it returns the current stat
 plus `blockHash`/`blockHeight`, the merkle path (BRC-74 BUMP), the raw tx, and
 any competing txs.
 
+The poll is a genuine repair path, not just a staleness sweep, and it rests on
+two invariants:
+
+- **It always makes progress.** Every selected row is stamped `last_polled_at`
+  the moment it is picked up — applied or not — and the work lists are ordered by
+  that stamp. Without it, a row the poll cannot apply writes nothing, keeps its
+  `updated_at`, and is re-selected at the head of every tick, hiding the whole
+  backlog behind it. (That is exactly how a 1000-TPS run left 23,745
+  transactions with an empty `arcade_status` and a count that never drained.)
+- **A transaction with no `arcade_status` is always reachable.** Arcade has a
+  status for every transaction it has seen, so an empty local `arcade_status` is
+  proof of local divergence. Those rows get their own query, their own partial
+  index and their own per-tick budget (`FindMissingArcadeStatus`) instead of
+  competing for a place in the general staleness page, which at high throughput
+  is always longer than one batch limit.
+
+Set `Arcade.CallbackToken` so the SSE stream is scoped to this wallet instance:
+arcade uses it to identify the consumer, which is what lets its mid-stream
+catch-up engage on reconnect instead of leaving the poll to do all the repair.
+
 ## ChainTracks (headers)
 
 The headers client (`pkg/headers`) talks to ChainTracks under

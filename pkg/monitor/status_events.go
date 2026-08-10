@@ -2,6 +2,8 @@ package monitor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"strings"
@@ -39,16 +41,30 @@ const (
 	// without onEvent blocking — a blocked reader stops draining the socket, so
 	// arcade back-pressures and SEEN/MINED events are missed entirely.
 	applyQueueSize = 16384
-	// applyShards is the number of parallel apply workers a batch is fanned out
-	// across, keyed by txid so a given tx's events always land on the same shard
-	// (preserving the per-txid arrival order the terminal/lattice guards need)
-	// while distinct txids apply concurrently.
-	applyShards = 8
 
 	// applyDeadlockAttempts bounds the retry of a transient (deadlock/lock)
 	// apply failure; the victim is safe to retry immediately.
 	applyDeadlockAttempts = 3
 )
+
+// applyShards is the number of parallel apply workers a batch is fanned out
+// across, keyed by txid so a given tx's events always land on the same shard
+// (preserving the per-txid arrival order the terminal/lattice guards need) while
+// distinct txids apply concurrently.
+//
+// It reads the value [WithApplyConcurrency] configured. This used to be a
+// hardcoded const, which silently made the option DEAD: a deployment that raised
+// it still applied through 8 workers, the 16384-slot hand-off queue saturated,
+// onEvent blocked the SSE reader, and arcade — seeing a slow client — DROPPED our
+// events outright (~25k/s of "dropped events for slow SSE client"). Those dropped
+// events are the origin of the stranded, never-statused transactions; the repair
+// poll in storage is the safety net, this is the fix.
+func (d *Daemon) applyShards() int {
+	if d.applyConcurrency > 0 {
+		return d.applyConcurrency
+	}
+	return defaultApplyWorkers
+}
 
 // handleStatusEvents consumes the arcade status SSE stream and applies each
 // event through storage.ApplyStatusUpdate, persisting a replay cursor after
@@ -146,8 +162,22 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 
 // applyStatusBatch hands the whole batch to storage.ApplyStatusBatch (records in
 // ARRIVAL ORDER), then persists the replay cursor once — to the newest event
-// that carries an id. A failed batch never blocks the cursor (replaying it is
-// safe; the polls are the safety net), so the cursor still advances.
+// that carries an id — but ONLY when the whole batch applied.
+//
+// CURSOR HOLD ON FAILURE. This used to advance the cursor unconditionally, on
+// the theory that "replaying is safe and the polls are the safety net". They
+// were not: the poll could not reach a row that never got a status (it ordered
+// by updated_at and a failed apply writes nothing), so a failed batch's events
+// were gone for good and its transactions diverged from arcade permanently.
+//
+// Of the two ways to fix that — hold the cursor at the last FULLY-applied event,
+// or persist the failed event ids somewhere for a repair pass — holding the
+// cursor is the one that cannot lose events: it needs no new durable store, and
+// it reuses the guarantee we already depend on (arcade replays everything after
+// Last-Event-ID, and every apply is idempotent). A dead-letter list, by
+// contrast, is itself a write that can fail — leaving nothing at all. The cost
+// of holding is bounded and benign: a reconnect re-delivers events we may have
+// already applied, which is a no-op.
 //
 // The per-txid arrival-order serialization that the terminal/lattice guards rely
 // on is now enforced inside ApplyStatusBatch (it collapses a txid's records to
@@ -160,9 +190,24 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 		records[i] = batch[i].Record
 	}
 	applyStart := time.Now()
-	d.applyRecords(ctx, records)
+	applyErr := d.applyRecords(ctx, records)
 	applyDone := time.Now()
 	d.traceBatch(batch, applyStart, applyDone)
+
+	if applyErr != nil {
+		sample := make([]string, 0, txidSampleSize)
+		for i := range records {
+			if len(sample) == txidSampleSize {
+				break
+			}
+			sample = append(sample, records[i].TxID)
+		}
+		d.logger.ErrorContext(ctx, "status batch apply failed; holding SSE replay cursor so no event is lost",
+			slog.Int("batchSize", len(records)),
+			slog.Any("sampleTxIDs", sample),
+			slog.String("error", applyErr.Error()))
+		return
+	}
 
 	// Persist the cursor to the newest event that actually carries an id: an
 	// empty id must never overwrite a good cursor with "" (a restart would then
@@ -254,47 +299,57 @@ func tsOrEmpty(t time.Time) string {
 	return t.Format(time.RFC3339Nano)
 }
 
-// applyRecords applies one batch by fanning it out across applyShards workers,
-// keyed by txid: a given txid's records always go to the same shard (so their
-// arrival order — which the terminal/lattice guards depend on — is preserved),
-// while distinct txids apply concurrently. Shards hold disjoint txid sets, so
-// their ApplyStatusBatch transactions never conflict. This multiplies apply
-// throughput so the reader's hand-off buffer drains fast enough that onEvent
-// never blocks (a blocked reader = missed SSE events). A single shard, or a
-// batch too small to shard, applies inline without spawning goroutines.
-func (d *Daemon) applyRecords(ctx context.Context, records []arcade.TxRecord) {
+// txidSampleSize caps how many txids a diagnostic log line carries: enough to
+// go look one up, never enough to blow up the log at 1000 TPS.
+const txidSampleSize = 5
+
+// applyRecords applies one batch by fanning it out across [Daemon.applyShards]
+// workers, keyed by txid: a given txid's records always go to the same shard (so
+// their arrival order — which the terminal/lattice guards depend on — is
+// preserved), while distinct txids apply concurrently. Shards hold disjoint txid
+// sets, so their ApplyStatusBatch transactions never conflict. This multiplies
+// apply throughput so the reader's hand-off buffer drains fast enough that
+// onEvent never blocks (a blocked reader = missed SSE events). A single shard,
+// or a batch too small to shard, applies inline without spawning goroutines.
+//
+// It returns the joined error of every shard that could not be applied, so the
+// caller can hold the replay cursor rather than skipping past lost events.
+func (d *Daemon) applyRecords(ctx context.Context, records []arcade.TxRecord) error {
 	if len(records) == 0 {
-		return
+		return nil
 	}
-	if len(records) <= applyBatchMax/applyShards || applyShards <= 1 {
-		d.applyShard(ctx, records)
-		return
+	width := d.applyShards()
+	if len(records) <= applyBatchMax/width || width <= 1 {
+		return d.applyShard(ctx, records)
 	}
 
-	shards := make([][]arcade.TxRecord, applyShards)
+	shards := make([][]arcade.TxRecord, width)
 	for _, r := range records {
-		s := shardOf(r.TxID)
+		s := shardOf(r.TxID, width)
 		shards[s] = append(shards[s], r)
 	}
+	errs := make([]error, width)
 	var wg sync.WaitGroup
 	for i := range shards {
 		if len(shards[i]) == 0 {
 			continue
 		}
 		wg.Add(1)
-		go func(recs []arcade.TxRecord) {
+		go func(idx int, recs []arcade.TxRecord) {
 			defer wg.Done()
-			d.applyShard(ctx, recs)
-		}(shards[i])
+			errs[idx] = d.applyShard(ctx, recs)
+		}(i, shards[i])
 	}
 	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // applyShard applies one shard's records (a disjoint txid set) through
 // storage.ApplyStatusBatch, retrying transient DB contention — the batch is
-// idempotent so retry is safe. Other failures are logged and swallowed (replay
-// is safe; the polls are the safety net).
-func (d *Daemon) applyShard(ctx context.Context, records []arcade.TxRecord) {
+// idempotent so retry is safe. A shard that still fails is logged and its error
+// returned: the caller holds the replay cursor on it, because the events in a
+// failed shard are otherwise gone (arcade never re-sends past Last-Event-ID).
+func (d *Daemon) applyShard(ctx context.Context, records []arcade.TxRecord) error {
 	var err error
 	for range applyDeadlockAttempts {
 		err = d.storage.ApplyStatusBatch(ctx, records)
@@ -306,16 +361,19 @@ func (d *Daemon) applyShard(ctx context.Context, records []arcade.TxRecord) {
 		d.logger.ErrorContext(ctx, "ApplyStatusBatch failed",
 			slog.Int("batchSize", len(records)),
 			slog.String("error", err.Error()))
+		return fmt.Errorf("apply shard of %d records: %w", len(records), err)
 	}
+	return nil
 }
 
-// shardOf maps a txid to one of applyShards buckets. FNV-1a over the txid string
+// shardOf maps a txid to one of width buckets. FNV-1a over the txid string
 // spreads txids evenly and is stable, so every event for a txid routes to the
 // same shard within a batch.
-func shardOf(txid string) int {
+func shardOf(txid string, width int) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(txid))
-	return int(h.Sum32() % applyShards)
+	//nolint:gosec // width is a small positive worker count.
+	return int(h.Sum32() % uint32(width))
 }
 
 // isTransientDBError reports whether err looks like retryable DB contention
