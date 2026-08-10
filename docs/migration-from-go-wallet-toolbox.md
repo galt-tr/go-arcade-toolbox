@@ -77,7 +77,9 @@ These compile identically but *behave* differently — read them:
   is replaced by the reject→release reconciler: async-rejected transactions have
   their inputs auto-released **after two-pass verification**, with a double-spend
   winner-union rule. No manual unfail, no UTXO leak. See
-  [arcade-integration](arcade-integration.md#the-rejectrelease-reconciler).
+  [reject-release-vs-unfail](reject-release-vs-unfail.md) for the full comparison
+  and [arcade-integration](arcade-integration.md#the-rejectrelease-reconciler)
+  for the guard rules.
 - **ChainTracks config key `remote_url` → `url`.** The type is renamed
   `ChaintracksClient` → `ChainTracks`, the embedded/remote `mode` toggle and its
   `storage_path`/`bootstrap_*`/`p2p_*` keys are removed, and the single URL key is

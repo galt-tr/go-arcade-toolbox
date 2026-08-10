@@ -78,6 +78,10 @@ func withRawTx(raw []byte) func(*arcade.TxRecord) {
 	return func(r *arcade.TxRecord) { r.RawTx = raw }
 }
 
+func withExtraInfo(s string) func(*arcade.TxRecord) {
+	return func(r *arcade.TxRecord) { r.ExtraInfo = s }
+}
+
 // --- harness ---------------------------------------------------------------
 
 type reconStack struct {
@@ -383,6 +387,100 @@ func TestReconciler_FalsePositive_NeverReleases(t *testing.T) {
 	// (b) PENDING_RETRY: still suspect, input untouched.
 	require.Equal(t, metastore.KnownTxStatusSuspectFailed, h.knownTx(retryTxid).Status)
 	h.requireSpentBy(inRetry, retryTxid, "ambiguous tx input must NOT be released")
+}
+
+// --- 2b. REJECTED + UTXO_SPENT ExtraInfo → partial release (winner-union) --
+
+// TestReconciler_Rejected_UTXOSpent_PartialRelease pins the production case
+// where Arcade reports pure REJECTED (not DOUBLE_SPEND_ATTEMPTED) but ExtraInfo
+// asserts a concrete outpoint is already spent by another tx. Blind two-pass
+// release would free that outpoint and re-fund reject churn; we must hold the
+// spent input and only free residual inputs (same invariant as winner-union).
+func TestReconciler_Rejected_UTXOSpent_PartialRelease(t *testing.T) {
+	h := newReconStack(t)
+	txid := newTxID(0xC1)
+	inSpent := opFor(0x51, 2) // Arcade says this one is already spent on chain
+	inFree := opFor(0x52, 0)  // not mentioned → safe residual
+
+	// Build ExtraInfo in the live Teranode shape (outpoint + spender txid).
+	extra := "UTXO_SPENT (70): " + inSpent.TxID.String() + ":2 utxo already spent by tx " +
+		newTxID(0xEE) + "[0]\n"
+
+	changeOp := h.seedKnownTx(txid, []utxostore.Outpoint{inSpent, inFree}, 2500)
+	h.mintAndSpendFunding(inSpent, txid)
+	h.mintAndSpendFunding(inFree, txid)
+	h.markSuspect(txid, arcade.StatusRejected, nil)
+	h.scriptTx(txid, arcade.StatusRejected, withExtraInfo(extra))
+
+	h.clock.Advance(reconGrace + time.Second)
+	// Pass 1: stamp only.
+	r1 := h.verify()
+	require.Equal(t, 0, r1.Released)
+	require.Equal(t, 1, r1.Ambiguous)
+	h.requireSpentBy(inSpent, txid, "no release on pass 1")
+	h.requireSpentBy(inFree, txid, "no release on pass 1")
+
+	// Pass 2: partial release.
+	h.clock.Advance(reconGrace + time.Second)
+	r2 := h.verify()
+	require.Equal(t, 1, r2.Released)
+	h.requireClaimable(inFree, "residual input not named by UTXO_SPENT is released")
+	h.requireSpentBy(inSpent, txid, "UTXO_SPENT input must NOT re-enter the claimable pool")
+	require.Equal(t, wdk.ProvenTxStatusDoubleSpend, h.knownTx(txid).Status,
+		"spend-conflict REJECTED terminalizes as doubleSpend, not invalid")
+	h.requireRemoved(changeOp, "phantom change still removed")
+}
+
+// TestReconciler_Rejected_UTXOSpent_AllInputsHeld proves that when ExtraInfo
+// covers every funding input, we still finalize the suspect (remove change)
+// but release zero coins back to the pool.
+func TestReconciler_Rejected_UTXOSpent_AllInputsHeld(t *testing.T) {
+	h := newReconStack(t)
+	txid := newTxID(0xC2)
+	inA := opFor(0x53, 0)
+	inB := opFor(0x54, 1)
+
+	extra := "UTXO_SPENT (70): " + inA.TxID.String() + ":0 already spent\n" +
+		"UTXO_SPENT (70): " + inB.TxID.String() + ":1 already spent\n"
+
+	changeOp := h.seedKnownTx(txid, []utxostore.Outpoint{inA, inB}, 1000)
+	h.mintAndSpendFunding(inA, txid)
+	h.mintAndSpendFunding(inB, txid)
+	h.markSuspect(txid, arcade.StatusRejected, nil)
+	h.scriptTx(txid, arcade.StatusRejected, withExtraInfo(extra))
+
+	h.clock.Advance(reconGrace + time.Second)
+	_ = h.verify() // pass 1
+	h.clock.Advance(reconGrace + time.Second)
+	r2 := h.verify()
+	require.Equal(t, 1, r2.Released, "release still runs to terminalize + remove change")
+	h.requireSpentBy(inA, txid, "held spent A")
+	h.requireSpentBy(inB, txid, "held spent B")
+	h.requireRemoved(changeOp, "change removed even when no residual inputs")
+	require.Equal(t, wdk.TxStatusFailed, h.txStatus(txid))
+}
+
+// TestReconciler_Rejected_ConflictClass_NoParsedSpent_Defers: ExtraInfo looks
+// like a spend conflict but names no outpoints and CompetingTxs are empty /
+// not mined — must NOT release-all (the old pure-REJECTED bug).
+func TestReconciler_Rejected_ConflictClass_NoParsedSpent_Defers(t *testing.T) {
+	h := newReconStack(t)
+	txid := newTxID(0xC3)
+	inA := opFor(0x55, 0)
+
+	h.seedKnownTx(txid, []utxostore.Outpoint{inA}, 0)
+	h.mintAndSpendFunding(inA, txid)
+	h.markSuspect(txid, arcade.StatusRejected, nil)
+	// Conflict-class keyword but no outpoint / spender we can act on.
+	h.scriptTx(txid, arcade.StatusRejected, withExtraInfo("TX_CONFLICTING (36): conflict detected"))
+
+	h.clock.Advance(reconGrace + time.Second)
+	_ = h.verify()
+	h.clock.Advance(reconGrace + time.Second)
+	r2 := h.verify()
+	require.Equal(t, 0, r2.Released, "must not free inputs without a proven spent set")
+	require.Equal(t, metastore.KnownTxStatusSuspectFailed, h.knownTx(txid).Status)
+	h.requireSpentBy(inA, txid, "input stays held under conflict ambiguity")
 }
 
 // --- 3. double-spend winner rule -------------------------------------------

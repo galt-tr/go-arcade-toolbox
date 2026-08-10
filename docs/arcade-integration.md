@@ -128,6 +128,14 @@ against the headers client, never from the stream alone.
 
 ## The reject→release reconciler
 
+> **Why this exists (vs go-wallet-toolbox unfail):** see the full comparison in
+> [reject-release-vs-unfail.md](reject-release-vs-unfail.md). Short version:
+> unfail is a manual, MerklePath-centric recovery of already-failed txs;
+> reject→release is an automatic two-phase quarantine that only frees inputs
+> after Arcade re-verification (two-pass grace for pure rejects, winner-union
+> for double-spends), so false-positive `REJECTED` statuses cannot cause a
+> wallet-induced double-spend and UTXO leaks no longer wait on an operator.
+
 Under the async model a rejection can be a **transient false positive**, so
 releasing a rejected transaction's inputs eagerly risks resurrecting a still-live
 input into a real double spend. The reconciler (`pkg/storage/reconciler.go`,
@@ -147,17 +155,23 @@ Three guard rules make this safe:
    the second, default grace 90s). A transient `REJECTED` that recovers to a
    `SEEN_*`/`ACCEPTED`/`MINED` status in between is caught by the recovered branch
    and **nothing is released** — its frozen change is unfrozen and it re-enters
-   the normal apply path.
+   the normal apply path. “Pure” means ExtraInfo is **not** a spend-conflict
+   class (fee/script/policy): every funding input is assumed still free on chain
+   and may be returned to the pool.
 
-2. **Double-spend winner-union rule (`DOUBLE_SPEND_ATTEMPTED`).** Inputs are
-   released only once some competing tx is itself terminal-successful
-   (`MINED`/`IMMUTABLE`), i.e. our inputs are provably consumed by a winner. Then
-   only the inputs the winner did **not** take are released; winner-consumed
-   inputs stay recorded as spent. Crucially the reconciler **unions the inputs of
-   *every* confirmed winner** — two competitors can each mine a disjoint subset of
-   our inputs, and stopping at the first winner would resurrect the other
-   winner's input. If any confirmed winner's rawTx is unreadable, the whole
-   release is deferred (never release on an unknown consumption set).
+2. **Double-spend / spend-conflict winner-union** (`DOUBLE_SPEND_ATTEMPTED`, or
+   `REJECTED` whose ExtraInfo / `competingTxs` / ARC status code assert a spent
+   input — e.g. `UTXO_SPENT (70): <txid>:<vout> … spent by tx <spender>` after
+   Arcade surfaces Teranode failure lists). Inputs are **not** all freed. The
+   reconciler unions:
+   - outpoints Arcade’s ExtraInfo asserts are already spent (trusted without
+     requiring the spender to be MINED in our local view), and
+   - inputs of every `CompetingTxs` / ExtraInfo spender that is itself
+     terminal-successful (`MINED`/`IMMUTABLE`) with a readable rawTx.
+   Only residual inputs (in neither set) are released; spent inputs stay spent.
+   If conflict is detected but no spent set can be proven, release is **deferred**
+   (safe bias → `stuck`), never “free everything.” If any confirmed winner’s
+   rawTx is unreadable, the whole residual release is deferred.
 
 3. **No-double-release CAS.** The terminal status flip
    (`suspectFailed → invalidTx/doubleSpend`) is a positive compare-and-set, so a

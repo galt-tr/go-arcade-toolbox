@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reject→release vs unfail — go-arcade-toolbox</title>
+<style>
+  :root {
+    --bg: #0f1219;
+    --bg-elevated: #171b26;
+    --bg-code: #0a0d13;
+    --border: #2a3142;
+    --border-soft: #1e2433;
+    --text: #e8ecf4;
+    --text-muted: #9aa3b5;
+    --text-dim: #6b7385;
+    --accent: #5b9dff;
+    --accent-soft: rgba(91, 157, 255, 0.12);
+    --good: #3dd68c;
+    --good-soft: rgba(61, 214, 140, 0.12);
+    --warn: #f0b429;
+    --warn-soft: rgba(240, 180, 41, 0.12);
+    --bad: #f07178;
+    --bad-soft: rgba(240, 113, 120, 0.12);
+    --purple: #c792ea;
+    --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "SF Mono", "Cascadia Code", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+    --radius: 10px;
+    --max: 860px;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 1.65;
+    color: var(--text);
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(91, 157, 255, 0.08), transparent 50%),
+      radial-gradient(900px 500px at 100% 0%, rgba(61, 214, 140, 0.05), transparent 45%),
+      var(--bg);
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+
+  header.hero {
+    margin-bottom: 2.25rem;
+    padding-bottom: 1.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid rgba(91, 157, 255, 0.25);
+    border-radius: 999px;
+    padding: 0.28rem 0.75rem;
+    margin-bottom: 1rem;
+  }
+  h1 {
+    font-size: clamp(1.75rem, 4vw, 2.35rem);
+    line-height: 1.2;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 0.85rem;
+  }
+  .lede {
+    font-size: 1.08rem;
+    color: var(--text-muted);
+    margin: 0 0 1.25rem;
+    max-width: 62ch;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .chip {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.55rem;
+  }
+
+  nav.toc {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.15rem 1.1rem;
+    margin-bottom: 2.5rem;
+  }
+  nav.toc h2 {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 0 0 0.65rem;
+    font-weight: 600;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.2rem;
+    columns: 1;
+  }
+  @media (min-width: 640px) {
+    nav.toc ol { columns: 2; column-gap: 1.5rem; }
+  }
+  nav.toc li {
+    margin: 0.2rem 0;
+    break-inside: avoid;
+    font-size: 0.92rem;
+  }
+  nav.toc a { color: var(--text-muted); }
+  nav.toc a:hover { color: var(--accent); }
+
+  section {
+    margin-bottom: 2.75rem;
+  }
+  h2 {
+    font-size: 1.4rem;
+    letter-spacing: -0.015em;
+    margin: 0 0 0.9rem;
+    padding-top: 0.25rem;
+    scroll-margin-top: 1rem;
+  }
+  h2 .num {
+    color: var(--text-dim);
+    font-weight: 600;
+    margin-right: 0.35rem;
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 0.6rem;
+    color: var(--text);
+  }
+  h4 {
+    font-size: 0.98rem;
+    margin: 1.25rem 0 0.5rem;
+    color: var(--text-muted);
+  }
+  p { margin: 0 0 0.9rem; }
+  strong { font-weight: 650; color: #fff; }
+  ul, ol { margin: 0 0 1rem; padding-left: 1.35rem; }
+  li { margin: 0.3rem 0; }
+  li::marker { color: var(--text-dim); }
+
+  .callout {
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    padding: 0.95rem 1.1rem;
+    margin: 1.1rem 0 1.25rem;
+  }
+  .callout.tension {
+    border-color: rgba(240, 180, 41, 0.35);
+    background: linear-gradient(135deg, var(--warn-soft), var(--bg-elevated));
+  }
+  .callout.good {
+    border-color: rgba(61, 214, 140, 0.35);
+    background: linear-gradient(135deg, var(--good-soft), var(--bg-elevated));
+  }
+  .callout.bad {
+    border-color: rgba(240, 113, 120, 0.35);
+    background: linear-gradient(135deg, var(--bad-soft), var(--bg-elevated));
+  }
+  .callout.accent {
+    border-color: rgba(91, 157, 255, 0.35);
+    background: linear-gradient(135deg, var(--accent-soft), var(--bg-elevated));
+  }
+  .callout .label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    margin-bottom: 0.35rem;
+  }
+  .callout.tension .label { color: var(--warn); }
+  .callout.good .label { color: var(--good); }
+  .callout.bad .label { color: var(--bad); }
+  .callout.accent .label { color: var(--accent); }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .grid-2 {
+    display: grid;
+    gap: 0.85rem;
+    margin: 1rem 0 1.25rem;
+  }
+  @media (min-width: 640px) {
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+  }
+  .card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+  }
+  .card h3 {
+    margin: 0 0 0.45rem;
+    font-size: 0.95rem;
+  }
+  .card p { margin: 0; font-size: 0.92rem; color: var(--text-muted); }
+  .card.risk-leak h3 { color: var(--warn); }
+  .card.risk-ds h3 { color: var(--bad); }
+
+  pre.flow {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.45;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    color: #c5cddc;
+    margin: 1rem 0 1.25rem;
+    white-space: pre;
+  }
+  pre.flow .ok { color: var(--good); }
+  pre.flow .warn { color: var(--warn); }
+  pre.flow .bad { color: var(--bad); }
+  pre.flow .dim { color: var(--text-dim); }
+  pre.flow .hi { color: var(--accent); }
+  pre.flow .purp { color: var(--purple); }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-soft);
+    border-radius: 4px;
+    padding: 0.08em 0.35em;
+    color: #d4daf0;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+    margin: 1rem 0 1.35rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    min-width: 520px;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.65rem 0.85rem;
+    border-bottom: 1px solid var(--border-soft);
+    vertical-align: top;
+  }
+  th {
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    font-weight: 650;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) td { background: rgba(255, 255, 255, 0.015); }
+  td.better { color: var(--good); }
+  .table-wrap.compare th:nth-child(3),
+  .table-wrap.compare td:nth-child(3) {
+    background: rgba(61, 214, 140, 0.04);
+  }
+
+  .phase {
+    border-left: 3px solid var(--accent);
+    padding: 0.15rem 0 0.15rem 1rem;
+    margin: 1rem 0 1.25rem;
+  }
+  .phase h4 {
+    margin-top: 0;
+    color: var(--accent);
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .core {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.15rem;
+    margin: 0.75rem 0;
+  }
+  .core h4 {
+    margin: 0 0 0.45rem;
+    color: var(--text);
+    font-size: 1rem;
+  }
+  .core .tag {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--purple);
+    background: rgba(199, 146, 234, 0.12);
+    border: 1px solid rgba(199, 146, 234, 0.25);
+    border-radius: 4px;
+    padding: 0.12rem 0.4rem;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+  }
+
+  .example {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.15rem;
+    margin: 0.85rem 0;
+  }
+  .example h4 {
+    margin: 0 0 0.55rem;
+    color: var(--text);
+  }
+  .example ol { margin-bottom: 0.65rem; }
+  .example .note {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-soft);
+    padding-top: 0.65rem;
+    margin-top: 0.35rem;
+  }
+
+  .summary {
+    background: linear-gradient(145deg, rgba(91, 157, 255, 0.1), rgba(61, 214, 140, 0.06));
+    border: 1px solid rgba(91, 157, 255, 0.28);
+    border-radius: var(--radius);
+    padding: 1.25rem 1.35rem;
+    font-size: 1.02rem;
+    line-height: 1.7;
+  }
+  .summary p { margin: 0; color: var(--text); }
+  .summary strong { color: #fff; }
+
+  footer {
+    margin-top: 3rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+  footer code { font-size: 0.8em; }
+
+  @media print {
+    body { background: #fff; color: #111; }
+    .wrap { max-width: none; padding: 0; }
+    .callout, .card, .core, .example, nav.toc, .table-wrap, pre.flow, .summary {
+      break-inside: avoid;
+      border-color: #ccc;
+      background: #f8f8f8;
+    }
+    a { color: #06c; }
+    th { background: #eee; color: #333; }
+    code { background: #eee; color: #111; border-color: #ddd; }
+    pre.flow { color: #222; background: #f4f4f4; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">go-arcade-toolbox · design note</div>
+  <h1>Reject→release vs unfail</h1>
+  <p class="lede">
+    How this toolbox recovers spendable inputs after a rejected transaction,
+    how that differs from the manual <strong>unfail</strong> model in
+    <code>go-wallet-toolbox</code>, and why reject→release is the safer default
+    for an Arcade-asynchronous wallet.
+  </p>
+  <div class="meta">
+    <span class="chip">Phase 1 · status_updates.go</span>
+    <span class="chip">Phase 2 · reconciler.go</span>
+    <span class="chip">monitor · reject_release</span>
+    <span class="chip">defaults · 60s / 90s / 24h</span>
+  </div>
+</header>
+
+<nav class="toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#problem">The problem both models solve</a></li>
+    <li><a href="#unfail">Old model: unfail</a></li>
+    <li><a href="#reject-release">New model: reject→release</a></li>
+    <li><a href="#side-by-side">Side-by-side</a></li>
+    <li><a href="#why-better">Why reject→release is better</a></li>
+    <li><a href="#limits">Honest limits</a></li>
+    <li><a href="#examples">Worked examples</a></li>
+    <li><a href="#migration">Migration notes</a></li>
+    <li><a href="#summary">One-paragraph summary</a></li>
+    <li><a href="#refs">References</a></li>
+  </ol>
+</nav>
+
+<!-- 1 -->
+<section id="problem">
+  <h2><span class="num">1.</span> The problem both models try to solve</h2>
+  <p>
+    A wallet that broadcasts a transaction has already <strong>reserved or spent</strong>
+    the funding inputs in its local ledger. If that transaction later fails, those
+    inputs must become claimable again — otherwise the wallet <strong>leaks UTXOs</strong>
+    (balance exists on chain / in theory, but the inventory never returns them to the funder).
+  </p>
+  <p>That sounds simple until you put Arcade in the middle:</p>
+
+  <pre class="flow"><span class="hi">POST /tx</span>  ──▶  <span class="warn">202 RECEIVED</span>          <span class="dim">(intake — not a final verdict)</span>
+                │
+                ├── later: <span class="ok">SEEN_* / MINED</span>     <span class="dim">(tx is live / settled)</span>
+                ├── later: <span class="bad">REJECTED</span>           <span class="dim">(may still recover to SEEN_*)</span>
+                └── later: <span class="purp">DOUBLE_SPEND_*</span>     <span class="dim">(a competitor may win)</span></pre>
+
+  <p>
+    Arcade is <strong>asynchronous</strong>. A <code>REJECTED</code> status is not always permanent:
+    <code>SEEN_ON_NETWORK</code>, <code>SEEN_MULTIPLE_NODES</code>, and <code>ACCEPTED_BY_NETWORK</code>
+    are allowed to recover a prior <code>REJECTED</code> (false positive). Releasing funding inputs
+    the moment you first see <code>REJECTED</code> can put a still-live coin back into the claimable
+    pool while the original tx (or a competitor) is still valid on the network — which is how you
+    get a <strong>real double-spend from your own wallet</strong>.
+  </p>
+
+  <div class="grid-2">
+    <div class="card risk-leak">
+      <h3>Never leak UTXOs</h3>
+      <p>If you free too late (or never): capital stuck, balance looks wrong, rails stall.</p>
+    </div>
+    <div class="card risk-ds">
+      <h3>Never free while live</h3>
+      <p>If you free too early: wallet-induced double-spend; funds lost on chain.</p>
+    </div>
+  </div>
+
+  <div class="callout tension">
+    <div class="label">Design tension</div>
+    <p>
+      Reject→release and unfail are two answers to that tension.
+      <strong>They are not the same answer.</strong>
+    </p>
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="unfail">
+  <h2><span class="num">2.</span> The old model: unfail (<code>go-wallet-toolbox</code>)</h2>
+
+  <h3>Shape</h3>
+  <p>Unfail is a <strong>recover-from-failed</strong> workflow, not a continuous reject pipeline.</p>
+  <ol>
+    <li>
+      Something marks a known-tx as <strong>failed</strong> / eventually <code>unfail</code>
+      (often via the wallet API: <code>ListFailedActions(..., unfail=true)</code>, which attaches
+      an <code>"unfail"</code> pseudo-label that storage routes into the unfail queue).
+    </li>
+    <li>
+      The monitor’s <code>un_fail</code> task periodically scans known-txs with status
+      <code>unfail</code> (<code>process_unfail.go</code> in GWT).
+    </li>
+    <li>
+      For each candidate it asks services for a <strong>MerklePath</strong>:
+      <ul>
+        <li><strong>Path found</strong> → revive: known-tx → <code>unmined</code>, user tx →
+          <code>unproven</code>, rematerialize spendable outputs / UTXOs.</li>
+        <li><strong>Path not found</strong> → dead: known-tx → <code>invalid</code>, cascade user
+          txs to <code>failed</code>, <strong>recreate spent inputs</strong> and mark created
+          outputs not spendable.</li>
+      </ul>
+    </li>
+  </ol>
+
+  <pre class="flow">failed / unfail-labeled
+        │
+        ▼
+  monitor UnFail task
+        │
+        ├── MerklePath?  <span class="ok">yes</span> ──▶ revive (unmined / unproven + rematerialize UTXOs)
+        │
+        └── MerklePath?  <span class="bad">no</span>  ──▶ invalid + restore spent inputs</pre>
+
+  <h3>What unfail optimizes for</h3>
+  <ul>
+    <li><strong>Operator-driven recovery</strong> of txs already sitting in a failed bucket.</li>
+    <li>A binary on-chain check: “does a proof exist yet?” as the authority for revive vs release.</li>
+    <li>Compatibility with a multi-provider services world (MerklePath from whichever provider answers).</li>
+  </ul>
+
+  <h3>Where unfail is weak for Arcade</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Weakness</th><th>Why it matters under Arcade</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Manual / opt-in</strong></td>
+          <td>Failed txs sit until someone lists them with <code>unfail=true</code>. Async rejections do not automatically enter a verified release pipeline. UTXO leaks hide until an operator notices.</td>
+        </tr>
+        <tr>
+          <td><strong>Wrong question for false positives</strong></td>
+          <td>“Has a merkle path?” is a <strong>mined</strong> check. A tx can be <code>REJECTED</code> then recover to <code>SEEN_*</code> <em>without</em> being mined yet. Unfail’s “no path → release” path can free inputs while the tx is still in the mempool graph.</td>
+        </tr>
+        <tr>
+          <td><strong>Not Arcade-status-native</strong></td>
+          <td>Does not model <code>suspectFailed</code>, grace windows, or the Arcade status lattice (<code>CanSupersede</code>). Recovery and death are collapsed into one MerklePath poll.</td>
+        </tr>
+        <tr>
+          <td><strong>Double-spend under-specified</strong></td>
+          <td>No winner-union rule over competing txs. Partial consumption by multiple winners is not first-class.</td>
+        </tr>
+        <tr>
+          <td><strong>Observability is binary</strong></td>
+          <td>You get “processed unfail items,” not false-positive / stuck / cascaded counters. The leak rate is hard to measure.</td>
+        </tr>
+        <tr>
+          <td><strong>Label-driven API</strong></td>
+          <td>Coupling recovery to <code>ListFailedActions</code> + a magic label is easy to misuse and hard to automate safely at high TPS.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    Unfail can be careful in a single DB with good tests (GWT’s <code>process_unfail</code>
+    does CAS and unit-of-work restores). The structural problem is the
+    <strong>workflow model</strong>: human-gated, proof-centric, not continuous
+    reject-verification against an async oracle.
+  </p>
+</section>
+
+<!-- 3 -->
+<section id="reject-release">
+  <h2><span class="num">3.</span> The new model: reject→release (<code>go-arcade-toolbox</code>)</h2>
+
+  <p>
+    Reject→release is a <strong>two-phase automatic reconciler</strong> owned by storage + the
+    monitor. It assumes Arcade is the status oracle and that rejections can lie for a while.
+  </p>
+
+  <div class="phase">
+    <h4>Phase 1 — mark, do not free</h4>
+    <p>
+      On async reject (<code>REJECTED</code> / <code>DOUBLE_SPEND_ATTEMPTED</code> via SSE or poll),
+      or on a synchronous <code>POST /tx</code> 4xx:
+    </p>
+    <ul>
+      <li>Known-tx is marked <strong><code>suspectFailed</code></strong> (with <code>suspect_since</code>, competing txids when present).</li>
+      <li><strong>Funding inputs are not released.</strong></li>
+      <li>Synchronous 4xx also <strong>removes phantom change</strong> minted in the same ProcessAction (that change never hit the chain). Async reject freezes / quarantines change until Phase 2 decides.</li>
+    </ul>
+    <div class="callout accent">
+      <div class="label">Deliberate asymmetry</div>
+      <p><strong>Status can go bad immediately; capital stays locked until verification.</strong></p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <h4>Phase 2 — re-verify, then free only if provably dead</h4>
+    <p>
+      The monitor’s leased <code>reject_release</code> task runs
+      <code>VerifyAndReleaseSuspects</code> on a cadence (default <strong>60s</strong>):
+    </p>
+    <ol>
+      <li>Load suspects older than the grace window (default <strong>90s</strong>).</li>
+      <li>Re-query Arcade (<code>GetTx</code>) for authoritative status.</li>
+      <li>Branch on the result:</li>
+    </ol>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Re-check result</th><th>Action</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Recovered to <code>SEEN_*</code> / <code>ACCEPTED</code> / <code>MINED</code> / …</td>
+          <td><strong>False positive</strong> — unfreeze change, re-enter normal apply path, <strong>release nothing</strong></td>
+        </tr>
+        <tr>
+          <td>Still <code>REJECTED</code></td>
+          <td><strong>Two-pass guard</strong> (below)</td>
+        </tr>
+        <tr>
+          <td><code>DOUBLE_SPEND_ATTEMPTED</code></td>
+          <td><strong>Winner-union rule</strong> (below)</td>
+        </tr>
+        <tr>
+          <td>Ambiguous / GetTx error / no winner yet</td>
+          <td>Stay in quarantine; freeze change</td>
+        </tr>
+        <tr>
+          <td>Past max quarantine (default <strong>24h</strong>)</td>
+          <td>Escalate to <strong><code>stuck</code></strong> — operator-visible, <strong>never auto-released</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre class="flow">async REJECTED / DOUBLE_SPEND / sync 4xx
+        │
+        ▼
+  Phase 1: <span class="warn">suspectFailed</span>   <span class="dim">(inputs still held)</span>
+        │
+        ▼
+  Phase 2: GetTx re-verify <span class="dim">(every ~60s, after grace)</span>
+        │
+        ├── recovered ──────────────▶ <span class="ok">false positive (no release)</span>
+        ├── REJECTED ×2, grace apart ▶ <span class="hi">release inputs (provably dead)</span>
+        ├── DOUBLE_SPEND + winner ──▶ <span class="hi">release only inputs winner did not take</span>
+        └── unresolved &gt; 24h ───────▶ <span class="bad">stuck (human, never auto-release)</span></pre>
+
+  <h3>Three safety cores</h3>
+
+  <div class="core">
+    <h4><span class="tag">1</span> Two-pass false-positive guard (pure <code>REJECTED</code>)</h4>
+    <p>
+      A pure rejection is only released after <strong>two</strong> independent
+      <code>GetTx</code> results of <code>REJECTED</code>, separated by at least the grace window:
+    </p>
+    <ul>
+      <li><strong>Pass 1:</strong> stamp <code>verified_rejected_at</code>, freeze change, leave suspect.</li>
+      <li><strong>Pass 2 (stamp + grace aged):</strong> still <code>REJECTED</code> → build release plan and free inputs.</li>
+    </ul>
+    <p>
+      If between passes the status recovers, the recovered branch runs —
+      <strong>zero release</strong>. That is exactly the Arcade lattice case unfail’s
+      MerklePath check does not model.
+    </p>
+  </div>
+
+  <div class="core">
+    <h4><span class="tag">2</span> Double-spend winner-union rule</h4>
+    <p>
+      On <code>DOUBLE_SPEND_ATTEMPTED</code>, inputs free only when
+      <strong>at least one competitor is terminal-successful</strong>
+      (<code>MINED</code> / <code>IMMUTABLE</code>):
+    </p>
+    <ul>
+      <li>Inputs the winner(s) consumed stay recorded as <strong>spent</strong> (they are gone).</li>
+      <li>Only inputs <strong>no confirmed winner took</strong> are released back to the pool.</li>
+      <li>The reconciler <strong>unions every confirmed winner’s inputs</strong>. Stopping at the first winner would resurrect an outpoint another mined competitor already spent.</li>
+      <li>If any confirmed winner’s <code>rawTx</code> is unreadable, release is <strong>deferred</strong> (never free on an incomplete consumption set).</li>
+    </ul>
+  </div>
+
+  <div class="core">
+    <h4><span class="tag">3</span> No-double-release CAS + idempotent inventory ops</h4>
+    <ul>
+      <li>Terminal flip is a positive CAS: <code>suspectFailed → invalidTx | doubleSpend</code>.</li>
+      <li>Crash re-run or a racing pass is refused once the gate has flipped.</li>
+      <li>Inventory ops are idempotent (<code>Unspend</code> guarded by <code>spent_by</code>, reservation release skips free rows, <code>RemoveByMintTx</code> skips missing).</li>
+      <li>Mode B enqueues release ops to the outbox then executes; <code>DrainOutbox</code> heals a crash mid-inline-execute.</li>
+    </ul>
+  </div>
+
+  <h3>Cascades</h3>
+  <p>
+    Removing a dead tx’s phantom change re-marks any <strong>child</strong> that spent that
+    change as suspect for a later pass. The cascade is iterative (no full conflicting-children
+    graph), and never clobbers a completed tx.
+  </p>
+
+  <h3>Metrics — the leak becomes countable</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Counter</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>reconciler_released_total</code></td><td>Provably dead; inputs returned to the pool</td></tr>
+        <tr><td><code>reconciler_false_positive_total</code></td><td>Transient reject; two-pass guard did its job</td></tr>
+        <tr><td><code>reconciler_stuck_total</code></td><td>Past quarantine; <strong>human required</strong></td></tr>
+        <tr><td>plus <code>scanned</code>, <code>ambiguous</code>, <code>cascaded</code>, outbox <code>drained</code>/<code>failed</code>/<code>parked</code></td><td>Pass diagnostics</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Under unfail, a silent UTXO leak was an operator mystery. Under reject→release,
+    false positives and stuck capital are first-class telemetry.
+  </p>
+</section>
+
+<!-- 4 -->
+<section id="side-by-side">
+  <h2><span class="num">4.</span> Side-by-side</h2>
+  <div class="table-wrap compare">
+    <table>
+      <thead>
+        <tr>
+          <th>Dimension</th>
+          <th>unfail (GWT)</th>
+          <th>reject→release (arcade-toolbox)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Trigger</strong></td>
+          <td>Manual / label (<code>ListFailedActions(unfail=true)</code>) + monitor scan of <code>unfail</code> status</td>
+          <td class="better">Automatic on reject status / sync 4xx → <code>suspectFailed</code></td>
+        </tr>
+        <tr>
+          <td><strong>When inputs free</strong></td>
+          <td>After unfail decides “no MerklePath”</td>
+          <td class="better">After <strong>verified</strong> death (two-pass REJECTED or winner-confirmed double-spend)</td>
+        </tr>
+        <tr>
+          <td><strong>Authority</strong></td>
+          <td>MerklePath presence</td>
+          <td class="better">Arcade <code>GetTx</code> status lattice + optional winner rawTx</td>
+        </tr>
+        <tr>
+          <td><strong>False-positive model</strong></td>
+          <td>Weak (proof-centric)</td>
+          <td class="better">First-class (grace + two passes + recover branch)</td>
+        </tr>
+        <tr>
+          <td><strong>Double-spend</strong></td>
+          <td>Restore inputs when invalid; no winner-union</td>
+          <td class="better">Winner-union; partial release; defer on ambiguity</td>
+        </tr>
+        <tr>
+          <td><strong>Default bias under uncertainty</strong></td>
+          <td>Can free too early if “no path yet”</td>
+          <td class="better"><strong>Never free</strong> (quarantine → stuck)</td>
+        </tr>
+        <tr>
+          <td><strong>Operator role</strong></td>
+          <td>Required to start recovery</td>
+          <td class="better">Required only for <code>stuck</code> / parked outbox</td>
+        </tr>
+        <tr>
+          <td><strong>High-TPS fit</strong></td>
+          <td>Human-in-the-loop does not scale</td>
+          <td class="better">Continuous leased task; metrics for backlog</td>
+        </tr>
+        <tr>
+          <td><strong>Failure visibility</strong></td>
+          <td>Easy to miss stuck capital</td>
+          <td class="better"><code>false_positive</code> / <code>stuck</code> / <code>released</code> counters</td>
+        </tr>
+        <tr>
+          <td><strong>Coupling</strong></td>
+          <td>Wallet list API + magic label</td>
+          <td class="better">Storage + monitor only</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- 5 -->
+<section id="why-better">
+  <h2><span class="num">5.</span> Why reject→release is better</h2>
+
+  <h3>5.1 It matches Arcade’s actual contract</h3>
+  <p>
+    Arcade says: <strong>broadcast is intake; status is out-of-band; <code>REJECTED</code> can recover.</strong>
+    Reject→release encodes that contract in the ledger. Unfail encodes a different world:
+    “failed means maybe mined, check for a proof.”
+  </p>
+  <p>
+    If your truth oracle is Arcade, the reconciler asks the right question:
+    <strong>“Is this tx still dead on the oracle after a deliberate wait?”</strong> — not
+    <strong>“Does any provider have a merkle path yet?”</strong>
+  </p>
+
+  <h3>5.2 It prevents the catastrophic failure mode</h3>
+  <p>
+    The expensive bug is not a delayed UTXO return. It is
+    <strong>freeing an input that is still committed to a live (or soon-live) transaction</strong>,
+    then spending it again in a new createAction.
+  </p>
+  <div class="callout good">
+    <div class="label">Safe default</div>
+    <p>
+      Reject→release’s default under ambiguity is <strong>hold</strong>. That trades temporary
+      capital lock for permanent fund safety. At payment-rail TPS, that trade is correct:
+      a stuck UTXO is recoverable with ops; a double-spent UTXO is not.
+    </p>
+  </div>
+
+  <h3>5.3 It closes the UTXO-leak class without humans</h3>
+  <p>
+    Under unfail, async rejects that nobody unfails become <strong>silent inventory leaks</strong>.
+    Under reject→release, every suspect is on a timer:
+  </p>
+  <ul>
+    <li>recover → rejoin lifecycle</li>
+    <li>verify dead → auto-release</li>
+    <li>cannot decide → <code>stuck</code> alert</li>
+  </ul>
+  <p>There is no “failed forever in a dark corner unless someone lists with a flag.”</p>
+
+  <h3>5.4 Double-spend is handled as a set problem, not a boolean</h3>
+  <p>
+    Real conflicts are messy: multiple competitors, disjoint input subsets, missing rawTx.
+    Winner-union + defer-on-unreadable is the difference between a wallet that can free residual
+    change after a conflict and one that either frees too much (double-spend) or frees nothing
+    after a partial conflict (leak).
+  </p>
+
+  <h3>5.5 It is operable at scale</h3>
+  <div class="table-wrap compare">
+    <table>
+      <thead>
+        <tr><th>unfail at 1k TPS</th><th>reject→release at 1k TPS</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Who calls <code>ListFailedActions(unfail=true)</code>?</td><td class="better">Monitor does the work</td></tr>
+        <tr><td>How do you know leak rate?</td><td class="better"><code>released</code> / <code>false_positive</code> / <code>stuck</code></td></tr>
+        <tr><td>What if MerklePath lag is minutes?</td><td class="better">Grace + status re-check, not proof-only</td></tr>
+        <tr><td>Multi-instance safety?</td><td class="better">Lease on <code>reject_release</code> + CAS gate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>5.6 Sync 4xx vs async reject stay consistent on the hard rule</h3>
+  <p>
+    Both paths <strong>refuse to free funding inputs in Phase 1</strong>. Sync 4xx eagerly drops
+    <strong>change</strong> (never on chain, non-abortable failed tx). Async reject leaves change
+    quarantined until Phase 2. The invariant is the same:
+    <strong>inputs free only after verified death.</strong>
+  </p>
+</section>
+
+<!-- 6 -->
+<section id="limits">
+  <h2><span class="num">6.</span> What reject→release is <em>not</em> better at</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Limit</th><th>Implication</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Capital can sit locked for ≥ grace (and up to quarantine)</strong></td>
+          <td>Size fuel pools for worst-case quarantine if rejections are common. Defaults: 90s grace, 24h stuck ceiling.</td>
+        </tr>
+        <tr>
+          <td><strong><code>stuck</code> never auto-releases</strong></td>
+          <td>Rising <code>reconciler_stuck_total</code> is a page, not a log line. Human investigation required (Arcade down, unreadable competitor rawTx, endless ambiguity).</td>
+        </tr>
+        <tr>
+          <td><strong>Requires Arcade + monitor</strong></td>
+          <td>If <code>reject_release</code> is disabled or the oracle is unreachable, suspects pile up — same class of failure as “nobody ran unfail,” but <strong>visible</strong>.</td>
+        </tr>
+        <tr>
+          <td><strong>Not a substitute for FailAbandoned</strong></td>
+          <td>Pre-broadcast <code>unsigned</code>/<code>nosend</code> cleanup is a different task. Forever-<code>RECEIVED</code> / never-mined tails need oracle terminal status (or a future policy), not Phase 2 alone.</td>
+        </tr>
+        <tr>
+          <td><strong>Wallet <code>ListFailedActions(unfail=…)</code> is not the control plane</strong></td>
+          <td>Do not expect the GWT label workflow. Recovery is the reconciler; the old API is not the mechanism.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout tension">
+    <div class="label">Intentional bias</div>
+    <p>Safe bias is intentional: <strong>prefer stuck capital over unsafe free.</strong></p>
+  </div>
+</section>
+
+<!-- 7 -->
+<section id="examples">
+  <h2><span class="num">7.</span> Worked examples</h2>
+
+  <div class="example">
+    <h4>A — Transient reject (false positive)</h4>
+    <ol>
+      <li>Wallet broadcasts tx <code>A</code>; inputs reserved/spent locally; change at <code>TierSending</code>.</li>
+      <li>SSE: <code>REJECTED</code> → Phase 1: <code>suspectFailed</code>, inputs <strong>held</strong>.</li>
+      <li>30s later SSE: <code>SEEN_ON_NETWORK</code>.</li>
+      <li>Phase 2 re-check (or status apply) sees recovery → <strong>false positive</strong>, no release; change promotes on the normal SEEN path.</li>
+    </ol>
+    <div class="note">
+      <strong>Unfail path risk:</strong> if an operator (or automated label) pushed unfail while
+      still “no MerklePath,” inputs could be restored while <code>A</code> was about to be seen —
+      then a second payment reuses those outpoints.
+    </div>
+  </div>
+
+  <div class="example">
+    <h4>B — Durable reject</h4>
+    <ol>
+      <li>Tx <code>B</code> rejected; Phase 1 suspects.</li>
+      <li>Pass 1 of reconciler: still <code>REJECTED</code>, stamp <code>verified_rejected_at</code>.</li>
+      <li>≥ 90s later, pass 2: still <code>REJECTED</code> → release funding inputs, remove phantom change, cascade children that spent that change.</li>
+    </ol>
+    <div class="note">No human call required; leak closed on a bounded timer.</div>
+  </div>
+
+  <div class="example">
+    <h4>C — Double-spend, two winners, disjoint inputs</h4>
+    <ol>
+      <li>Tx <code>C</code> spends inputs <code>{i1, i2, i3}</code>; status <code>DOUBLE_SPEND_ATTEMPTED</code>.</li>
+      <li>Competitor <code>W1</code> mines with <code>{i1}</code>; competitor <code>W2</code> mines with <code>{i2}</code>.</li>
+      <li>Winner-union → consumption set <code>{i1, i2}</code>; release only <code>{i3}</code>.</li>
+    </ol>
+    <div class="note">
+      A “first winner wins” rule would free <code>i2</code> after seeing only <code>W1</code> — incorrect.
+      Reject→release unions winners; unfail has no equivalent structure.
+    </div>
+  </div>
+
+  <div class="example">
+    <h4>D — Ambiguity past 24h</h4>
+    <ol>
+      <li>Double-spend, but no competitor ever reaches <code>MINED</code> / rawTx unreadable.</li>
+      <li>After max quarantine → <strong><code>stuck</code></strong>, inputs still held, metric increments.</li>
+      <li>Operator inspects Arcade / competitors; manual remediation only if policy allows.</li>
+    </ol>
+    <div class="note">Prefer this over guessing.</div>
+  </div>
+</section>
+
+<!-- 8 -->
+<section id="migration">
+  <h2><span class="num">8.</span> Migration notes (GWT → arcade-toolbox)</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>GWT habit</th><th>Arcade-toolbox equivalent</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ListFailedActions(ctx, args, true, originator)</code> to queue unfail</td>
+          <td>Do <strong>not</strong> rely on this for input recovery; ensure monitor <code>reject_release</code> is enabled</td>
+        </tr>
+        <tr>
+          <td>Monitor task <code>un_fail</code> = MerklePath recovery</td>
+          <td>Config key may still exist as <code>un_fail</code>, but the daemon <strong>repurposes</strong> it to <strong>status poll</strong> (<code>SynchronizeTransactionStatuses</code>). Reject recovery is <code>reject_release</code></td>
+        </tr>
+        <tr>
+          <td>Expect failed bucket to hold capital until ops</td>
+          <td>Expect <code>suspectFailed</code> → auto path; watch <code>stuck</code></td>
+        </tr>
+        <tr>
+          <td>Restore spent outputs via unfail invalid path</td>
+          <td><code>Unspend</code> / <code>ReleaseReservation</code> / <code>RemoveByMintTx</code> via reconciler plan</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- 9 -->
+<section id="summary">
+  <h2><span class="num">9.</span> One-paragraph summary</h2>
+  <div class="summary">
+    <p>
+      <strong>Unfail</strong> is a human-triggered, MerklePath-centric recovery of already-failed
+      transactions: good enough when failure is rare and an operator is in the loop, but the wrong
+      control plane for Arcade’s async status lattice and high-TPS rails.
+      <strong>Reject→release</strong> never frees funding inputs on first sight of failure; it
+      quarantines as <code>suspectFailed</code>, re-verifies against Arcade with a two-pass grace
+      for pure rejects and a winner-union rule for double-spends, auto-releases only when death is
+      proven, and escalates ambiguity to an operator-visible <code>stuck</code> state with metrics.
+      That is better because it aligns with Arcade’s false-positive-capable rejections, prevents
+      wallet-induced double-spends, closes silent UTXO leaks without manual labels, and makes
+      recovery operable at scale — at the deliberate cost of holding capital under uncertainty
+      instead of guessing.
+    </p>
+  </div>
+</section>
+
+<!-- refs -->
+<section id="refs">
+  <h2><span class="num">10.</span> References (in-repo)</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Topic</th><th>Where</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Reconciler implementation</td><td><code>pkg/storage/reconciler.go</code></td></tr>
+        <tr><td>Phase 1 status apply</td><td><code>pkg/storage/status_updates.go</code> (<code>ApplyStatusUpdate</code>)</td></tr>
+        <tr><td>Sync 4xx path</td><td><code>pkg/storage/process.go</code> (<code>commitRejected</code>)</td></tr>
+        <tr><td>Defaults (60s / 90s / 24h)</td><td><code>pkg/defs/reconciler.go</code></td></tr>
+        <tr><td>Monitor wiring</td><td><code>pkg/monitor/monitor.go</code> (<code>RejectReleaseMonitorTask</code>)</td></tr>
+        <tr><td>Markdown source</td><td><code>docs/reject-release-vs-unfail.md</code></td></tr>
+        <tr><td>GWT unfail (spec repo)</td><td><code>go-wallet-toolbox/pkg/storage/internal/actions/process_unfail.go</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  Self-contained design note for <code>go-arcade-toolbox</code>.
+  Open this file directly in a browser — no server or external assets required.
+  Print-friendly styles included.
+</footer>
+
+</div>
+</body>
+</html>
