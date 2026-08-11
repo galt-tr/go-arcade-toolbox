@@ -55,13 +55,14 @@ const (
 	// runs this task in singleton/reschedule mode, so an overlong sweep simply
 	// eats its own next tick.
 	maxRepairPages = 16
-)
 
-// repairSweepBudget bounds the wall-clock the extra repair paging may take, so
-// the sweep yields well inside a normal poll interval however slow arcade is
-// answering. It is the second half of the maxRepairPages bound: pages cap the
-// work, the budget caps the time.
-const repairSweepBudget = 30 * time.Second
+	// repairSweepBudget bounds the wall clock the extra repair paging may take,
+	// so the sweep yields well inside a poll interval — the shortest configured
+	// default is 5 minutes, and the deployment that produced the 269k backlog
+	// ran it at ≈60s — however slowly arcade is answering. It is the second half
+	// of the maxRepairPages bound: pages cap the work, the budget caps the time.
+	repairSweepBudget = 30 * time.Second
+)
 
 // pollableStatuses are the in-flight / unproven known-tx statuses the poll
 // fallback re-polls (via GetTx → ApplyStatusUpdate) when they go stale. It
