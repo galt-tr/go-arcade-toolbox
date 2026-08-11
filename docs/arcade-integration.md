@@ -93,6 +93,13 @@ failover chain** — multi-instance HA is a future router (see below). A zero
   watchdog (60s) treats silence as a dead peer — Arcade sends `: keepalive`
   comments every 15s.
 
+The monitor persists its own resume position (`arcade_sse_last_event_id`) and
+holds it at a **low-water mark**: it never advances past the oldest event that
+has not applied, so a batch that fails is re-delivered on the next connect even
+if later batches succeed in the meantime. The hold is bounded
+(`cursorHoldMaxEvents`); past that it is released at ERROR and those events
+become the poll's to repair, which is what the next section is for.
+
 ### Cold-start caveat — the poll fallback is mandatory
 
 A fresh connection (empty `Last-Event-ID`) **replays only NON-terminal

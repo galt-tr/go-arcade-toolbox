@@ -360,6 +360,97 @@ func TestApplyStatusBatch_FailedApplyHoldsCursor(t *testing.T) {
 	require.Equal(t, cursor.resume(ctx), string(mustKV(t, store, LastEventIDKey)))
 }
 
+// TestApplyStatusBatch_LaterSuccessDoesNotCarryTheCursorPastAFailedBatch is the
+// shape of issue #8, and the one TestApplyStatusBatch_FailedApplyHoldsCursor
+// above cannot see: it re-applies the SAME batch, so it only ever proved the
+// cursor is held for the IMMEDIATELY failing batch.
+//
+// The applier is a single goroutine running batches in sequence. Holding the
+// cursor by simply not recording a failed batch therefore holds it only until
+// the NEXT batch succeeds — that batch records its own, strictly newer id, and a
+// reconnect resumes past the failure. Those events are never replayed.
+//
+// So: batch N applies, N+1 fails, N+2 applies. The persisted cursor must still
+// be N's, not N+2's — and it must stay there until N+1's events actually apply.
+func TestApplyStatusBatch_LaterSuccessDoesNotCarryTheCursorPastAFailedBatch(t *testing.T) {
+	const (
+		nth   = "aaaa" // batch N   — applies
+		bad   = "bbbb" // batch N+1 — fails
+		after = "cccc" // batch N+2 — applies, and must not carry the cursor
+		later = "dddd" // arrives with bad's replay
+	)
+	store := newModelStorage(nil)
+	dmn, err := NewDaemon(logging.NewTestLogger(t), store, nil, nil, defs.DefaultMonitorConfig(), WithoutDistributedLock())
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	cursor := &cursorTracker{daemon: dmn}
+	lowWaterMark := nth + "-" + string(arcade.StatusSeenOnNetwork)
+
+	// N applies, and the cursor is allowed to reach it.
+	dmn.applyStatusBatch(ctx, []arcade.StatusEvent{rec(nth, arcade.StatusSeenOnNetwork)}, cursor)
+	require.Equal(t, lowWaterMark, cursor.resume(ctx))
+
+	// N+1 fails — the deadlock that lost a 4,000-row batch in the 2026-08-11 run.
+	store.batchErr = errors.New("deadlock detected")
+	dmn.applyStatusBatch(ctx, []arcade.StatusEvent{rec(bad, arcade.StatusMined)}, cursor)
+
+	// N+2 applies. It is NEWER than the events N+1 lost, so it must not move the
+	// resume position: doing so is exactly how a reconnect skips past them.
+	store.batchErr = nil
+	dmn.applyStatusBatch(ctx, []arcade.StatusEvent{rec(after, arcade.StatusMined)}, cursor)
+	require.Equal(t, lowWaterMark, cursor.resume(ctx),
+		"the resume position must not advance past an OLDER un-applied batch")
+	require.Equal(t, lowWaterMark, string(mustKV(t, store, LastEventIDKey)),
+		"the persisted cursor must not advance past an OLDER un-applied batch")
+
+	// A reconnect from that position re-delivers N+1's events. Once they apply,
+	// nothing older is outstanding and the cursor catches up in one jump.
+	dmn.applyStatusBatch(ctx, []arcade.StatusEvent{
+		rec(bad, arcade.StatusMined),
+		rec(later, arcade.StatusMined),
+	}, cursor)
+	require.Equal(t, later+"-"+string(arcade.StatusMined), cursor.resume(ctx),
+		"the cursor must resume advancing once every un-applied event has re-applied")
+}
+
+// TestCursorTracker_HoldIsBounded covers the other failure mode of holding: a
+// batch that never re-applies would pin the cursor forever, and every reconnect
+// would then drag a catchup that grows without limit. Past cursorHoldMaxEvents
+// the hold is released deliberately, leaving those events to the repair poll.
+func TestCursorTracker_HoldIsBounded(t *testing.T) {
+	store := newModelStorage(nil)
+	dmn, err := NewDaemon(logging.NewTestLogger(t), store, nil, nil, defs.DefaultMonitorConfig(), WithoutDistributedLock())
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	cursor := &cursorTracker{daemon: dmn}
+	cursor.record(ctx, []arcade.StatusEvent{rec("aaaa", arcade.StatusSeenOnNetwork)})
+	lowWaterMark := "aaaa-" + string(arcade.StatusSeenOnNetwork)
+
+	// One batch fails and is never re-delivered.
+	cursor.hold(ctx, []arcade.StatusEvent{rec("bbbb", arcade.StatusMined)})
+	require.Equal(t, lowWaterMark, cursor.resume(ctx))
+
+	// Feed applied batches past the bound. The hold survives well beyond one
+	// batch — that is the whole point — but not without limit.
+	fill := seenEvents("fill", applyBatchMax)
+	applied := 0
+	for applied < cursorHoldMaxEvents/2 {
+		cursor.record(ctx, fill)
+		applied += len(fill)
+	}
+	require.Equal(t, lowWaterMark, cursor.resume(ctx),
+		"the hold must survive far more than the one batch that follows the failure")
+
+	for applied < cursorHoldMaxEvents+len(fill) {
+		cursor.record(ctx, fill)
+		applied += len(fill)
+	}
+	require.Equal(t, fill[len(fill)-1].ID, cursor.resume(ctx),
+		"past its bound the hold is released so the stream can make progress again")
+}
+
 func mustKV(t *testing.T, m *modelStorage, key string) []byte {
 	t.Helper()
 	v, ok, err := m.GetKeyValue(context.Background(), key)

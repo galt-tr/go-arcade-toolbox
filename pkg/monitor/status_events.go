@@ -15,7 +15,7 @@ import (
 )
 
 // LastEventIDKey is the key_values key holding the SSE replay cursor across
-// restarts (the id of the last event of the last fully-applied batch).
+// restarts: the newest event id with nothing older still un-applied.
 const LastEventIDKey = "arcade_sse_last_event_id"
 
 // sseReconnectBackoff bounds the outer reconnect loop when StreamStatus returns
@@ -28,8 +28,8 @@ const sseReconnectBackoff = time.Second
 // applying them one-at-a-time (plus one cursor write each) would cap throughput
 // far below a busy stream, so a small worker pool with amortized cursor
 // persistence keeps up while preserving replay safety (events are idempotent;
-// the cursor advances only to the last event of a fully-applied batch, and is
-// allowed to lag it — see [cursorTracker] — but never to lead it).
+// the cursor never advances past the oldest un-applied event, and is allowed to
+// lag even that — see [cursorTracker] — but never to lead it).
 const (
 	defaultApplyWorkers = 8
 	// applyBatchMax is the max events drained into one batch before applying.
@@ -67,6 +67,25 @@ const (
 	// reconnect can cause, which is harmless (every apply is idempotent) but not
 	// free.
 	cursorFlushBatches = 64
+
+	// cursorHoldMaxEvents bounds how far the replay cursor may fall behind while
+	// it is HELD behind events that failed to apply (see [cursorTracker.hold]).
+	//
+	// The hold works by making a reconnect re-deliver those events, and it costs
+	// exactly that redelivery — which grows with every event applied past the
+	// gap. So an unbounded hold has a failure mode of its own: the cursor pins at
+	// a position so old that every reconnect asks arcade for a catchup nobody can
+	// serve, and the stream stops making progress at all.
+	//
+	// 200k is ~35s of the 2026-08-11 run's peak apply rate (5.5k events/s), which
+	// comfortably spans the window in which a hold can actually pay off — a
+	// stream reconnect (sseReconnectBackoff is 1s) or a restart — and is ~2
+	// minutes of replay at arcade's measured ~1.6k events/s delivery ceiling,
+	// a cost a recovery can carry. Past it the hold is released deliberately and
+	// logged at ERROR, and the events it was protecting fall back to the repair
+	// poll (storage's FindMissingArcadeStatus / FindByStatusOlderThan sweep,
+	// which selects on the rows themselves and never consults this cursor).
+	cursorHoldMaxEvents = 200_000
 
 	// applyDeadlockAttempts bounds the retry of a transient (deadlock/lock)
 	// apply failure; the victim is safe to retry immediately.
@@ -110,9 +129,12 @@ func (d *Daemon) applyShards() int {
 //     every apply guard) is preserved. Sharded parallelism + bulk batching
 //     together clear a mined block's thousand-event burst in seconds.
 //
-// The cursor advances only to the newest non-empty event id of a fully-applied
-// batch, never regresses to "", and never advances past what was durably
-// persisted (so a reconnect resumes from a real position).
+// The cursor never advances past the OLDEST un-applied event — not merely past
+// the batch that happens to be failing right now, which is all it used to
+// promise (issue #8) — never regresses to "", and never advances past what was
+// durably persisted (so a reconnect resumes from a real position). Its one
+// escape hatch is cursorHoldMaxEvents, past which a hold that is not clearing is
+// given up at ERROR and its events left to storage's repair poll.
 func (d *Daemon) handleStatusEvents(ctx context.Context) {
 	d.logger.InfoContext(ctx, "starting arcade status event handler")
 
@@ -240,36 +262,148 @@ ready:
 // on a detached context and so has no deadline of its own.
 const cursorFlushTimeout = 5 * time.Second
 
-// cursorTracker owns the SSE replay cursor: the id of the last event of the last
-// FULLY-applied batch. It exists to decouple "a batch applied" from "the cursor
-// was written", which used to be the same act — one key_values write per batch,
-// i.e. ~72k writes to move one block's 1.1M records.
+// cursorTracker owns the SSE replay cursor: the position a (re)connect resumes
+// from. It exists to decouple "a batch applied" from "the cursor was written",
+// which used to be the same act — one key_values write per batch, i.e. ~72k
+// writes to move one block's 1.1M records.
 //
 // Deferring the write is safe in the one direction that matters. The cursor may
 // lag what has been applied (a reconnect then re-delivers events we already
 // applied, which is a no-op — every apply is idempotent) but it may never LEAD
 // it, because leading is how events are skipped and lost for good. So `durable`
 // only ever advances after the database has confirmed the write, and `pending`
-// only ever holds fully-applied positions.
+// only ever holds positions that are safe to resume from.
+//
+// LOW-WATER MARK, NOT HIGH-WATER MARK. "The last FULLY-applied batch" is not a
+// safe position on its own, and used to be what this held. The applier is a
+// single goroutine running batches in sequence, so declining to record a FAILED
+// batch holds the cursor only until the next batch succeeds: that batch records
+// its own, strictly newer id and a reconnect resumes past the failure, so a
+// failure sandwiched between successes was skipped on the replay path entirely
+// (issue #8). A hold has to outlive later successes.
+//
+// It therefore tracks the un-applied events themselves: while `unapplied` is
+// non-empty the cursor is FROZEN at the newest position with nothing older
+// outstanding, no matter what applies after it. It thaws when the replay it was
+// arranging has delivered those events and every one of them has applied — or,
+// failing that, at cursorHoldMaxEvents, where the hold is given up loudly rather
+// than pinning the stream forever.
 type cursorTracker struct {
 	daemon *Daemon
 
 	mu sync.Mutex
 	// durable is the id key_values holds: what a restart resumes from.
 	durable string
-	// pending is a fully-applied id not yet written; "" or == durable when there
-	// is nothing owed.
+	// pending is a safe-to-resume id not yet written; "" or == durable when there
+	// is nothing owed. While holding it is frozen — it IS the low-water mark.
 	pending string
 	// batches counts applied batches since the last successful write.
 	batches int
+
+	// holding is true while at least one delivered event is known to be
+	// un-applied, i.e. while pending is frozen.
+	holding bool
+	// unapplied is the event id of everything a failed batch left un-applied and
+	// that has not since re-applied. It is nil on the path where nothing fails,
+	// so a healthy stream pays nothing for it.
+	unapplied map[string]struct{}
+	// held counts events seen (applied or failed) since the hold began: how much
+	// redelivery the hold is currently buying — see cursorHoldMaxEvents.
+	held int
+	// untracked names the sentinel a failed batch with no event ids at all is
+	// held under, so two of them cannot collapse into one key.
+	untracked int
 }
 
-// record takes the id of the last event of a batch that applied in full, and
-// writes it out once cursorFlushBatches have accumulated. Between those the
-// applier just moves on; the idle flush in collectBatch covers everything else.
-func (c *cursorTracker) record(ctx context.Context, eventID string) {
+// hold freezes the cursor behind a batch that failed to apply, remembering its
+// event ids so the freeze can be lifted when — and only when — every one of them
+// has re-applied. It returns how many un-applied events are now held and the
+// position they are held at, for the caller's log line.
+//
+// Of the two ways to keep a failed batch's events reachable — hold the cursor
+// behind them, or persist their ids somewhere for a repair pass — holding is the
+// one that cannot lose events: it needs no new durable store, and it reuses the
+// guarantee we already depend on (arcade replays everything after Last-Event-ID,
+// and every apply is idempotent). A dead-letter list, by contrast, is itself a
+// write that can fail, leaving nothing at all. The set below is that list's
+// in-memory shadow and is deliberately NOT durable: it exists only to decide
+// when the freeze may lift, and losing it to a restart is harmless because the
+// restart resumes from the frozen cursor and re-delivers the same events.
+func (c *cursorTracker) hold(ctx context.Context, batch []arcade.StatusEvent) (int, string) {
 	c.mu.Lock()
-	c.pending = eventID
+	defer c.mu.Unlock()
+
+	if c.unapplied == nil {
+		c.unapplied = make(map[string]struct{}, len(batch))
+	}
+	tracked := 0
+	for i := range batch {
+		if id := batch[i].ID; id != "" {
+			c.unapplied[id] = struct{}{}
+			tracked++
+		}
+	}
+	if tracked == 0 {
+		// Defensive: arcade tags every event with its ns id, so a batch with none
+		// at all cannot be recognized in its own replay. Hold it under a key no
+		// event can ever carry, which keeps the freeze honest — only the bound
+		// below can lift this one.
+		c.untracked++
+		c.unapplied[fmt.Sprintf("\x00untracked-%d", c.untracked)] = struct{}{}
+	}
+	c.holding = true
+	c.held += len(batch)
+	c.releaseIfPastBoundLocked(ctx)
+
+	return len(c.unapplied), c.positionLocked()
+}
+
+// record takes a batch that applied IN FULL. It clears those events from any
+// outstanding hold and then, unless the cursor is still frozen behind older
+// un-applied events, advances the pending position to the batch's newest event
+// id — writing it out once cursorFlushBatches have accumulated. Between those
+// the applier just moves on; the idle flush in collectBatch covers the rest.
+func (c *cursorTracker) record(ctx context.Context, batch []arcade.StatusEvent) {
+	c.mu.Lock()
+
+	newest := newestEventID(batch)
+	// Only a live hold needs to look at every event; the healthy path stops at
+	// the newest id, as it always has.
+	if len(c.unapplied) > 0 {
+		for i := range batch {
+			delete(c.unapplied, batch[i].ID)
+		}
+	}
+
+	if c.holding {
+		c.held += len(batch)
+		if len(c.unapplied) == 0 {
+			c.daemon.logger.InfoContext(ctx, "every un-applied status event has re-applied, releasing the SSE replay cursor",
+				slog.String("heldAt", c.positionLocked()), slog.Int("heldEvents", c.held))
+			c.releaseLocked()
+		} else {
+			c.releaseIfPastBoundLocked(ctx)
+		}
+		if c.holding {
+			// Still frozen: this batch applied, but it is NEWER than events that
+			// did not, and moving the resume position past them is exactly how a
+			// reconnect skips them for good.
+			c.mu.Unlock()
+			return
+		}
+	}
+
+	// Advance only to an event that actually carries an id: an empty id must
+	// never overwrite a good cursor with "" (a restart would then resume with no
+	// Last-Event-ID and skip the gap — replay is safe, skip is not).
+	if newest == "" {
+		c.mu.Unlock()
+		c.daemon.logger.WarnContext(ctx, "status batch carried no event ids, replay cursor not advanced",
+			slog.Int("batchSize", len(batch)))
+		return
+	}
+
+	c.pending = newest
 	c.batches++
 	due := c.batches >= cursorFlushBatches
 	c.mu.Unlock()
@@ -277,6 +411,54 @@ func (c *cursorTracker) record(ctx context.Context, eventID string) {
 	if due {
 		c.flush(ctx)
 	}
+}
+
+// releaseIfPastBoundLocked gives up a hold that has grown past
+// cursorHoldMaxEvents. The events it was protecting are handed — deliberately,
+// and at ERROR so an operator sees it — to the repair poll, which finds diverged
+// rows by selecting on the rows themselves and never consults this cursor. That
+// is the slow path, but it is a backstop; a cursor pinned without limit is not
+// recoverable at all, because the catchup every reconnect then asks for only
+// grows.
+func (c *cursorTracker) releaseIfPastBoundLocked(ctx context.Context) {
+	if c.held < cursorHoldMaxEvents {
+		return
+	}
+	c.daemon.logger.ErrorContext(ctx, "SSE replay cursor held past its bound, leaving un-applied events to the repair poll",
+		slog.String("heldAt", c.positionLocked()),
+		slog.Int("unappliedEvents", len(c.unapplied)),
+		slog.Int("heldEvents", c.held),
+		slog.Int("maxHeldEvents", cursorHoldMaxEvents))
+	c.releaseLocked()
+}
+
+// releaseLocked thaws the cursor: the next recorded batch advances it again.
+func (c *cursorTracker) releaseLocked() {
+	c.unapplied = nil
+	c.holding = false
+	c.held = 0
+	c.untracked = 0
+}
+
+// positionLocked is the resume position as it stands right now: the pending id
+// if one is owed, else whatever the database already holds.
+func (c *cursorTracker) positionLocked() string {
+	if c.pending != "" {
+		return c.pending
+	}
+	return c.durable
+}
+
+// newestEventID is the id of the last event in the batch that carries one. A
+// batch is in arrival order, so that is the furthest a resume position could
+// move; events with no id cannot be resumed from and are skipped over.
+func newestEventID(batch []arcade.StatusEvent) string {
+	for i := len(batch) - 1; i >= 0; i-- {
+		if batch[i].ID != "" {
+			return batch[i].ID
+		}
+	}
+	return ""
 }
 
 // flush persists the pending cursor, if any. It is a no-op when nothing is owed,
@@ -314,33 +496,29 @@ func (c *cursorTracker) resume(ctx context.Context) string {
 }
 
 // applyStatusBatch hands the whole batch to storage.ApplyStatusBatch (records in
-// ARRIVAL ORDER), then persists the replay cursor once — to the newest event
-// that carries an id — but ONLY when the whole batch applied.
+// ARRIVAL ORDER) and then tells the [cursorTracker] what happened: a batch that
+// applied in full is recorded, a batch that failed is HELD.
 //
 // CURSOR HOLD ON FAILURE. This used to advance the cursor unconditionally, on
 // the theory that "replaying is safe and the polls are the safety net". They
 // were not: the poll could not reach a row that never got a status (it ordered
 // by updated_at and a failed apply writes nothing), so a failed batch's events
 // were gone for good and its transactions diverged from arcade permanently.
+// Holding the cursor behind the failure means a reconnect re-delivers those
+// events instead, at the benign cost of re-delivering some already-applied
+// (idempotent) ones with them.
 //
-// Of the two ways to fix that — hold the cursor at the last FULLY-applied event,
-// or persist the failed event ids somewhere for a repair pass — holding the
-// cursor is the one that cannot lose events: it needs no new durable store, and
-// it reuses the guarantee we already depend on (arcade replays everything after
-// Last-Event-ID, and every apply is idempotent). A dead-letter list, by
-// contrast, is itself a write that can fail — leaving nothing at all. The cost
-// of holding is bounded and benign: a reconnect re-delivers events we may have
-// already applied, which is a no-op.
+// Holding is NOT simply "do not record this batch", which is what it used to be
+// and which held the cursor for the failing batch only — the very next batch to
+// succeed recorded a newer id and carried the resume position straight past the
+// events that were lost. The tracker holds against every later success until
+// those events actually apply; see [cursorTracker].
 //
 // The per-txid arrival-order serialization that the terminal/lattice guards rely
 // on is now enforced inside ApplyStatusBatch (it collapses a txid's records to
 // its final surviving status, honoring supersession), so this method simply
 // preserves arrival order in the slice it passes down. (The queue drains FIFO =
 // SSE ns-id arrival order.)
-//
-// The cursor is handed to [cursorTracker], which decides when it is worth a
-// write; the "only when the whole batch applied" rule is enforced here, by not
-// recording anything on the failure path.
 func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEvent, cursor *cursorTracker) {
 	records := make([]arcade.TxRecord, len(batch))
 	for i := range batch {
@@ -359,28 +537,22 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 			}
 			sample = append(sample, records[i].TxID)
 		}
-		d.logger.ErrorContext(ctx, "status batch apply failed; holding SSE replay cursor so no event is lost",
+		// cursorHeldEvents/cursorHeldAt state what the cursor ACTUALLY does about
+		// this, rather than asserting a guarantee: it is the count of un-applied
+		// events the resume position is now held behind, and where it is held.
+		// Zero means the hold was given up at its bound (logged on its own line)
+		// and these events are the repair poll's to fix.
+		heldEvents, heldAt := cursor.hold(ctx, batch)
+		d.logger.ErrorContext(ctx, "status batch apply failed; its events are un-applied",
 			slog.Int("batchSize", len(records)),
 			slog.Any("sampleTxIDs", sample),
+			slog.Int("cursorHeldEvents", heldEvents),
+			slog.String("cursorHeldAt", heldAt),
 			slog.String("error", applyErr.Error()))
 		return
 	}
 
-	// Persist the cursor to the newest event that actually carries an id: an
-	// empty id must never overwrite a good cursor with "" (a restart would then
-	// resume with no Last-Event-ID and skip the gap — replay is safe, skip is not).
-	cursorID := ""
-	for i := len(batch) - 1; i >= 0; i-- {
-		if batch[i].ID != "" {
-			cursorID = batch[i].ID
-			break
-		}
-	}
-	if cursorID == "" {
-		d.logger.WarnContext(ctx, "status batch carried no event ids, replay cursor not advanced", slog.Int("batchSize", len(batch)))
-		return
-	}
-	cursor.record(ctx, cursorID)
+	cursor.record(ctx, batch)
 }
 
 // traceBatch emits opt-in txtrace lines for an applied batch: one "mined_batch"
