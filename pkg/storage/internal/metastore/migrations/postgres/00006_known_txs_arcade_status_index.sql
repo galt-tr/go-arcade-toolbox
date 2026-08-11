@@ -1,0 +1,46 @@
+-- +goose Up
+-- CountByArcadeStatus (knowntx.go) is a deployment-wide observability rollup:
+--
+--   SELECT COALESCE(arcade_status,''), COUNT(*) FROM known_txs GROUP BY arcade_status
+--
+-- No index led with arcade_status, so it was a full sequential scan of the
+-- widest table in the schema — one that carries raw_tx / input_beef / BUMP
+-- blobs — and its cost grew with every transaction created.
+--
+-- Measured on the live 1.99M-row table (postgres 17, 2432MB heap, 324MB of
+-- indexes), same query, before and after:
+--
+--   before | Seq Scan            | 557.2 ms | Buffers: shared hit=311,312
+--   after  | Index Only Scan     | 134.4 ms | Buffers: shared hit=13,417
+--                                             Heap Fetches: 38,126
+--
+-- 4.2x faster and 23x less buffer traffic, for a 13MB index — the smallest on
+-- the table, against 337MB of pre-existing indexes.
+--
+-- WHY THIS IS WORTH AN INDEX ON A HOT COLUMN. arcade_status is rewritten on
+-- every status transition, so an index on it is maintained by the workload's
+-- dominant write (BulkSetArcadeStatus). That cost is accepted here for two
+-- reasons. First, it does not make HOT updates any worse: 00005 measured
+-- hot_upd = 0 already, because arcade_status is the predicate of
+-- idx_known_txs_no_arcade_status and postgres counts partial-index predicate
+-- columns as indexed. The column was effectively indexed for HOT purposes
+-- before this migration. Second, the rollup runs on the app's metrics gauge
+-- sampler, where 557ms per tick was not merely slow — it blocked the whole
+-- snapshot publish, so a dashboard could report status counts that lagged the
+-- database by hundreds of thousands of rows mid-run and look like the pipeline
+-- had stalled when it had not.
+--
+-- Deliberately a plain btree on (arcade_status) alone, not a composite: the
+-- query groups the entire table and reads no other column, so the narrow index
+-- is what makes the scan index-only. Cardinality is tiny (4-6 distinct values),
+-- which is what keeps it to 13MB.
+--
+-- NOTE ON DEPLOYMENT. This runs inside goose's transaction, matching 00004, so
+-- it takes a write lock on known_txs for the duration of the build — seconds at
+-- ~2M rows. Applying it to a large existing deployment while a blast is in
+-- flight will stall inserts for that window; prefer a quiet moment. A fresh
+-- database pays nothing.
+CREATE INDEX idx_known_txs_arcade_status ON known_txs (arcade_status);
+
+-- +goose Down
+DROP INDEX IF EXISTS idx_known_txs_arcade_status;
