@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -586,38 +587,92 @@ func (p *Provider) verifyMinedBatch(ctx context.Context, recs []arcade.TxRecord)
 		ok  bool
 		err error
 	}
+	// entry is one memo slot. done is closed once the single in-flight fetch for
+	// this key completes, so late arrivals wait on the CHANNEL, never on vmu.
+	type entry struct {
+		done chan struct{}
+		res  vRes
+	}
 	var vmu sync.Mutex
-	vcache := make(map[vKey]vRes)
+	vcache := make(map[vKey]*entry)
+	// verify still collapses a block's worth of concurrent verifications to ONE
+	// HeaderByHeight per (height, root) — but it must not hold vmu across that
+	// fetch. Holding the lock for the whole network call serializes the entire
+	// errgroup behind one mutex: a big block's MINED burst then applies at
+	// single-goroutine speed, the SSE hand-off channel fills, and the arcade
+	// reader blocks in dispatchFrame — stalling the WHOLE event stream, not just
+	// MINED. Observed 2026-08-11 at ~1000 TPS: 224 goroutines parked in
+	// sync.Mutex.Lock here, every status frozen, and the local ledger diverging
+	// from arcade at the full creation rate until the blast was stopped.
+	//
+	// Singleflight instead: the lock covers only the map lookup/insert. The first
+	// caller for a key does the fetch and closes done; the rest release the lock
+	// immediately and wait on done. Cache hits never block.
 	verify := func(ctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
 		key := vKey{height: height, root: *root}
+
 		vmu.Lock()
-		defer vmu.Unlock()
-		if r, ok := vcache[key]; ok {
-			return r.ok, r.err
+		if e, ok := vcache[key]; ok {
+			vmu.Unlock()
+			select {
+			case <-e.done:
+				return e.res.ok, e.res.err
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
 		}
-		ok, err := p.hdrs.VerifyMerkleRoot(ctx, root, height)
-		vcache[key] = vRes{ok: ok, err: err}
-		return ok, err
+		e := &entry{done: make(chan struct{})}
+		vcache[key] = e
+		vmu.Unlock()
+
+		e.res.ok, e.res.err = p.hdrs.VerifyMerkleRoot(ctx, root, height)
+		close(e.done)
+		return e.res.ok, e.res.err
 	}
 
 	results := make([]*minedProof, len(recs))
+	reasons := make([]string, len(recs))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(minedVerifyConcurrency)
 	for i := range recs {
 		g.Go(func() error {
-			results[i] = p.verifyMinedOne(gctx, recs[i], verify)
+			results[i], reasons[i] = p.verifyMinedOne(gctx, recs[i], verify)
 			return nil
 		})
 	}
 	_ = g.Wait()
 	out := make([]minedProof, 0, len(recs))
-	for _, r := range results {
+	dropped := make(map[string]int)
+	var sample []string
+	for i, r := range results {
 		if r != nil {
 			out = append(out, *r)
+			continue
 		}
+		dropped[reasons[i]]++
+		if len(sample) < loggedTxIDSample {
+			sample = append(sample, recs[i].TxID)
+		}
+	}
+	// A dropped MINED proof leaves the tx WITHOUT an arcade status, i.e. locally
+	// diverged from arcade until something re-drives it. The per-tx detail stays
+	// at DEBUG (a lagging header view drops a whole block's worth at once and
+	// would flood the log), but the batch total is a WARN so a persistent
+	// divergence is visible rather than silent — this is exactly the signal that
+	// was missing while 23,745 rows sat stranded.
+	if len(dropped) > 0 {
+		p.logger.WarnContext(ctx, "mined proofs not stored; left for the repair poll",
+			slog.Int("dropped", len(recs)-len(out)),
+			slog.Int("batch", len(recs)),
+			slog.Any("reasons", dropped),
+			slog.Any("sampleTxIDs", sample))
 	}
 	return out
 }
+
+// loggedTxIDSample caps how many txids a diagnostic log line carries: enough to
+// go look one up, never enough to blow up the log at 1000 TPS.
+const loggedTxIDSample = 5
 
 // verifyMinedOne is the read-only pre-write half of applyMined for one record:
 // it returns the proof material when the BUMP's root verifies against the header
@@ -625,50 +680,55 @@ func (p *Provider) verifyMinedBatch(ctx context.Context, recs []arcade.TxRecord)
 // defer/skip/bad case. Unlike applyMined it never returns a hard error — a
 // missing headers source is logged and deferred so a global misconfig cannot
 // fail sibling txids' writes; hdrs is required in practice.
-func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord, verify func(context.Context, *chainhash.Hash, uint32) (bool, error)) *minedProof {
+//
+// The second return is a short, low-cardinality REASON for the drop (empty on
+// success) that [Provider.verifyMinedBatch] tallies into one WARN per batch: a
+// record dropped here writes NOTHING, so its tx keeps an empty arcade_status and
+// only the repair poll will ever pick it up. That has to be countable.
+func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord, verify func(context.Context, *chainhash.Hash, uint32) (bool, error)) (*minedProof, string) {
 	txid := rec.TxID
 	if len(rec.MerklePath) == 0 {
 		p.logger.DebugContext(ctx, "mined event without merkle path; deferring to proof poll", slog.String("txid", txid))
-		return nil
+		return nil, "no_merkle_path"
 	}
 	if p.hdrs == nil {
 		p.logger.WarnContext(ctx, "cannot verify merkle proof: no headers source; deferring", slog.String("txid", txid))
-		return nil
+		return nil, "no_headers_source"
 	}
 	txidHash, err := chainhash.NewHashFromHex(txid)
 	if err != nil {
 		p.logger.WarnContext(ctx, "cannot parse mined txid; deferring", slog.String("txid", txid), slog.String("error", err.Error()))
-		return nil
+		return nil, "unparseable_txid"
 	}
 	mp, err := transaction.NewMerklePathFromBinary(rec.MerklePath)
 	if err != nil {
 		p.logger.WarnContext(ctx, "mined event carries an unparseable merkle path; not storing",
 			slog.String("txid", txid), slog.String("error", err.Error()))
-		return nil
+		return nil, "unparseable_merkle_path"
 	}
 	if rec.BlockHeight != 0 && uint64(mp.BlockHeight) != rec.BlockHeight {
 		p.logger.WarnContext(ctx, "mined event block height disagrees with merkle path; not storing",
 			slog.String("txid", txid),
 			slog.Uint64("eventHeight", rec.BlockHeight),
 			slog.Uint64("pathHeight", uint64(mp.BlockHeight)))
-		return nil
+		return nil, "height_mismatch"
 	}
 	root, err := mp.ComputeRoot(txidHash)
 	if err != nil {
 		p.logger.WarnContext(ctx, "cannot compute merkle root from event path; not storing",
 			slog.String("txid", txid), slog.String("error", err.Error()))
-		return nil
+		return nil, "root_compute_failed"
 	}
 	ok, verr := verify(ctx, root, mp.BlockHeight)
 	if verr != nil {
 		p.logger.DebugContext(ctx, "merkle root not yet verifiable; deferring to proof poll",
 			slog.String("txid", txid), slog.String("error", verr.Error()))
-		return nil
+		return nil, "header_unavailable"
 	}
 	if !ok {
 		p.logger.WarnContext(ctx, "merkle root failed header verification; rejecting proof",
 			slog.String("txid", txid), slog.Uint64("height", uint64(mp.BlockHeight)))
-		return nil
+		return nil, "root_mismatch"
 	}
 	return &minedProof{
 		rec:       rec,
@@ -677,7 +737,7 @@ func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord, veri
 		blockHash: p.resolveBlockHash(ctx, rec.BlockHash, mp.BlockHeight),
 		mpBytes:   mp.Bytes(),
 		root:      root[:],
-	}
+	}, ""
 }
 
 // applySeenBatch advances every SEEN-class tx to unproven and promotes all their
@@ -715,6 +775,16 @@ func (p *Provider) applyMinedBatch(ctx context.Context, proofs []minedProof) err
 	if len(proofs) == 0 {
 		return nil
 	}
+	// LOCK ORDERING: sort the batch into ascending STORAGE txid order before any
+	// write. The per-row SetProof loop below takes one row lock at a time, so in
+	// arrival order two concurrent apply shards (or an apply racing the poll
+	// sweep) whose txid sets overlap could grab the same two rows in opposite
+	// orders and deadlock (SQLSTATE 40P01). This is the same order the set-based
+	// bulk mutators lock in (see metastore/lockorder.go), so every writer in the
+	// pipeline now agrees on one global order.
+	sort.Slice(proofs, func(i, j int) bool {
+		return metastore.LessTxID(proofs[i].rec.TxID, proofs[j].rec.TxID)
+	})
 	txids := make([]string, len(proofs))
 	recs := make([]arcade.TxRecord, len(proofs))
 	for i := range proofs {
@@ -1055,6 +1125,17 @@ func (p *Provider) AbortAbandoned(ctx context.Context, olderThan time.Time, limi
 // and the cold-start terminal gap (a fresh SSE connect replays only
 // non-terminal statuses, so a tx that went terminal while disconnected is only
 // learned by polling).
+//
+// It polls TWO work lists and applies their union:
+//
+//   - the staleness list (least-recently-polled non-terminal txs), and
+//   - the REPAIR list: txs with no arcade status at all, i.e. rows on which the
+//     local ledger has provably diverged from arcade (arcade has a status for
+//     every tx it has ever seen). Those get their own query because at high
+//     throughput the staleness list is far longer than any batch limit, so a
+//     stranded row that happens to sort behind it would never be selected. This
+//     is the sweep that drains a "23,745 rows with an empty arcade_status" state
+//     instead of letting it sit frozen forever.
 func (p *Provider) SynchronizeTransactionStatuses(ctx context.Context, limit int) error {
 	if limit <= 0 {
 		limit = defaultMonitorBatchLimit
@@ -1064,7 +1145,45 @@ func (p *Provider) SynchronizeTransactionStatuses(ctx context.Context, limit int
 	if err != nil {
 		return fmt.Errorf("storage: find stale non-terminal: %w", err)
 	}
-	return p.pollAndApply(ctx, stale)
+	stranded, err := p.meta.KnownTx().FindMissingArcadeStatus(ctx, cutoff, limit, pollableStatuses...)
+	if err != nil {
+		return fmt.Errorf("storage: find txs missing an arcade status: %w", err)
+	}
+	if len(stranded) > 0 {
+		// The backlog SIZE (not just this page of it) is what tells an operator
+		// whether the repair is draining or frozen.
+		total, cErr := p.meta.KnownTx().CountMissingArcadeStatus(ctx, pollableStatuses...)
+		if cErr != nil {
+			p.logger.WarnContext(ctx, "poll: count of txs missing an arcade status failed", slog.String("error", cErr.Error()))
+		}
+		p.logger.WarnContext(ctx, "poll: repairing transactions with no arcade status",
+			slog.Int("repairing", len(stranded)),
+			slog.Int("arcade_status_missing_total", total))
+	}
+	return p.pollAndApply(ctx, mergeKnownTxs(stale, stranded))
+}
+
+// mergeKnownTxs concatenates two work lists, dropping txids already present in
+// the first (the staleness list and the repair list overlap by construction —
+// a stranded tx is usually stale too — and polling a txid twice in one sweep is
+// pure waste).
+func mergeKnownTxs(a, b []metastore.KnownTx) []metastore.KnownTx {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]struct{}, len(a))
+	for i := range a {
+		seen[a[i].TxID] = struct{}{}
+	}
+	out := a
+	for i := range b {
+		if _, dup := seen[b[i].TxID]; dup {
+			continue
+		}
+		seen[b[i].TxID] = struct{}{}
+		out = append(out, b[i])
+	}
+	return out
 }
 
 // CheckProofs is the proof poll fallback: for broadcast-accepted-but-unproven
@@ -1088,18 +1207,52 @@ func (p *Provider) CheckProofs(ctx context.Context, limit int) error {
 // roughly a single round-trip.
 const pollPeers = 16
 
+// pollApplyAttempts bounds the retry of a failed bulk poll-apply. The batch is
+// idempotent, so an immediate retry is always safe and clears the common cause
+// (transient DB contention).
+const pollApplyAttempts = 3
+
 // pollAndApply fetches each tx's authoritative record via GetTx — concurrently,
 // bounded by pollPeers — then applies all successful results in one bulk
 // ApplyStatusBatch. This is the recovery path for statuses the live SSE stream
 // missed or that arcade dropped; polling one-at-a-time was far too slow to clear
-// a backlog. A not-found tx is skipped; a transport error is logged and skipped
+// a backlog. A not-found tx is skipped; a transport error is counted and skipped
 // (the next sweep retries). Order does not matter: the records are independent
 // and ApplyStatusBatch is idempotent and guard-checked per txid.
+//
+// Two invariants this function OWNS, both learned the hard way:
+//
+//  1. PROGRESS. Every selected row is stamped via MarkPolled up front, whatever
+//     happens next. The finders order by that stamp, so a row that cannot be
+//     applied moves to the back of the queue instead of being re-selected at the
+//     head of every tick and hiding the entire backlog behind it (the frozen
+//     23,745-row count). A row can never be re-selected forever without the poll
+//     making progress past it.
+//
+//  2. NO SILENT DROPS. A failed bulk apply is retried, then FALLS BACK to a
+//     per-record apply so one poisoned record cannot take a whole batch of
+//     updates down with it (a single `batch=4000` failure used to be logged at
+//     WARN and discarded), and whatever still fails is reported at ERROR with a
+//     txid sample and returned to the caller.
 func (p *Provider) pollAndApply(ctx context.Context, kts []metastore.KnownTx) error {
 	if len(kts) == 0 {
 		return nil
 	}
+
+	// Invariant 1: record the ATTEMPT before doing anything that can fail.
+	attempted := make([]string, len(kts))
+	for i := range kts {
+		attempted[i] = kts[i].TxID
+	}
+	if err := p.meta.KnownTx().MarkPolled(ctx, attempted); err != nil {
+		// Not fatal for this sweep, but it is exactly the condition that lets a
+		// batch pin the head of the work list, so it must not be quiet.
+		p.logger.WarnContext(ctx, "poll: failed to record poll attempt; work list may not advance",
+			slog.Int("batch", len(attempted)), slog.String("error", err.Error()))
+	}
+
 	recs := make([]arcade.TxRecord, len(kts)) // one slot per input; empty TxID = skip
+	var fetchFailed, notFound atomic.Int64
 	var g errgroup.Group
 	g.SetLimit(pollPeers)
 	for i := range kts {
@@ -1112,8 +1265,10 @@ func (p *Provider) pollAndApply(ctx context.Context, kts []metastore.KnownTx) er
 			rec, err := p.oracle.GetTx(ctx, txid)
 			switch {
 			case errors.Is(err, arcade.ErrTxNotFound), rec == nil:
+				notFound.Add(1)
 				return nil
 			case err != nil:
+				fetchFailed.Add(1)
 				p.logger.DebugContext(ctx, "poll: GetTx failed", slog.String("txid", txid), slog.String("error", err.Error()))
 				return nil
 			}
@@ -1124,7 +1279,20 @@ func (p *Provider) pollAndApply(ctx context.Context, kts []metastore.KnownTx) er
 			return nil
 		})
 	}
-	_ = g.Wait() // per-tx errors are logged and skipped inside; Wait never returns non-nil
+	_ = g.Wait() // per-tx errors are counted and skipped inside; Wait never returns non-nil
+
+	if n := fetchFailed.Load(); n > 0 {
+		// Aggregated (not per-tx) so a wholesale arcade outage is one line, but at
+		// WARN: every failed fetch is a tx whose divergence persists another cycle.
+		p.logger.WarnContext(ctx, "poll: GetTx failed for part of the batch, retrying next cycle",
+			slog.Int64("failed", n), slog.Int64("notFound", notFound.Load()), slog.Int("batch", len(kts)))
+	} else if n := notFound.Load(); n > 0 {
+		// Arcade does not know these txids (yet) — a freshly-broadcast tx is not
+		// queryable for a few minutes. Benign, but it is why a repair pass can come
+		// back empty-handed, so keep it visible at DEBUG.
+		p.logger.DebugContext(ctx, "poll: arcade does not know part of the batch",
+			slog.Int64("notFound", n), slog.Int("batch", len(kts)))
+	}
 
 	batch := make([]arcade.TxRecord, 0, len(recs))
 	for i := range recs {
@@ -1135,10 +1303,40 @@ func (p *Provider) pollAndApply(ctx context.Context, kts []metastore.KnownTx) er
 	if len(batch) == 0 {
 		return nil
 	}
-	if err := p.ApplyStatusBatch(ctx, batch); err != nil {
-		p.logger.WarnContext(ctx, "poll: apply batch failed", slog.Int("batch", len(batch)), slog.String("error", err.Error()))
+
+	// Invariant 2: bounded retry, then per-record fallback, then a loud failure.
+	var applyErr error
+	for range pollApplyAttempts {
+		applyErr = p.ApplyStatusBatch(ctx, batch)
+		if applyErr == nil || ctx.Err() != nil {
+			break
+		}
 	}
-	return nil
+	if applyErr == nil {
+		return nil
+	}
+	var failed []string
+	for i := range batch {
+		if err := p.ApplyStatusUpdate(ctx, batch[i]); err != nil {
+			failed = append(failed, batch[i].TxID)
+		}
+	}
+	if len(failed) == 0 {
+		p.logger.WarnContext(ctx, "poll: bulk apply failed but the per-tx fallback applied every record",
+			slog.Int("batch", len(batch)), slog.String("error", applyErr.Error()))
+		return nil
+	}
+	sample := failed
+	if len(sample) > loggedTxIDSample {
+		sample = sample[:loggedTxIDSample]
+	}
+	p.logger.ErrorContext(ctx, "poll: apply failed, transactions left diverged from arcade",
+		slog.Int("failed", len(failed)),
+		slog.Int("batch", len(batch)),
+		slog.Any("sampleTxIDs", sample),
+		slog.String("error", applyErr.Error()))
+	return fmt.Errorf("storage: poll apply failed for %d/%d transactions (e.g. %v): %w",
+		len(failed), len(batch), sample, applyErr)
 }
 
 // DemoteReorgedProofs is the reorg handler: for stored proofs at or above

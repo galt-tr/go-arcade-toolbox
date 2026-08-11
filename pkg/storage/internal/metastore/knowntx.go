@@ -331,6 +331,9 @@ func (r KnownTxRepo) UpdateStatus(ctx context.Context, txid string, status wdk.P
 // precisely how the async batch applier tolerates ErrStatusUpdateSkipped /
 // ErrNotFound from the per-row writer. was_broadcast is set sticky when the new
 // status is broadcast evidence, matching UpdateStatus.
+//
+// The txids are bound (and, on PostgreSQL, locked) in ascending storage order —
+// see lockorder.go.
 func (r KnownTxRepo) BulkUpdateStatus(ctx context.Context, txids []string, status wdk.ProvenTxReqStatus, skipForStatuses ...wdk.ProvenTxReqStatus) error {
 	if len(txids) == 0 {
 		return nil
@@ -339,17 +342,12 @@ func (r KnownTxRepo) BulkUpdateStatus(ctx context.Context, txids []string, statu
 	if status.WasBroadcastStatus() {
 		setWasBroadcast = ", was_broadcast = " + r.s.boolTrueLiteral()
 	}
-	args := []any{string(status), r.s.encTime(r.s.now())}
-	ph := make([]string, 0, len(txids))
-	for _, t := range txids {
-		raw, err := encTxID(t)
-		if err != nil {
-			return err
-		}
-		ph = append(ph, "?")
-		args = append(args, raw)
+	ids, err := txidArgs(txids)
+	if err != nil {
+		return err
 	}
-	conds := []string{"txid IN (" + joinComma(ph) + ")"}
+	args := append([]any{string(status), r.s.encTime(r.s.now())}, ids...)
+	conds := []string{r.s.txidLockOrderedIn("known_txs", "txid", len(ids))}
 	if len(skipForStatuses) > 0 {
 		conds = append(conds, "status NOT IN ("+inPlaceholders(len(skipForStatuses))+")")
 		for _, st := range skipForStatuses {

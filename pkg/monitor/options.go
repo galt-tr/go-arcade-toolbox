@@ -23,10 +23,14 @@ func WithBatchLimit(n int) Option {
 }
 
 // WithApplyConcurrency sets how many SSE status events apply in parallel (still
-// sharded by txid, so per-txid order is preserved). Once recent block headers
-// are cached (see [headers.WithCacheDepth]), proof application is DB-bound, so a
-// sustained ~1000-TPS deployment must raise this above the default 8 for the
-// apply pipeline to keep pace with mining. A non-positive value is ignored.
+// sharded by txid, so per-txid order is preserved) — it is the shard count
+// [Daemon.applyShards] returns. Once recent block headers are cached (see
+// [headers.WithCacheDepth]), proof application is DB-bound, so a sustained
+// ~1000-TPS deployment must raise this above the default 8 for the apply
+// pipeline to keep pace with mining: when the appliers cannot drain the hand-off
+// queue, the SSE reader blocks and arcade drops events for us — which is how
+// transactions end up with no arcade status at all. A non-positive value is
+// ignored.
 func WithApplyConcurrency(n int) Option {
 	return func(d *Daemon) {
 		if n > 0 {
