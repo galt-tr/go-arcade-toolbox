@@ -186,6 +186,15 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 // applier is about to park. That is the moment to do deferred work — flushing
 // the replay cursor — for free: nothing is waiting behind it.
 func collectBatch(ctx context.Context, events <-chan arcade.StatusEvent, linger time.Duration, onIdle func()) []arcade.StatusEvent {
+	// Stop the moment the daemon is shutting down. Without this, a cancel with a
+	// full hand-off queue keeps handing out batches that can only fail — the
+	// apply runs on the same dead context — and logs one ERROR per batch on the
+	// way down. Dropping them is what the cursor is for: it never advanced past
+	// them, so they are re-delivered on the next connect.
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	batch := make([]arcade.StatusEvent, 0, applyBatchMax)
 	select {
 	case ev := <-events:
