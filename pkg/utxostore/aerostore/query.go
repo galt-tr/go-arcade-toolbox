@@ -11,42 +11,93 @@ import (
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
 )
 
+// streamQuery runs stmt and hands every record to visit, honoring ctx.
+//
+// The Aerospike Go client (v8) has NO context-aware API: Query hands back a
+// Recordset whose producer goroutines run until it is drained or closed, and
+// NewQueryPolicy defaults TotalTimeout to 0 — no time limit whatsoever. A caller
+// that wrapped one of these queries in a budget therefore had no way to enforce
+// it, which matters because these are index scans: the invKey sindex behind
+// [Store.Balance] measured 303,264 entries per bval on the live cluster, so one
+// call walks ~300k entries with nothing able to stop it.
+//
+// So the context is applied on both halves: its deadline bounds the server-side
+// work through the policy, and its done channel is selected on alongside the
+// results so cancellation takes effect immediately. The recordset is always
+// closed — abandoning one mid-walk otherwise strands the client's producer
+// goroutines until the GC finalizer happens to run.
+func (s *Store) streamQuery(ctx context.Context, policy *as.QueryPolicy, stmt *as.Statement, visit func(*as.Record) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return context.DeadlineExceeded
+		}
+		policy.TotalTimeout = remaining
+	}
+
+	rs, err := s.client.Query(policy, stmt)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rs.Close() }() // idempotent; cancels producers on an early exit
+
+	results := rs.Results()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case res, ok := <-results:
+			if !ok {
+				return nil
+			}
+			if res.Err != nil {
+				return res.Err
+			}
+			if verr := visit(res.Record); verr != nil {
+				return verr
+			}
+		}
+	}
+}
+
+// emptyBalance is the zero result returned alongside every Balance error, so a
+// caller that ignores the error cannot mistake a partial sum for a real one.
+func emptyBalance() utxostore.Balance {
+	return utxostore.Balance{
+		Claimable:      make(map[utxostore.Tier]uint64),
+		ClaimableCount: make(map[utxostore.Tier]int),
+	}
+}
+
 // Balance implements [utxostore.Store]: sums the (userID, basket) coins via the
 // invKey index (which contains only unspent rows). Claimable is per tier
 // (unspent, unreserved, not frozen); Reserved is reserved-but-unspent (frozen
 // or not). Frozen unreserved rows and spent rows count in neither bucket.
-func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxostore.Balance, error) {
-	b := utxostore.Balance{
-		Claimable:      make(map[utxostore.Tier]uint64),
-		ClaimableCount: make(map[utxostore.Tier]int),
-	}
+//
+// It honors ctx: cancelling or expiring it abandons the index walk (see
+// streamQuery).
+func (s *Store) Balance(ctx context.Context, userID int64, basket string) (utxostore.Balance, error) {
 	if s.closed.Load() {
-		return b, errClosed
+		return emptyBalance(), errClosed
 	}
 
 	stmt := as.NewStatement(s.namespace, s.set)
 	if err := stmt.SetFilter(as.NewEqualFilter(binInvKey, invKeyFor(userID, basket))); err != nil {
-		return b, fmt.Errorf("aerostore: set balance filter: %w", err)
+		return emptyBalance(), fmt.Errorf("aerostore: set balance filter: %w", err)
 	}
-	rs, err := s.client.Query(as.NewQueryPolicy(), stmt)
-	if err != nil {
-		return b, fmt.Errorf("aerostore: balance query: %w", err)
-	}
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return utxostore.Balance{
-					Claimable:      make(map[utxostore.Tier]uint64),
-					ClaimableCount: make(map[utxostore.Tier]int),
-				},
-				fmt.Errorf("aerostore: balance query result: %w", res.Err)
-		}
-		u, cerr := recordToUTXO(res.Record)
+
+	b := emptyBalance()
+	err := s.streamQuery(ctx, as.NewQueryPolicy(), stmt, func(rec *as.Record) error {
+		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
-			return b, cerr
+			return cerr
 		}
 		switch {
 		case u.SpentBy != nil:
-			continue // defensive: invKey index should already exclude spent rows
+			return nil // defensive: invKey index should already exclude spent rows
 		case u.ReservedBy != "":
 			b.Reserved += u.Satoshis
 			b.ReservedCount++
@@ -54,6 +105,10 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 			b.Claimable[u.Tier] += u.Satoshis
 			b.ClaimableCount[u.Tier]++
 		}
+		return nil
+	})
+	if err != nil {
+		return emptyBalance(), fmt.Errorf("aerostore: balance query: %w", err)
 	}
 	return b, nil
 }
@@ -61,7 +116,11 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 // FindStaleReservations implements [utxostore.Store]: reservations of unspent
 // reserved rows whose oldest ReservedAt is before olderThan, oldest first
 // (approximate ordering is acceptable). Backed by the numeric resAt index.
-func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+//
+// It honors ctx across both phases — phase B fans out one query PER stale
+// reservation, so an unhonored context there is unbounded in the number of index
+// walks, not just in the length of one.
+func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -93,20 +152,13 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 	}
 	qpA := as.NewQueryPolicy()
 	qpA.FilterExpression = as.ExpNot(as.ExpBinExists(binSpentBy)) // unspent only
-	rsA, err := s.client.Query(qpA, stmt)
-	if err != nil {
-		return nil, fmt.Errorf("aerostore: stale query: %w", err)
-	}
-	for res := range rsA.Results() {
-		if res.Err != nil {
-			return nil, fmt.Errorf("aerostore: stale query result: %w", res.Err)
-		}
-		u, cerr := recordToUTXO(res.Record)
+	if err := s.streamQuery(ctx, qpA, stmt, func(rec *as.Record) error {
+		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
-			return nil, cerr
+			return cerr
 		}
 		if u.ReservedBy == "" {
-			continue // defensive
+			return nil // defensive
 		}
 		k := token{userID: u.UserID, res: u.ReservedBy}
 		at := u.ReservedAt.UnixMilli()
@@ -116,6 +168,9 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 		} else if at < cur {
 			oldest[k] = at
 		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("aerostore: stale query: %w", err)
 	}
 
 	// Oldest-first (approximate ordering is acceptable), then apply the limit
@@ -129,7 +184,7 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 	// the resBy index (includes rows reserved after the cutoff).
 	refs := make([]utxostore.ReservationRef, 0, len(order))
 	for _, k := range order {
-		ref, ferr := s.reservationMembership(k.userID, k.res)
+		ref, ferr := s.reservationMembership(ctx, k.userID, k.res)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -142,7 +197,7 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 
 // reservationMembership returns the full set of unspent rows held by
 // (userID, reservation), dated by the oldest.
-func (s *Store) reservationMembership(userID int64, reservation string) (utxostore.ReservationRef, error) {
+func (s *Store) reservationMembership(ctx context.Context, userID int64, reservation string) (utxostore.ReservationRef, error) {
 	ref := utxostore.ReservationRef{Reservation: reservation, UserID: userID}
 	stmt := as.NewStatement(s.namespace, s.set)
 	if err := stmt.SetFilter(as.NewEqualFilter(binResBy, reservation)); err != nil {
@@ -153,22 +208,18 @@ func (s *Store) reservationMembership(userID int64, reservation string) (utxosto
 		as.ExpEq(as.ExpIntBin(binUserID), as.ExpIntVal(userID)),
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
 	)
-	rs, err := s.client.Query(qp, stmt)
-	if err != nil {
-		return ref, fmt.Errorf("aerostore: membership query: %w", err)
-	}
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return ref, fmt.Errorf("aerostore: membership query result: %w", res.Err)
-		}
-		u, cerr := recordToUTXO(res.Record)
+	if err := s.streamQuery(ctx, qp, stmt, func(rec *as.Record) error {
+		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
-			return ref, cerr
+			return cerr
 		}
 		if ref.ReservedAt.IsZero() || u.ReservedAt.Before(ref.ReservedAt) {
 			ref.ReservedAt = u.ReservedAt
 		}
 		ref.Outpoints = append(ref.Outpoints, u.Outpoint)
+		return nil
+	}); err != nil {
+		return ref, fmt.Errorf("aerostore: membership query: %w", err)
 	}
 	return ref, nil
 }
