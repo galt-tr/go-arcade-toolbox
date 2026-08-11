@@ -62,6 +62,15 @@ type modelStorage struct {
 	// batchErr, when set, fails every ApplyStatusBatch (the "the database is
 	// down mid-batch" case the replay cursor must not skip past).
 	batchErr error
+	// batchGate, when set, holds every ApplyStatusBatch until the test sends,
+	// so a test can pin the applier in a known place and queue events behind it.
+	batchGate chan struct{}
+	// batchSizes records the size of every ApplyStatusBatch call, in order.
+	// With WithApplyConcurrency(1) there is exactly one call per applied batch,
+	// so this is the batch-size series the applier produced.
+	batchSizes []int
+	// kvWrites counts SetKeyValue calls — i.e. replay-cursor writes.
+	kvWrites atomic.Int32
 }
 
 func newModelStorage(seed []string) *modelStorage {
@@ -149,6 +158,16 @@ func (m *modelStorage) stateOf(txid string) modelState {
 // cross-txid throughput parallelism is preserved.
 func (m *modelStorage) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord) error {
 	m.batchCalls.Add(1)
+	m.mu.Lock()
+	m.batchSizes = append(m.batchSizes, len(recs))
+	gate := m.batchGate
+	m.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+		}
+	}
 	if m.batchErr != nil {
 		return m.batchErr
 	}
@@ -198,6 +217,7 @@ func (m *modelStorage) GetKeyValue(_ context.Context, k string) ([]byte, bool, e
 }
 
 func (m *modelStorage) SetKeyValue(_ context.Context, k string, v []byte) error {
+	m.kvWrites.Add(1)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.kv[k] = v
@@ -236,9 +256,8 @@ func TestApplyStatusBatch_ShardsByTxidArrivalOrderWins(t *testing.T) {
 		rec(d, arcade.StatusRejected),
 	}
 
-	var mu sync.Mutex
-	cursor := ""
-	dmn.applyStatusBatch(context.Background(), batch, &mu, &cursor)
+	cursor := &cursorTracker{daemon: dmn}
+	dmn.applyStatusBatch(context.Background(), batch, cursor)
 
 	// Every txid ends at the MINED outcome — a mined tx is never clobbered by an
 	// earlier-arrival stale frame in the same batch.
@@ -256,7 +275,7 @@ func TestApplyStatusBatch_ShardsByTxidArrivalOrderWins(t *testing.T) {
 	require.GreaterOrEqual(t, store.maxActive, 2, "distinct txids must still run in parallel")
 
 	// Cursor advanced to the last event id of the batch.
-	require.Equal(t, d+"-"+string(arcade.StatusRejected), cursor)
+	require.Equal(t, d+"-"+string(arcade.StatusRejected), cursor.resume(context.Background()))
 }
 
 // TestApplyShards_FollowsWithApplyConcurrency proves the knob is LIVE. The shard
@@ -325,20 +344,20 @@ func TestApplyStatusBatch_FailedApplyHoldsCursor(t *testing.T) {
 	dmn, err := NewDaemon(logging.NewTestLogger(t), store, nil, nil, defs.DefaultMonitorConfig(), WithoutDistributedLock())
 	require.NoError(t, err)
 
-	var mu sync.Mutex
-	cursor := "id-before"
+	ctx := context.Background()
+	cursor := &cursorTracker{daemon: dmn, durable: "id-before"}
 	batch := []arcade.StatusEvent{rec(txid, arcade.StatusMined)}
 
-	dmn.applyStatusBatch(context.Background(), batch, &mu, &cursor)
-	require.Equal(t, "id-before", cursor, "the in-memory cursor must not move past a failed batch")
-	_, ok, _ := store.GetKeyValue(context.Background(), LastEventIDKey)
+	dmn.applyStatusBatch(ctx, batch, cursor)
+	require.Equal(t, "id-before", cursor.resume(ctx), "the resume position must not move past a failed batch")
+	_, ok, _ := store.GetKeyValue(ctx, LastEventIDKey)
 	require.False(t, ok, "the persisted cursor must not move past a failed batch")
 
 	// Once the apply succeeds the cursor resumes advancing normally.
 	store.batchErr = nil
-	dmn.applyStatusBatch(context.Background(), batch, &mu, &cursor)
-	require.Equal(t, txid+"-"+string(arcade.StatusMined), cursor)
-	require.Equal(t, cursor, string(mustKV(t, store, LastEventIDKey)))
+	dmn.applyStatusBatch(ctx, batch, cursor)
+	require.Equal(t, txid+"-"+string(arcade.StatusMined), cursor.resume(ctx))
+	require.Equal(t, cursor.resume(ctx), string(mustKV(t, store, LastEventIDKey)))
 }
 
 func mustKV(t *testing.T, m *modelStorage, key string) []byte {
@@ -347,4 +366,167 @@ func mustKV(t *testing.T, m *modelStorage, key string) []byte {
 	require.NoError(t, err)
 	require.True(t, ok, "key %s persisted", key)
 	return v
+}
+
+// --- Applier batching and cursor coalescing (the "72,773 batches of 15.3" gap) ---
+
+// scriptedOracle is a [arcade.TxOracle] whose SSE stream delivers exactly the
+// events a test pushes, in order, and then stays connected until ctx is
+// canceled — so a test drives the reader→applier hand-off precisely.
+type scriptedOracle struct {
+	events chan arcade.StatusEvent
+}
+
+func (o *scriptedOracle) StreamStatus(ctx context.Context, _ string, onEvent func(arcade.StatusEvent) error) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev := <-o.events:
+			if err := onEvent(ev); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (o *scriptedOracle) Broadcast(context.Context, string, []byte) (*arcade.BroadcastResult, error) {
+	return nil, errors.New("not used")
+}
+
+func (o *scriptedOracle) GetTx(context.Context, string) (*arcade.TxRecord, error) {
+	return nil, errors.New("not used")
+}
+
+func (o *scriptedOracle) Health(context.Context) (*arcade.Health, error) {
+	return nil, errors.New("not used")
+}
+
+// events builds n distinct SEEN events, ids "<prefix>-<i>".
+func seenEvents(prefix string, n int) []arcade.StatusEvent {
+	out := make([]arcade.StatusEvent, n)
+	for i := range out {
+		txid := fmt.Sprintf("%s%060x", prefix, i)
+		out[i] = arcade.StatusEvent{
+			ID:     fmt.Sprintf("%s-%d", prefix, i),
+			Record: arcade.TxRecord{TxID: txid, Status: arcade.StatusSeenOnNetwork},
+		}
+	}
+	return out
+}
+
+// startApplier wires a daemon over a scripted stream and runs handleStatusEvents
+// until the test finishes. WithApplyConcurrency(1) keeps one ApplyStatusBatch
+// call per applied batch, so store.batchSizes is the batch-size series.
+func startApplier(t *testing.T, store *modelStorage, linger time.Duration) *scriptedOracle {
+	t.Helper()
+	oracle := &scriptedOracle{events: make(chan arcade.StatusEvent, applyQueueSize)}
+	dmn, err := NewDaemon(logging.NewTestLogger(t), store, nil, oracle, defs.DefaultMonitorConfig(),
+		WithoutDistributedLock(), WithApplyConcurrency(1))
+	require.NoError(t, err)
+	dmn.applyLinger = linger
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dmn.handleStatusEvents(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("status event handler did not stop")
+		}
+	})
+	return oracle
+}
+
+// batchSizes snapshots the recorded batch-size series.
+func (m *modelStorage) sizes() []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int(nil), m.batchSizes...)
+}
+
+// TestStatusApplier_LingersInsteadOfApplyingTinyBatches is the batching half of
+// the "72,773 batches averaging 15.3 records against a 512 cap" gap: the applier
+// took only what was READY, so under a stream that trickles the batch collapsed
+// to whatever arrived during the previous apply and every one of those tiny
+// batches paid a full shard fan-out and a cursor write.
+//
+// The applier here is pinned inside its first apply while 100 events queue
+// behind it. On release it must NOT immediately apply those 100: it must hold
+// them and keep filling, so the 412 that arrive next join the SAME batch and it
+// applies once, full, at the 512 cap. Without a linger the series is
+// [1, 100, 412] — three fan-outs for what is one batch's worth of work.
+func TestStatusApplier_LingersInsteadOfApplyingTinyBatches(t *testing.T) {
+	store := newModelStorage(nil)
+	store.batchGate = make(chan struct{})
+	// Far longer than the test needs: the batch is released by hitting
+	// applyBatchMax, never by the timer, so nothing here waits on wall-clock.
+	oracle := startApplier(t, store, 30*time.Second)
+
+	push := func(evs []arcade.StatusEvent) {
+		for _, ev := range evs {
+			oracle.events <- ev
+		}
+	}
+	waitBatches := func(n int) {
+		require.Eventually(t, func() bool { return int(store.batchCalls.Load()) >= n },
+			5*time.Second, time.Millisecond, "expected at least %d applied batches", n)
+	}
+
+	// A lone event applies immediately — an idle stream never pays the linger.
+	push(seenEvents("first", 1))
+	waitBatches(1)
+	require.Equal(t, []int{1}, store.sizes())
+
+	// Queue 100 behind the busy applier, then let it through.
+	push(seenEvents("burst", 100))
+	store.batchGate <- struct{}{}
+
+	// Give the applier every chance to drain those 100 and apply them as their
+	// own undersized batch, which is exactly what it used to do.
+	time.Sleep(100 * time.Millisecond)
+
+	// The rest of the burst arrives while the applier is still filling.
+	push(seenEvents("rest", 412))
+	store.batchGate <- struct{}{}
+	waitBatches(2)
+
+	require.Equal(t, []int{1, 512}, store.sizes(),
+		"the burst must apply as ONE full batch, not as the fragments that happened to be ready")
+}
+
+// TestStatusApplier_CoalescesCursorWritesUnderLoad is the cursor half of the
+// same gap: the replay cursor was written once per batch, so moving block 378's
+// 1.1M records cost ~72k key_values writes. The cursor may lag what has been
+// applied (a reconnect just re-delivers idempotent events) — it may only never
+// LEAD it — so under a sustained burst the writes coalesce, and the cursor is
+// still exactly right once the burst ends.
+func TestStatusApplier_CoalescesCursorWritesUnderLoad(t *testing.T) {
+	const total = 8 * applyBatchMax // guarantees at least 8 batches
+
+	store := newModelStorage(nil)
+	oracle := startApplier(t, store, applyLinger)
+
+	evs := seenEvents("bulk", total)
+	for _, ev := range evs {
+		oracle.events <- ev
+	}
+
+	// Wait for the whole burst to be applied and the cursor to settle.
+	last := evs[total-1].ID
+	require.Eventually(t, func() bool {
+		v, ok, _ := store.GetKeyValue(context.Background(), LastEventIDKey)
+		return ok && string(v) == last
+	}, 20*time.Second, 5*time.Millisecond, "cursor must reach the last event of the burst")
+
+	batches := int(store.batchCalls.Load())
+	writes := int(store.kvWrites.Load())
+	require.GreaterOrEqual(t, batches, 8, "a %d-event burst cannot fit in fewer than 8 batches", total)
+	require.Less(t, writes, batches,
+		"the replay cursor must not cost one write per batch (%d writes for %d batches)", writes, batches)
 }

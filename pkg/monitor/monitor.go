@@ -68,6 +68,11 @@ type Daemon struct {
 	suspectGrace        time.Duration
 	maxQuarantine       time.Duration
 	applyConcurrency    int // parallel SSE status-apply workers (WithApplyConcurrency)
+	// applyLinger is how long a status-apply batch waits for more events once
+	// the queue runs dry. Defaults to the applyLinger const; overridable in
+	// tests, where a long linger makes the coalescing assertions exact instead
+	// of timing-dependent.
+	applyLinger time.Duration
 
 	startLock sync.Mutex
 	started   bool
@@ -105,6 +110,7 @@ func NewDaemon(
 		now:                 time.Now,
 		limits:              limits{sendWaiting: defaultBatchLimit, abort: defaultBatchLimit, sync: defaultBatchLimit, proof: defaultBatchLimit, rejectRelease: defaultBatchLimit},
 		applyConcurrency:    defaultApplyWorkers,
+		applyLinger:         applyLinger,
 		failAbandonedAge:    defaultFailAbandonedAge,
 		staleReservationTTL: defaultStaleReservationTTL,
 		suspectGrace:        cfg.Reconciler.SuspectGrace(),

@@ -61,6 +61,25 @@ func eventsURL(config defs.Arcade) string {
 //
 // It blocks until ctx is canceled and then returns ctx.Err(). An error returned
 // by onEvent is only logged - the event still counts as delivered (at-least-once).
+//
+// ONE CONNECTION, DELIBERATELY. A mined block's MINED wave shares this stream
+// with live ACCEPTED/SEEN, and measurably head-of-line-blocks it: ACCEPTED
+// delivery p50 86ms but p95 21.6s, and the p95 splits entirely by block bucket
+// (26,777ms in the bucket containing a 122,640-tx block vs 2,269ms in one
+// without). The obvious fix - a second subscription carrying only MINED, the way
+// the merkle SEEN/STUMP topic split fixed the same shape upstream - is NOT
+// available to a client today and would make things worse if attempted:
+// arcade's GET /events parses exactly one query parameter (callbackToken) and
+// one header (Last-Event-ID), with no status filter anywhere, so a second
+// connection on the same token receives a full duplicate of every event AND
+// doubles arcade's per-event cost, because the token->txid membership probe runs
+// once per client inside the single fan-out goroutine that is already the
+// bottleneck (~1,600 events/s against ~4,000/s of demand at 1000 TPS).
+//
+// Splitting this stream therefore needs an arcade-side change first: a status
+// filter on /events (its store layer already accepts an onlyStatuses argument
+// for catchup) plus a per-client predicate in the fan-out. Verified against
+// arcade v0.11.6.
 func (c *Client) StreamStatus(ctx context.Context, lastEventID string, onEvent func(StatusEvent) error) error {
 	reader := sse.New(sse.Config{
 		Name:   "arcade-events",

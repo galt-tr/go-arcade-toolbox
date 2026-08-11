@@ -41,6 +41,27 @@ const (
 	// before SynchronizeTransactionStatuses re-polls it via GetTx. The cron
 	// interval is the coarse cadence; this filters out just-touched rows.
 	syncStaleness = 1 * time.Minute
+
+	// maxRepairPages caps how many EXTRA pages of the repair list one sweep
+	// drains beyond its first. The repair rate used to be flat — one page per
+	// tick whatever the backlog — so a 269k divergence needed ~65 minutes at the
+	// observed 4,000 rows/≈60s ≈ 67/s, and only a lucky block catchup rescued
+	// it. Recovery has to scale with the hole it is filling, so the sweep pages
+	// while the backlog is deeper than one page: 16 pages of 4,000 is ~1,000/s,
+	// which drains that same 269k in ~4 minutes.
+	//
+	// The cap exists because the sweep must not become the load: each page is
+	// `limit` GetTx calls (pollPeers at a time) plus a bulk apply, and gocron
+	// runs this task in singleton/reschedule mode, so an overlong sweep simply
+	// eats its own next tick.
+	maxRepairPages = 16
+
+	// repairSweepBudget bounds the wall clock the extra repair paging may take,
+	// so the sweep yields well inside a poll interval — the shortest configured
+	// default is 5 minutes, and the deployment that produced the 269k backlog
+	// ran it at ≈60s — however slowly arcade is answering. It is the second half
+	// of the maxRepairPages bound: pages cap the work, the budget caps the time.
+	repairSweepBudget = 30 * time.Second
 )
 
 // pollableStatuses are the in-flight / unproven known-tx statuses the poll
@@ -1136,6 +1157,10 @@ func (p *Provider) AbortAbandoned(ctx context.Context, olderThan time.Time, limi
 //     stranded row that happens to sort behind it would never be selected. This
 //     is the sweep that drains a "23,745 rows with an empty arcade_status" state
 //     instead of letting it sit frozen forever.
+//
+// The repair list is the one that has to KEEP UP: when it does not fit in a
+// single page the sweep keeps paging it (see drainRepairBacklog), so recovery
+// scales with the size of the divergence instead of trickling at a fixed rate.
 func (p *Provider) SynchronizeTransactionStatuses(ctx context.Context, limit int) error {
 	if limit <= 0 {
 		limit = defaultMonitorBatchLimit
@@ -1149,18 +1174,73 @@ func (p *Provider) SynchronizeTransactionStatuses(ctx context.Context, limit int
 	if err != nil {
 		return fmt.Errorf("storage: find txs missing an arcade status: %w", err)
 	}
-	if len(stranded) > 0 {
-		// The backlog SIZE (not just this page of it) is what tells an operator
-		// whether the repair is draining or frozen.
-		total, cErr := p.meta.KnownTx().CountMissingArcadeStatus(ctx, pollableStatuses...)
-		if cErr != nil {
-			p.logger.WarnContext(ctx, "poll: count of txs missing an arcade status failed", slog.String("error", cErr.Error()))
-		}
-		p.logger.WarnContext(ctx, "poll: repairing transactions with no arcade status",
-			slog.Int("repairing", len(stranded)),
-			slog.Int("arcade_status_missing_total", total))
+
+	if err := p.pollAndApply(ctx, mergeKnownTxs(stale, stranded)); err != nil {
+		return err
 	}
-	return p.pollAndApply(ctx, mergeKnownTxs(stale, stranded))
+	if len(stranded) == 0 {
+		return nil
+	}
+	return p.drainRepairBacklog(ctx, cutoff, limit, len(stranded))
+}
+
+// drainRepairBacklog reports the repair sweep and, when the first page came back
+// FULL, keeps paging: a full page means the divergence is deeper than one page,
+// and one page per tick will not close it. At the observed 4,000 rows per ≈60s
+// tick a 269k backlog needs ~65 minutes, and the run that produced that number
+// was rescued by a block catchup rather than by this path.
+//
+// It scales the page count with the measured backlog, bounded by maxRepairPages
+// and repairSweepBudget so a deep backlog cannot turn the sweep into the load.
+// Paging works because pollAndApply stamps last_polled_at on every row it takes
+// BEFORE anything else, and the repair query orders by that stamp — so each page
+// returns rows the previous one did not.
+//
+// firstPage is what the caller already repaired, counted here so the log line
+// reports the sweep's whole effort.
+func (p *Provider) drainRepairBacklog(ctx context.Context, cutoff time.Time, limit, firstPage int) error {
+	// The backlog SIZE (not just this page of it) is what tells an operator
+	// whether the repair is draining or frozen, and it is what sets the pace.
+	total, err := p.meta.KnownTx().CountMissingArcadeStatus(ctx, pollableStatuses...)
+	if err != nil {
+		p.logger.WarnContext(ctx, "poll: count of txs missing an arcade status failed", slog.String("error", err.Error()))
+		total = 0
+	}
+
+	// total is measured AFTER the caller's page applied, so it is what is still
+	// owed; size the extra paging to exactly that, capped.
+	pages := 0
+	if firstPage >= limit && total > 0 {
+		pages = min((total+limit-1)/limit, maxRepairPages)
+	}
+
+	deadline := p.now().Add(repairSweepBudget)
+	repaired := firstPage
+	for range pages {
+		if ctx.Err() != nil || !p.now().Before(deadline) {
+			break
+		}
+		page, ferr := p.meta.KnownTx().FindMissingArcadeStatus(ctx, cutoff, limit, pollableStatuses...)
+		if ferr != nil {
+			return fmt.Errorf("storage: find txs missing an arcade status: %w", ferr)
+		}
+		if len(page) == 0 {
+			break
+		}
+		if aerr := p.pollAndApply(ctx, page); aerr != nil {
+			return aerr
+		}
+		repaired += len(page)
+		if len(page) < limit {
+			break // the list is drained
+		}
+	}
+
+	p.logger.WarnContext(ctx, "poll: repairing transactions with no arcade status",
+		slog.Int("repairing", repaired),
+		slog.Int("pages", pages+1),
+		slog.Int("arcade_status_missing_total", total))
+	return nil
 }
 
 // mergeKnownTxs concatenates two work lists, dropping txids already present in

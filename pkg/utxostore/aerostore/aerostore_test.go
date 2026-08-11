@@ -1,7 +1,9 @@
 package aerostore
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -126,4 +128,38 @@ func TestParseDSN(t *testing.T) {
 		_, err := parseDSN(bad)
 		require.Errorf(t, err, "expected %q to fail", bad)
 	}
+}
+
+// TestQueryHonorsContext pins the contract [Store.streamQuery] exists for: the
+// caller's context is checked BEFORE the client is dialed, so a canceled or
+// expired budget stops the index walk instead of being silently discarded.
+//
+// These queries are index scans — the invKey sindex behind Balance measured
+// 303,264 entries per bval on the live cluster — and the Aerospike client has no
+// context-aware API, so a discarded context meant a caller's 5s budget bounded
+// nothing at all.
+//
+// The store here has no client, which is the point: reaching Query would panic,
+// so the assertions can only pass if the context was honored first.
+func TestQueryHonorsContext(t *testing.T) {
+	s := &Store{namespace: "test", set: "utxos"}
+
+	t.Run("canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := s.Balance(ctx, 1, "default")
+		require.ErrorIs(t, err, context.Canceled)
+
+		_, err = s.FindStaleReservations(ctx, time.Now(), 10)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("expired deadline", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		_, err := s.Balance(ctx, 1, "default")
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	})
 }
