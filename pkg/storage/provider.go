@@ -54,6 +54,10 @@ type Provider struct {
 	beef    wdk.BeefVerifier
 	rand    wdk.Randomizer
 
+	// chronicleScripts selects Chronicle-era rules for the default scripts
+	// verifier. See [WithChronicleOpcodes].
+	chronicleScripts bool
+
 	feeModel     defs.FeeModel
 	changeBasket defs.ChangeBasket
 	utxoMgmt     defs.UTXOManagement
@@ -101,6 +105,30 @@ type Option func(*Provider)
 // WithScriptsVerifier overrides the default (go-sdk interpreter) scripts verifier.
 func WithScriptsVerifier(v wdk.ScriptsVerifier) Option {
 	return func(p *Provider) { p.scripts = v }
+}
+
+// WithChronicleOpcodes makes the default scripts verifier validate against
+// Chronicle-era consensus rules instead of Genesis-era ones.
+//
+// Chronicle (BSV v1.2.0) re-enabled OP_2MUL and OP_2DIV, which Genesis had left
+// disabled. Without this option those opcodes are rejected locally, in
+// [Provider.ProcessAction], BEFORE the transaction is ever offered to Arcade —
+// so a transaction that the network would accept fails with:
+//
+//	storage: script verification failed for input 0:
+//	attempt to execute disabled opcode OP_2MUL
+//
+// This is not hypothetical: contracts compiled by Rúnar emit OP_2MUL inside the
+// OP_PUSH_TX preamble that every stateful (checkPreimage) covenant carries, so
+// none of them can be spent through this wallet under Genesis rules.
+//
+// It is off by default because enabling it accepts scripts that a node still
+// running Genesis rules would reject. Turn it on when the network you broadcast
+// to has activated Chronicle.
+//
+// Has no effect when [WithScriptsVerifier] supplies a custom verifier.
+func WithChronicleOpcodes() Option {
+	return func(p *Provider) { p.chronicleScripts = true }
 }
 
 // WithBeefVerifier overrides the default (go-sdk beef.Verify over the headers
@@ -227,7 +255,7 @@ func New(
 		p.rand = newDefaultRandomizer()
 	}
 	if p.scripts == nil {
-		p.scripts = newDefaultScriptsVerifier()
+		p.scripts = newDefaultScriptsVerifier(p.chronicleScripts)
 	}
 	if p.beef == nil {
 		if hdrs == nil {
