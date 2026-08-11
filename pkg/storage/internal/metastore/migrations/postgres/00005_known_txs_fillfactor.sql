@@ -1,0 +1,47 @@
+-- +goose Up
+-- known_txs is the most update-heavy table in the workload: a transaction is
+-- created once and then re-written on every status transition, which the live
+-- 1000-TPS runs measure at roughly 18 row-writes per created transaction. The
+-- live table showed n_tup_hot_upd = 0 across 52.4M updates and had grown to
+-- 1978MB of heap for 1.54M live rows.
+--
+-- WHAT THIS FIXES, AND WHAT IT DOES NOT. It is tempting to read "hot_upd = 0"
+-- as "leave free space on the page and the updates go HOT". They do not, and
+-- that was measured, not assumed (postgres 17, the real schema, the real write
+-- paths, 3,000 rows × 4 arcade status transitions):
+--
+--   fillfactor | hot_upd | newpage_upd | heap pages before -> after
+--   -----------+---------+-------------+---------------------------
+--          100 |       0 |      11,945 |  50 ->  321   (x6.42)
+--           90 |       0 |       9,196 |  55 ->  277   (x5.04)
+--           80 |       0 |       6,427 |  62 ->  228   (x3.68)
+--           70 |       0 |       3,848 |  70 ->  179   (x2.56)
+--           50 |       0 |         400 | 100 ->  116   (x1.16)
+--
+-- HOT stays at zero at every fillfactor because HOT also requires that no
+-- INDEXED column changed, and postgres counts a partial index's PREDICATE
+-- columns as indexed. The dominant write here sets arcade_status + updated_at:
+-- arcade_status is the predicate of idx_known_txs_no_arcade_status and
+-- updated_at is the second key of idx_known_txs_status. Removing BOTH does
+-- unlock HOT (measured: 8,152 of 12,000 updates) — but those are precisely the
+-- indexes the repair sweep and the anti-starvation poll ordering depend on, so
+-- that trade is not available: it would reintroduce the stranded-transaction
+-- bug that migration 00004 exists to fix.
+--
+-- What a lower fillfactor DOES buy, without touching a single index or query,
+-- is new-page updates: at 100 essentially every update (11,945 of 12,000)
+-- allocates a new page, and each of those is a page allocation, a WAL full-page
+-- image, and heap growth that only VACUUM gives back. At 70 that drops ~3x and
+-- the table ends 44% smaller after identical churn, for a 40% larger cold size.
+-- 70 is the trade taken here; 50 is better still on churn but doubles the cold
+-- footprint of a table whose heap is already the largest non-TOAST object.
+--
+-- This is a catalog-only change: it does not rewrite the table. Existing pages
+-- keep their current packing until they are next rewritten, so the benefit
+-- arrives gradually. An operator wanting it immediately on an already-bloated
+-- table must run VACUUM FULL or CLUSTER out of band — neither can run inside a
+-- migration's transaction.
+ALTER TABLE known_txs SET (fillfactor = 70);
+
+-- +goose Down
+ALTER TABLE known_txs RESET (fillfactor);

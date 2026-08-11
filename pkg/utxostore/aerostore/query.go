@@ -77,7 +77,7 @@ func emptyBalance() utxostore.Balance {
 // (unspent, unreserved, not frozen); Reserved is reserved-but-unspent (frozen
 // or not). Frozen unreserved rows and spent rows count in neither bucket.
 //
-// It honors ctx: cancelling or expiring it abandons the index walk (see
+// It honors ctx: canceling or expiring it abandons the index walk (see
 // streamQuery).
 func (s *Store) Balance(ctx context.Context, userID int64, basket string) (utxostore.Balance, error) {
 	if s.closed.Load() {

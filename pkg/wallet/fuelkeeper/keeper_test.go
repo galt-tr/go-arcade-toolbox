@@ -412,7 +412,7 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 // leaf is attempted this many times before it gives up for the round.
 const mintLeafAttempts = 4
 
-// contendingWallet fails the first `failCalls` leaf fan-outs — modelling the
+// contendingWallet fails the first `failCalls` leaf fan-outs — modeling the
 // live hazard, where concurrent leaves draw from one shared basket and the
 // losers get a non-retryable provided-input conflict — and, like a real wallet,
 // refuses to do anything on a canceled context.

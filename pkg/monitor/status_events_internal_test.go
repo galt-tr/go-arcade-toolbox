@@ -393,9 +393,11 @@ func (o *scriptedOracle) StreamStatus(ctx context.Context, _ string, onEvent fun
 func (o *scriptedOracle) Broadcast(context.Context, string, []byte) (*arcade.BroadcastResult, error) {
 	return nil, errors.New("not used")
 }
+
 func (o *scriptedOracle) GetTx(context.Context, string) (*arcade.TxRecord, error) {
 	return nil, errors.New("not used")
 }
+
 func (o *scriptedOracle) Health(context.Context) (*arcade.Health, error) {
 	return nil, errors.New("not used")
 }
