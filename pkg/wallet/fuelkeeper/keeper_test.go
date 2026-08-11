@@ -407,3 +407,84 @@ func TestNew_RejectsInvalidConfig(t *testing.T) {
 	_, err := fuelkeeper.New(nil, keeperConfig(), logging.NewTestLogger(t))
 	require.Error(t, err)
 }
+
+// mintLeafAttempts mirrors the keeper's unexported retry bound: a contended
+// leaf is attempted this many times before it gives up for the round.
+const mintLeafAttempts = 4
+
+// contendingWallet fails the first `failCalls` leaf fan-outs — modelling the
+// live hazard, where concurrent leaves draw from one shared basket and the
+// losers get a non-retryable provided-input conflict — and, like a real wallet,
+// refuses to do anything on a canceled context.
+type contendingWallet struct {
+	*fakeWallet
+
+	mu             sync.Mutex
+	failCalls      int
+	seenLeaves     int
+	canceledLeaves int
+}
+
+func (c *contendingWallet) FanOutFuel(ctx context.Context, shape wdk.ShapedChange, o string) (*sdk.CreateActionResult, error) {
+	if string(shape.Basket) != "fuel" {
+		return c.fakeWallet.FanOutFuel(ctx, shape, o)
+	}
+	c.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.canceledLeaves++
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.seenLeaves++
+	fail := c.seenLeaves <= c.failCalls
+	c.mu.Unlock()
+	if fail {
+		return nil, errors.New("provided input conflict: outpoint already reserved")
+	}
+	return c.fakeWallet.FanOutFuel(ctx, shape, o)
+}
+
+func (c *contendingWallet) counts() (seen, canceled int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seenLeaves, c.canceledLeaves
+}
+
+// TestRunOnce_ContendedLeafDoesNotAbortTheRound pins the two things a losing
+// leaf must NOT do.
+//
+// It must not fail the round: contention between concurrent leaves is ordinary
+// and self-healing, and reporting it as "fuel top-up round failed" at ERROR
+// produced 35 such lines in a run whose pool still reached 1.55M leaves.
+//
+// And it must not take its siblings with it. The round ran on an
+// errgroup.WithContext, whose derived context is canceled by the FIRST error, so
+// one exhausted leaf killed every leaf behind it — and those aborted broadcasts
+// went out through the arcade client the payment path shares, where the circuit
+// breaker counted each cancellation as an arcade outage.
+//
+// One leaf is starved to exhaustion (mintLeafAttempts failures in a row) while
+// the other four have funds waiting for them.
+func TestRunOnce_ContendedLeafDoesNotAbortTheRound(t *testing.T) {
+	cfg := keeperConfig() // FanoutMaxTxsPerRound 5 → a 5-leaf round
+	cfg.MintConcurrency = 1
+	// Reserve is full and the change basket is too thin for the recycle path,
+	// so the ONLY thing that can go wrong is the starved leaf.
+	fake := &fakeWallet{poolTotal: 0, reserveTotal: 100, claimableCount: 1}
+	wallet := &contendingWallet{fakeWallet: fake, failCalls: mintLeafAttempts}
+
+	keeper, err := fuelkeeper.New(wallet, cfg, logging.NewTestLogger(t))
+	require.NoError(t, err)
+
+	require.NoError(t, keeper.RunOnce(t.Context()),
+		"a leaf losing the funding race is ordinary contention, not a round failure")
+
+	// The four leaves behind the loser still minted; only the loser is left for
+	// the next round.
+	require.Equal(t, 4, fake.fuelFanOuts(), "the leaves behind a contended one must still mint")
+	require.EqualValues(t, 400, fake.pool())
+
+	seen, canceled := wallet.counts()
+	require.Equal(t, 0, canceled, "a contended leaf must not cancel its siblings")
+	require.Equal(t, mintLeafAttempts+4, seen, "the loser exhausted its retries, the rest funded first try")
+}

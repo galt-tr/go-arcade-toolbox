@@ -450,12 +450,75 @@ func (k *Keeper) runOnce(ctx context.Context) (catchUp bool, err error) {
 	return stillLow, nil
 }
 
+// leafOutcome accumulates one round's leaf results.
+//
+// A leaf that loses the funding race after every retry is ORDINARY: concurrent
+// leaves draw from one shared basket, can select the same coin, and the loser is
+// simply re-minted by the next round. It used to fail the WHOLE round, which was
+// wrong twice over. errgroup.WithContext cancels its derived context on the
+// first error, so one contended leaf aborted every sibling still in flight —
+// and, because those siblings broadcast through the arcade client the payment
+// path shares, their cancellations were counted as arcade outages by the circuit
+// breaker. Meanwhile the operator saw "fuel top-up round failed" at ERROR: 35 of
+// them in a run whose pool still reached 1.55M leaves without trouble.
+//
+// So contention is counted, not propagated, and reported once per round.
+type leafOutcome struct {
+	// minted counts leaves that funded.
+	minted atomic.Uint64
+	// contended counts leaves that exhausted mintLeafAttempts.
+	contended atomic.Uint64
+
+	mu sync.Mutex
+	// lastErr is the most recent leaf failure, kept for the round's log line so
+	// a genuinely broken keeper (bad shape, dead wallet) is still diagnosable.
+	lastErr error
+}
+
+// fail records a leaf that could not fund after every attempt.
+func (o *leafOutcome) fail(err error) {
+	o.contended.Add(1)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.lastErr = err
+}
+
+// err returns the last leaf failure, if any.
+func (o *leafOutcome) err() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.lastErr
+}
+
+// report logs how a round's leaves fared. Partial contention is expected and
+// stays at DEBUG; a round in which NOTHING funded is worth an operator's
+// attention, so it is a WARN.
+func (k *Keeper) report(ctx context.Context, out *leafOutcome, issued uint64) {
+	contended := out.contended.Load()
+	if contended == 0 {
+		return
+	}
+	attrs := []any{
+		slog.Uint64("contendedLeaves", contended),
+		slog.Uint64("issuedLeaves", issued),
+		logging.Error(out.err()),
+	}
+	if out.minted.Load() == 0 {
+		k.logger.WarnContext(ctx, "no leaf in this round funded; next round retries", attrs...)
+		return
+	}
+	k.logger.DebugContext(ctx, "some leaves lost the funding race; next round retries", attrs...)
+}
+
 // mintOneLeaf performs a single leaf fan-out, retrying reserve-chunk selection
 // collisions. Concurrent leaves fund from the same reserve basket and can pick
 // the same chunk; storage reports that as a (deliberately non-retryable)
 // provided-input conflict, which would otherwise fail most of a round. A short
 // stagger between attempts spreads the selection.
-func (k *Keeper) mintOneLeaf(ctx context.Context, cfg Config, minted *atomic.Uint64) error {
+//
+// It never returns an error: an exhausted leaf is recorded on out and the round
+// carries on (see [leafOutcome]).
+func (k *Keeper) mintOneLeaf(ctx context.Context, cfg Config, out *leafOutcome) error {
 	shape := wdk.ShapedChange{
 		Count:    cfg.FanoutOutputsPerTx,
 		Satoshis: primitives.SatoshiValue(cfg.Denomination),
@@ -472,14 +535,15 @@ func (k *Keeper) mintOneLeaf(ctx context.Context, cfg Config, minted *atomic.Uin
 			}
 		}
 		if err = k.fanOut(ctx, cfg, shape); err == nil {
-			minted.Add(1)
+			out.minted.Add(1)
 			return nil
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("leaf fan-out failed after %d attempts: %w", mintLeafAttempts, err)
+	out.fail(fmt.Errorf("leaf fan-out failed after %d attempts: %w", mintLeafAttempts, err))
+	return nil
 }
 
 // mintLeaves runs up to `leaves` leaf fan-outs with MintConcurrency-bounded
@@ -487,21 +551,25 @@ func (k *Keeper) mintOneLeaf(ctx context.Context, cfg Config, minted *atomic.Uin
 // active it stops issuing new leaves past StreamLeafCap (a stream starting
 // mid-round shortens even a big idle catch-up round) and each fan-out still
 // yields afterward (see fanOut), bounding the keeper's share of the shared
-// wallet. On error the started leaves finish and the first error is returned
-// with the partial mint count already reflected in the result.
+// wallet.
+//
+// A leaf that cannot fund does not stop the round: see [leafOutcome] for why a
+// contended leaf must not cancel its siblings.
 func (k *Keeper) mintLeaves(ctx context.Context, cfg Config, leaves uint64) (uint64, error) {
 	conc := cfg.MintConcurrency
 	if conc == 0 {
 		conc = 1
 	}
 
-	g, gctx := errgroup.WithContext(ctx)
+	// Deliberately NOT errgroup.WithContext: its derived context is canceled by
+	// the first error, which here would abort every sibling leaf still in flight.
+	g := new(errgroup.Group)
 	g.SetLimit(int(conc))
 
-	var mintedLeaves atomic.Uint64
+	var out leafOutcome
 	issued := uint64(0)
 	for range leaves {
-		if gctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 		if k.streamActive.Load() && issued >= cfg.StreamLeafCap {
@@ -510,11 +578,12 @@ func (k *Keeper) mintLeaves(ctx context.Context, cfg Config, leaves uint64) (uin
 			break
 		}
 		issued++
-		g.Go(func() error { return k.mintOneLeaf(gctx, cfg, &mintedLeaves) })
+		g.Go(func() error { return k.mintOneLeaf(ctx, cfg, &out) })
 	}
 
 	err := g.Wait()
-	minted := mintedLeaves.Load() * cfg.FanoutOutputsPerTx
+	k.report(ctx, &out, issued)
+	minted := out.minted.Load() * cfg.FanoutOutputsPerTx
 	if err != nil {
 		return minted, fmt.Errorf("mint round failed after %d outputs: %w", minted, err)
 	}
@@ -527,7 +596,9 @@ func (k *Keeper) mintLeaves(ctx context.Context, cfg Config, leaves uint64) (uin
 // leaves draw from the same change basket and can pick the same coins, which
 // storage reports as a (non-retryable) provided-input conflict; a short stagger
 // between attempts spreads the selection.
-func (k *Keeper) mintOneRecycleLeaf(ctx context.Context, cfg Config, minted *atomic.Uint64) error {
+//
+// Like mintOneLeaf it never returns an error; see [leafOutcome].
+func (k *Keeper) mintOneRecycleLeaf(ctx context.Context, cfg Config, out *leafOutcome) error {
 	shape := wdk.ShapedChange{
 		Count:        cfg.RecycleCount,
 		Satoshis:     primitives.SatoshiValue(cfg.Denomination),
@@ -545,34 +616,36 @@ func (k *Keeper) mintOneRecycleLeaf(ctx context.Context, cfg Config, minted *ato
 			}
 		}
 		if err = k.fanOut(ctx, cfg, shape); err == nil {
-			minted.Add(1)
+			out.minted.Add(1)
 			return nil
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("recycle leaf fan-out failed after %d attempts: %w", mintLeafAttempts, err)
+	out.fail(fmt.Errorf("recycle leaf fan-out failed after %d attempts: %w", mintLeafAttempts, err))
+	return nil
 }
 
 // mintRecycleLeaves runs up to `leaves` direct-recycle leaf fan-outs with
 // MintConcurrency-bounded parallelism and returns how many fuel outputs were
-// minted (leaves × RecycleCount). It mirrors mintLeaves' concurrency and
-// stream-fairness structure but funds each leaf directly from the change basket
-// (see mintOneRecycleLeaf) instead of consuming a reserve chunk.
+// minted (leaves × RecycleCount). It mirrors mintLeaves' concurrency, contention
+// tolerance and stream-fairness structure but funds each leaf directly from the
+// change basket (see mintOneRecycleLeaf) instead of consuming a reserve chunk.
 func (k *Keeper) mintRecycleLeaves(ctx context.Context, cfg Config, leaves uint64) (uint64, error) {
 	conc := cfg.MintConcurrency
 	if conc == 0 {
 		conc = 1
 	}
 
-	g, gctx := errgroup.WithContext(ctx)
+	// Deliberately NOT errgroup.WithContext: see mintLeaves.
+	g := new(errgroup.Group)
 	g.SetLimit(int(conc))
 
-	var mintedLeaves atomic.Uint64
+	var out leafOutcome
 	issued := uint64(0)
 	for range leaves {
-		if gctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 		if k.streamActive.Load() && issued >= cfg.StreamLeafCap {
@@ -581,11 +654,12 @@ func (k *Keeper) mintRecycleLeaves(ctx context.Context, cfg Config, leaves uint6
 			break
 		}
 		issued++
-		g.Go(func() error { return k.mintOneRecycleLeaf(gctx, cfg, &mintedLeaves) })
+		g.Go(func() error { return k.mintOneRecycleLeaf(ctx, cfg, &out) })
 	}
 
 	err := g.Wait()
-	minted := mintedLeaves.Load() * cfg.RecycleCount
+	k.report(ctx, &out, issued)
+	minted := out.minted.Load() * cfg.RecycleCount
 	if err != nil {
 		return minted, fmt.Errorf("recycle mint round failed after %d outputs: %w", minted, err)
 	}
@@ -617,6 +691,11 @@ func (k *Keeper) ensureChunks(ctx context.Context, cfg Config, leaves uint64) (u
 		// all-or-nothing fan-out would then mint NOTHING while the stream
 		// drains the pool dry, so halve the ask until it funds. Bounded:
 		// ~log2(needed) failed attempts before giving up entirely.
+		//
+		// Each of those attempts is a designed step of the search, not an
+		// incident, so it logs at DEBUG — at INFO it was 534 lines in a run
+		// that provisioned the pool without trouble. The outcome of the search
+		// is what an operator needs, and it is logged below.
 		for needed > 1 {
 			if err = k.fanOut(ctx, cfg, wdk.ShapedChange{
 				Count:    needed,
@@ -625,7 +704,7 @@ func (k *Keeper) ensureChunks(ctx context.Context, cfg Config, leaves uint64) (u
 			}); err == nil {
 				break
 			}
-			k.logger.InfoContext(ctx, "chunk fan-out did not fund, halving ask",
+			k.logger.DebugContext(ctx, "chunk fan-out did not fund, halving ask",
 				slog.Uint64("count", needed), logging.Error(err))
 			needed /= 2
 		}
