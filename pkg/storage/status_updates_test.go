@@ -835,3 +835,82 @@ func TestApplyStatusBatch_MinedVerifyDoesNotSerialize(t *testing.T) {
 	require.Less(t, elapsed, time.Duration(n/2)*delay,
 		"MINED verify serialized on the memo mutex: %v for %d distinct keys at %v/fetch", elapsed, n, delay)
 }
+
+// TestSynchronizeTransactionStatuses_RepairRateScalesWithBacklog is the cadence
+// half of the repair path. Reaching the rows behind the head is necessary but
+// not sufficient: the sweep also has to reach them FAST ENOUGH. It used to take
+// exactly one page per tick whatever the backlog, which the live run measured at
+// 4,000 rows per ≈60s tick — 67/s against a 269k divergence, i.e. ~65 minutes,
+// and that backlog was in fact rescued by a block catchup rather than by this
+// sweep.
+//
+// A backlog deeper than one page must therefore be paged within a single sweep,
+// so recovery scales with the size of the hole instead of trickling.
+func TestSynchronizeTransactionStatuses_RepairRateScalesWithBacklog(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	// Five pages' worth of diverged rows: every one has a valid local status and
+	// no arcade status at all.
+	const (
+		rows  = 10
+		limit = 2
+	)
+	stranded := make([]string, rows)
+	for i := range rows {
+		stranded[i] = newTxID(byte(0xB0 + i))
+		h.seedChangeTx(stranded[i], wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 5000, utxostore.TierUnproven)
+	}
+	h.oracle.getTx = func(_ context.Context, id string) (*arcade.TxRecord, error) {
+		return &arcade.TxRecord{TxID: id, Status: arcade.StatusSeenOnNetwork}, nil
+	}
+	h.now = h.now.Add(5 * time.Minute) // every row is stale enough to poll
+
+	require.NoError(t, h.p.SynchronizeTransactionStatuses(ctx, limit))
+
+	for _, txid := range stranded {
+		require.NotNilf(t, h.knownTx(txid).ArcadeStatus,
+			"one sweep at limit=%d must drain a %d-row divergence, not %d of it", limit, rows, limit)
+	}
+}
+
+// maxRepairPages mirrors the storage package's unexported cap on how many EXTRA
+// pages of the repair list one sweep may drain.
+const maxRepairPages = 16
+
+// TestSynchronizeTransactionStatuses_RepairPagingIsBounded holds the other side
+// of the same knob: scaling with the backlog must not let one sweep run away
+// with the process. The sweep is a scheduled job — gocron reschedules it in
+// singleton mode — so it has to yield, and maxRepairPages is what makes it.
+func TestSynchronizeTransactionStatuses_RepairPagingIsBounded(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	// Far more diverged rows than maxRepairPages pages can cover at limit=1.
+	const (
+		rows  = maxRepairPages + 8
+		limit = 1
+	)
+	for i := range rows {
+		h.seedChangeTx(newTxID(byte(0x30+i)), wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 5000, utxostore.TierUnproven)
+	}
+
+	var mu sync.Mutex
+	polled := 0
+	h.oracle.getTx = func(_ context.Context, id string) (*arcade.TxRecord, error) {
+		mu.Lock()
+		polled++
+		mu.Unlock()
+		return &arcade.TxRecord{TxID: id, Status: arcade.StatusSeenOnNetwork}, nil
+	}
+	h.now = h.now.Add(5 * time.Minute)
+
+	require.NoError(t, h.p.SynchronizeTransactionStatuses(ctx, limit))
+
+	mu.Lock()
+	defer mu.Unlock()
+	// One first page (merged staleness + repair) plus at most maxRepairPages.
+	require.LessOrEqual(t, polled, (1+maxRepairPages)*limit,
+		"one sweep must not page past maxRepairPages, however deep the backlog")
+	require.Less(t, polled, rows, "the remainder is left for the next tick")
+}
