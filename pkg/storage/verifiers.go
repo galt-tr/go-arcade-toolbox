@@ -59,9 +59,14 @@ func (v *defaultBeefVerifier) VerifyBeef(ctx context.Context, beef *transaction.
 // through the go-sdk interpreter. It verifies SCRIPTS ONLY — no merkle proofs,
 // no ancestor recursion (proofs belong to internalize). It is the local
 // implementation of [wdk.ScriptsVerifier].
-type defaultScriptsVerifier struct{}
+type defaultScriptsVerifier struct {
+	// chronicle selects Chronicle-era script rules. See [WithChronicleOpcodes].
+	chronicle bool
+}
 
-func newDefaultScriptsVerifier() *defaultScriptsVerifier { return &defaultScriptsVerifier{} }
+func newDefaultScriptsVerifier(chronicle bool) *defaultScriptsVerifier {
+	return &defaultScriptsVerifier{chronicle: chronicle}
+}
 
 var _ wdk.ScriptsVerifier = (*defaultScriptsVerifier)(nil)
 
@@ -78,14 +83,27 @@ func (v *defaultScriptsVerifier) VerifyScripts(_ context.Context, tx *transactio
 		if src == nil {
 			return false, fmt.Errorf("storage: input %d has no source output to verify against", i)
 		}
-		err := engine.Execute(
-			interpreter.WithTx(tx, i, src),
-			interpreter.WithForkID(),
-			interpreter.WithAfterGenesis(),
-		)
+		err := engine.Execute(v.executionOptions(tx, i, src)...)
 		if err != nil {
 			return false, fmt.Errorf("storage: script verification failed for input %d: %w", i, err)
 		}
 	}
 	return true, nil
+}
+
+// executionOptions builds the interpreter flags for one input. Chronicle
+// implies after-genesis, so the two eras are mutually exclusive rather than
+// additive.
+func (v *defaultScriptsVerifier) executionOptions(
+	tx *transaction.Transaction, i int, src *transaction.TransactionOutput,
+) []interpreter.ExecutionOptionFunc {
+	era := interpreter.WithAfterGenesis()
+	if v.chronicle {
+		era = interpreter.WithAfterChronicle()
+	}
+	return []interpreter.ExecutionOptionFunc{
+		interpreter.WithTx(tx, i, src),
+		interpreter.WithForkID(),
+		era,
+	}
 }
