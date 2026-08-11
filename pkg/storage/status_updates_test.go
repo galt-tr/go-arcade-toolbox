@@ -73,6 +73,9 @@ func (f *fakeOracle) Health(context.Context) (*arcade.Health, error) {
 type fakeHeaders struct {
 	roots       map[uint32]chainhash.Hash
 	verifyCalls atomic.Int32
+	// verifyDelay simulates the chaintracks round-trip a real VerifyMerkleRoot
+	// makes, so a test can prove concurrent verifications are not serialized.
+	verifyDelay time.Duration
 }
 
 func newFakeHeaders() *fakeHeaders { return &fakeHeaders{roots: map[uint32]chainhash.Hash{}} }
@@ -102,6 +105,9 @@ func (f *fakeHeaders) HeaderByHeight(_ context.Context, height uint32) (*headers
 
 func (f *fakeHeaders) VerifyMerkleRoot(_ context.Context, root *chainhash.Hash, height uint32) (bool, error) {
 	f.verifyCalls.Add(1)
+	if f.verifyDelay > 0 {
+		time.Sleep(f.verifyDelay)
+	}
 	want, ok := f.roots[height]
 	if !ok {
 		return false, fmt.Errorf("no header at height %d", height)
@@ -782,4 +788,50 @@ func TestSweepStaleReservations_ReleasesStuckReservation(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, after.ReservedCount, "stale reservation released")
 	require.Equal(t, uint64(9000), after.Claimable[utxostore.TierMined], "input claimable again")
+}
+
+// TestApplyStatusBatch_MinedVerifyDoesNotSerialize pins the fix for a stall that
+// froze the ENTIRE arcade event stream (observed 2026-08-11 at ~1000 TPS).
+//
+// verifyMinedBatch memoizes header verification per (height, root) so a block's
+// worth of MINED events costs one HeaderByHeight instead of one per tx. The
+// original memo held its mutex across that fetch, so every verify goroutine in
+// the errgroup serialized behind one lock no matter which key it wanted. A large
+// MINED burst then applied at single-goroutine speed, the monitor's SSE hand-off
+// channel filled, and the arcade reader blocked in dispatchFrame — stalling
+// delivery of every status, not just MINED. A goroutine dump showed 224
+// goroutines parked in sync.Mutex.Lock inside this function.
+//
+// The assertion is wall-clock: distinct keys must verify CONCURRENTLY (bounded
+// by minedVerifyConcurrency), not one-at-a-time behind the memo lock.
+func TestApplyStatusBatch_MinedVerifyDoesNotSerialize(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	const (
+		n     = 24
+		delay = 40 * time.Millisecond
+	)
+
+	// Distinct heights => distinct memo keys => every record needs its own fetch.
+	// Serialized that is n*delay (~960ms); concurrent it is bounded by the verify
+	// pool, so it must land far below that.
+	recs := make([]arcade.TxRecord, 0, n)
+	for i := range n {
+		txid := newTxID(byte(0x40 + i))
+		h.seedChangeTx(txid, wdk.TxStatusUnproven, wdk.ProvenTxStatusUnconfirmed, 6000, utxostore.TierUnproven)
+		height := uint32(870000 + i)
+		rec, root := minedRecord(t, txid, height)
+		h.hdrs.register(height, root)
+		recs = append(recs, rec)
+	}
+	h.hdrs.verifyDelay = delay
+
+	start := time.Now()
+	require.NoError(t, h.p.ApplyStatusBatch(ctx, recs))
+	elapsed := time.Since(start)
+
+	require.EqualValues(t, n, h.hdrs.verifyCalls.Load(), "one fetch per distinct (height, root)")
+	require.Less(t, elapsed, time.Duration(n/2)*delay,
+		"MINED verify serialized on the memo mutex: %v for %d distinct keys at %v/fetch", elapsed, n, delay)
 }

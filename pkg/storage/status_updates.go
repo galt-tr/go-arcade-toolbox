@@ -587,18 +587,47 @@ func (p *Provider) verifyMinedBatch(ctx context.Context, recs []arcade.TxRecord)
 		ok  bool
 		err error
 	}
+	// entry is one memo slot. done is closed once the single in-flight fetch for
+	// this key completes, so late arrivals wait on the CHANNEL, never on vmu.
+	type entry struct {
+		done chan struct{}
+		res  vRes
+	}
 	var vmu sync.Mutex
-	vcache := make(map[vKey]vRes)
+	vcache := make(map[vKey]*entry)
+	// verify still collapses a block's worth of concurrent verifications to ONE
+	// HeaderByHeight per (height, root) — but it must not hold vmu across that
+	// fetch. Holding the lock for the whole network call serializes the entire
+	// errgroup behind one mutex: a big block's MINED burst then applies at
+	// single-goroutine speed, the SSE hand-off channel fills, and the arcade
+	// reader blocks in dispatchFrame — stalling the WHOLE event stream, not just
+	// MINED. Observed 2026-08-11 at ~1000 TPS: 224 goroutines parked in
+	// sync.Mutex.Lock here, every status frozen, and the local ledger diverging
+	// from arcade at the full creation rate until the blast was stopped.
+	//
+	// Singleflight instead: the lock covers only the map lookup/insert. The first
+	// caller for a key does the fetch and closes done; the rest release the lock
+	// immediately and wait on done. Cache hits never block.
 	verify := func(ctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
 		key := vKey{height: height, root: *root}
+
 		vmu.Lock()
-		defer vmu.Unlock()
-		if r, ok := vcache[key]; ok {
-			return r.ok, r.err
+		if e, ok := vcache[key]; ok {
+			vmu.Unlock()
+			select {
+			case <-e.done:
+				return e.res.ok, e.res.err
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
 		}
-		ok, err := p.hdrs.VerifyMerkleRoot(ctx, root, height)
-		vcache[key] = vRes{ok: ok, err: err}
-		return ok, err
+		e := &entry{done: make(chan struct{})}
+		vcache[key] = e
+		vmu.Unlock()
+
+		e.res.ok, e.res.err = p.hdrs.VerifyMerkleRoot(ctx, root, height)
+		close(e.done)
+		return e.res.ok, e.res.err
 	}
 
 	results := make([]*minedProof, len(recs))
