@@ -388,3 +388,68 @@ func indexOf(tiers []utxostore.Tier, target utxostore.Tier) int {
 	}
 	return -1
 }
+
+// TestFund_RequireChange pins the guarantee that [funder.FundArgs.RequireChange]
+// buys: the funded transaction always carries the change output the caller
+// planned for.
+//
+// By default the walk stops the moment the coins cover the target plus fee, and
+// [funder.Result] then drops the change output whenever the leftover is below
+// the dust floor, donating it to the miner. For an ordinary payment that is the
+// right trade. For a caller whose unlocking scripts commit to the output count
+// — a covenant that rebuilds [continuation, change] inside its sighash preimage
+// — it silently produces a transaction that cannot be spent, and only for the
+// coin selections that happen to land in the sub-dust window.
+//
+// The amounts below are chosen to land exactly there: at 100 sat/kB a single
+// 1043-satoshi coin covers a 1000-satoshi target with 20 satoshis left over,
+// against a 40-satoshi dust floor.
+func TestFund_RequireChange(t *testing.T) {
+	const (
+		rate   = int64(100)
+		target = satoshi.Value(1000)
+		txSize = uint64(44) // envelope + varints + one P2PKH output
+		// subDust alone covers target+fee, but only just: the remainder lands
+		// under the dust floor.
+		subDust = uint64(1043)
+	)
+
+	t.Run("by default sub-dust change is donated and the output disappears", func(t *testing.T) {
+		store := newMemStore()
+		mintCoins(t, store, "tx", utxostore.TierMined, subDust)
+
+		result, err := newFunder(t, store, rate).Fund(t.Context(), baseArgs(target, txSize, 1))
+		require.NoError(t, err)
+		require.Len(t, result.AllocatedUTXOs, 1)
+		require.Less(t, result.ChangeAmount, result.DustFloor)
+		require.Zero(t, result.ChangeOutputsCount,
+			"sub-dust change goes to the miner, leaving the transaction one output short")
+	})
+
+	t.Run("RequireChange keeps allocating until the change clears the dust floor", func(t *testing.T) {
+		store := newMemStore()
+		mintCoins(t, store, "tx", utxostore.TierMined, subDust, 500)
+
+		args := baseArgs(target, txSize, 1)
+		args.RequireChange = true
+
+		result, err := newFunder(t, store, rate).Fund(t.Context(), args)
+		require.NoError(t, err)
+		require.Len(t, result.AllocatedUTXOs, 2,
+			"the first coin leaves sub-dust change, so a second one is claimed")
+		require.GreaterOrEqual(t, result.ChangeAmount, result.DustFloor)
+		require.NotZero(t, result.ChangeOutputsCount)
+	})
+
+	t.Run("RequireChange fails rather than silently changing the output shape", func(t *testing.T) {
+		store := newMemStore()
+		mintCoins(t, store, "tx", utxostore.TierMined, subDust)
+
+		args := baseArgs(target, txSize, 1)
+		args.RequireChange = true
+
+		_, err := newFunder(t, store, rate).Fund(t.Context(), args)
+		require.ErrorIs(t, err, funder.ErrNotEnoughFunds)
+		require.Zero(t, reservedSats(t, store), "the reservation is released on failure")
+	})
+}

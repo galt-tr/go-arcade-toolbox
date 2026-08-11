@@ -79,7 +79,7 @@ func TestScriptsVerifier_ChronicleStillRejectsBadScripts(t *testing.T) {
 }
 
 // TestScriptsVerifier_GenesisUnchanged confirms ordinary scripts are unaffected
-// by the new field, so the default path keeps its existing behaviour.
+// by the new field, so the default path keeps its existing behavior.
 func TestScriptsVerifier_GenesisUnchanged(t *testing.T) {
 	tx := txSpending(t, "OP_3 OP_EQUAL", "OP_3")
 

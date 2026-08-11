@@ -149,6 +149,7 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		MaxChangeOutputsPerTx:   p.maxChangeOutputsPerTx(),
 		ExistingBasketCount:     existingCount,
 		Denomination:            denomination,
+		RequireChange:           p.requireChangeOutput,
 	}
 
 	var result *wdk.StorageCreateActionResult

@@ -30,7 +30,8 @@ func TestNewCollector_ZeroMinimumDesiredUTXOValue_DoesNotPanic(t *testing.T) {
 			1,     // numberOfDesiredUTXOs
 			0,     // minimumDesiredUTXOValue - previously caused a divide-by-zero panic
 			feeCalculator,
-			100, // maxChangeOutputsPerTx
+			100,   // maxChangeOutputsPerTx
+			false, // requireChange
 		)
 	})
 

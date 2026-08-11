@@ -130,6 +130,22 @@ type FundArgs struct {
 	NumberOfDesiredUTXOs    int64
 	MinimumDesiredUTXOValue uint64
 	MaxChangeOutputsPerTx   uint64
+
+	// RequireChange forbids the funder from omitting the change output.
+	//
+	// By default, once the allocated coins cover the target plus fee, whatever
+	// is left over is only kept if it clears the dust floor; below that it is
+	// donated to the miner and NO change output is produced. That is the right
+	// call for an ordinary payment — a sub-dust output costs more to spend than
+	// it holds — but it silently changes the transaction's output count, and a
+	// caller whose spending conditions commit to the output shape (a covenant
+	// reconstructing [continuation, change], for instance) cannot spend the
+	// result.
+	//
+	// With RequireChange the walk instead keeps allocating until the change
+	// clears the dust floor, and reports ErrNotEnoughFunds if it cannot. The
+	// transaction then always has exactly the shape the caller planned for.
+	RequireChange bool
 	// ExistingBasketCount is the number of coins already in the change basket,
 	// used to cap how many new change outputs are created.
 	ExistingBasketCount int64
@@ -209,6 +225,7 @@ func (f *Funder) fundOnce(ctx context.Context, args FundArgs) (*Result, error) {
 		args.MinimumDesiredUTXOValue,
 		f.feeCalculator,
 		args.MaxChangeOutputsPerTx,
+		args.RequireChange,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start collecting utxos: %w", err)

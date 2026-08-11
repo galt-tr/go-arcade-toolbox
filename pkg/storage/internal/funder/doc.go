@@ -54,6 +54,12 @@
 // fee of a minimal future spend). Change below the dust floor is donated to the
 // fee. This math is a behavioral port of go-wallet-toolbox's funder.
 //
+// Donating sub-dust change means the transaction comes out with one fewer
+// output than the caller planned. A transaction with no other output would then
+// be invalid, so the walk already keeps allocating until the change clears the
+// dust floor in that case; [FundArgs.RequireChange] extends the same guarantee
+// to callers whose spending conditions commit to the output shape.
+//
 // ExistingBasketCount is an INPUT, fetched by the caller before it opens any
 // database transaction: fetching it lazily inside the funder would deadlock a
 // single-connection SQLite transaction.

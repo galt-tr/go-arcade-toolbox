@@ -58,6 +58,11 @@ type Provider struct {
 	// verifier. See [WithChronicleOpcodes].
 	chronicleScripts bool
 
+	// requireChangeOutput forbids the funder from dropping a sub-dust change
+	// output, so every funded action keeps the output shape the caller planned.
+	// See [WithRequiredChangeOutput].
+	requireChangeOutput bool
+
 	feeModel     defs.FeeModel
 	changeBasket defs.ChangeBasket
 	utxoMgmt     defs.UTXOManagement
@@ -129,6 +134,32 @@ func WithScriptsVerifier(v wdk.ScriptsVerifier) Option {
 // Has no effect when [WithScriptsVerifier] supplies a custom verifier.
 func WithChronicleOpcodes() Option {
 	return func(p *Provider) { p.chronicleScripts = true }
+}
+
+// WithRequiredChangeOutput guarantees that every funded action carries a change
+// output, instead of letting the funder drop it when the leftover is small.
+//
+// By default the funder stops collecting coins as soon as they cover the
+// outputs plus the fee, and keeps the remainder as change only if it clears the
+// dust floor — 2× the fee of a minimal future spend, so 40 satoshis at the
+// default 100 sat/kb. Below that the remainder is donated to the miner and no
+// change output is produced at all, because such an output would cost more to
+// spend than it holds.
+//
+// That is right for an ordinary payment and wrong for a caller whose spending
+// conditions commit to the transaction's shape. A covenant that reconstructs
+// [continuation, change] to check its own sighash preimage cannot be satisfied
+// by a one-output transaction, so the action has to be abandoned — and the
+// failure is intermittent, since it depends on where coin selection happens to
+// land. A pool of small coins makes it common: the finer the granularity, the
+// more often the total lands inside the sub-dust window.
+//
+// With this option the funder keeps allocating until the change clears the dust
+// floor, and reports "not enough funds" if it cannot. Enable it when a
+// transaction's unlocking scripts depend on its output count; leave it off for
+// ordinary payments, where donating dust to the fee is the better trade.
+func WithRequiredChangeOutput() Option {
+	return func(p *Provider) { p.requireChangeOutput = true }
 }
 
 // WithBeefVerifier overrides the default (go-sdk beef.Verify over the headers

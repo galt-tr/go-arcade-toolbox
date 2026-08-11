@@ -36,15 +36,19 @@ type utxoCollector struct {
 	maxChangeOutputsPerTx   uint64
 	changeOutputsCount      uint64
 	minimumChange           uint64
+	// requireChange forces a change output even when the transaction already has
+	// one of its own. See FundArgs.RequireChange.
+	requireChange bool
 	// dustFloor is the minimum satoshi value a change output must have to be economically viable.
 	// An output below this threshold costs more to spend in a future transaction than it is worth.
 	dustFloor satoshi.Value
 }
 
-func newCollector(txSats satoshi.Value, txSize, outputCount uint64, numberOfDesiredUTXOs int64, minimumDesiredUTXOValue uint64, feeCalculator *feeCalc, maxChangeOutputsPerTx uint64) (c *utxoCollector, err error) {
+func newCollector(txSats satoshi.Value, txSize, outputCount uint64, numberOfDesiredUTXOs int64, minimumDesiredUTXOValue uint64, feeCalculator *feeCalc, maxChangeOutputsPerTx uint64, requireChange bool) (c *utxoCollector, err error) {
 	c = &utxoCollector{
-		txSats:      txSats,
-		outputCount: outputCount,
+		txSats:        txSats,
+		outputCount:   outputCount,
+		requireChange: requireChange,
 		// Clamped to at least 1: a zero value would divide-by-zero in calculateChangeCount.
 		// Baskets should never carry 0 here, but this is the last line of defense against
 		// any caller/DB state that slips through.
@@ -81,8 +85,17 @@ func newCollector(txSats satoshi.Value, txSize, outputCount uint64, numberOfDesi
 	return c, nil
 }
 
+// changeMandatory reports whether this transaction is invalid without a change
+// output — either because it carries no other output at all, or because the
+// caller pinned the output shape (FundArgs.RequireChange). In both cases the
+// walk must keep allocating until the change clears the dust floor, rather than
+// stopping the moment the target is covered and donating the remainder.
+func (c *utxoCollector) changeMandatory() bool {
+	return c.outputCount == 0 || c.requireChange
+}
+
 func (c *utxoCollector) remaining() satoshi.Value {
-	if c.outputCount == 0 {
+	if c.changeMandatory() {
 		change := c.change()
 		if c.changeOutputsCount > 0 && change < c.dustFloor {
 			feeWithNextInput, err := c.feeCalculator.Calculate(c.txSize + txutils.P2PKHEstimatedInputSize)
@@ -114,10 +127,12 @@ func (c *utxoCollector) remaining() satoshi.Value {
 
 // isFunded reports whether the collected coins cover the target plus fee.
 func (c *utxoCollector) isFunded() bool {
-	// A valid Bitcoin transaction must have at least one output.
-	// If no outputs are defined and no change outputs will be created,
-	// we must continue allocating UTXOs to ensure at least one change output exists.
-	if c.outputCount == 0 {
+	// A valid Bitcoin transaction must have at least one output, and a caller
+	// that pinned its output shape cannot absorb a dropped change output. In
+	// either case "covered" is not enough: the change must also survive
+	// prepareResult's dust-floor check, or the transaction comes out the wrong
+	// shape. Keep allocating until it does.
+	if c.changeMandatory() {
 		return c.changeOutputsCount > 0 && c.change() >= c.dustFloor
 	}
 
