@@ -26,9 +26,10 @@ const sseReconnectBackoff = time.Second
 
 // Status-apply pipeline sizing. Events for distinct txids are independent;
 // applying them one-at-a-time (plus one cursor write each) would cap throughput
-// far below a busy stream, so a small worker pool with per-batch cursor
+// far below a busy stream, so a small worker pool with amortized cursor
 // persistence keeps up while preserving replay safety (events are idempotent;
-// the cursor advances only to the last event of a fully-applied batch).
+// the cursor advances only to the last event of a fully-applied batch, and is
+// allowed to lag it — see [cursorTracker] — but never to lead it).
 const (
 	defaultApplyWorkers = 8
 	// applyBatchMax is the max events drained into one batch before applying.
@@ -41,6 +42,31 @@ const (
 	// without onEvent blocking — a blocked reader stops draining the socket, so
 	// arcade back-pressures and SEEN/MINED events are missed entirely.
 	applyQueueSize = 16384
+
+	// applyLinger is how long a batch waits for more events once the queue has
+	// run dry, before applying what it has.
+	//
+	// Without it the applier takes only what is READY, which collapses the batch
+	// to whatever arrived during the previous apply. Block 378 of the 2026-08-11
+	// run moved 1.1M records in 72,773 batches averaging 15.3 records against
+	// this 512 cap — ~72k shard fan-outs and ~72k replay-cursor writes to do the
+	// work of ~2k batches. The per-batch fixed cost, not the record count, was
+	// the load. Lingering converts arrival rate into batch size: at the ~5.5k
+	// events/s that block sustained, 10ms of patience is ~55 more records per
+	// batch instead of a fresh fan-out.
+	//
+	// 10ms is deliberately small against the pipeline it sits in: apply is p50
+	// 29ms and arcade's own delivery is p50 86ms/p95 21.6s, so the linger cannot
+	// be a visible term. An idle stream never pays it at all (see collectBatch).
+	applyLinger = 10 * time.Millisecond
+
+	// cursorFlushBatches bounds how many applied batches may share one replay
+	// cursor write. The cursor is also flushed the moment the queue runs dry, so
+	// this only binds while events arrive back-to-back — exactly the burst where
+	// a write per batch is pure overhead. It caps the redelivery a mid-burst
+	// reconnect can cause, which is harmless (every apply is idempotent) but not
+	// free.
+	cursorFlushBatches = 64
 
 	// applyDeadlockAttempts bounds the retry of a transient (deadlock/lock)
 	// apply failure; the victim is safe to retry immediately.
@@ -72,17 +98,17 @@ func (d *Daemon) applyShards() int {
 // started as a goroutine (Daemon.Start does, tracked by the wait group) and
 // returns only when ctx is canceled.
 //
-// Architecture (two concurrent actors sharing the cursor under cursorMu):
+// Architecture (two concurrent actors sharing a [cursorTracker]):
 //   - this goroutine runs the reconnect loop and calls oracle.StreamStatus,
 //     whose onEvent only ENQUEUES into a large (applyQueueSize) channel so a
 //     burst never blocks the reader (a blocked reader stops draining the socket,
 //     so arcade back-pressures and events are missed);
-//   - one applier goroutine drains the channel into batches (≤applyBatchMax) and,
-//     per batch, fans the records out across applyShards workers keyed by txid —
-//     distinct txids apply concurrently through storage.ApplyStatusBatch, while a
-//     given txid's events stay on one shard so their arrival order (and every
-//     apply guard) is preserved. Sharded parallelism + bulk batching together
-//     clear a mined block's thousand-event burst in seconds.
+//   - one applier goroutine drains the channel into batches (see collectBatch)
+//     and, per batch, fans the records out across applyShards workers keyed by
+//     txid — distinct txids apply concurrently through storage.ApplyStatusBatch,
+//     while a given txid's events stay on one shard so their arrival order (and
+//     every apply guard) is preserved. Sharded parallelism + bulk batching
+//     together clear a mined block's thousand-event burst in seconds.
 //
 // The cursor advances only to the newest non-empty event id of a fully-applied
 // batch, never regresses to "", and never advances past what was durably
@@ -94,16 +120,7 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 	if err != nil {
 		d.logger.WarnContext(ctx, "failed to load SSE replay cursor, starting from beginning", slog.String("error", err.Error()))
 	}
-
-	// lastEventID is read by this goroutine on reconnect and written by the
-	// applier after each batch; cursorMu makes the handoff race-free.
-	var cursorMu sync.Mutex
-	lastEventID := string(id)
-	readCursor := func() string {
-		cursorMu.Lock()
-		defer cursorMu.Unlock()
-		return lastEventID
-	}
+	cursor := &cursorTracker{daemon: d, durable: string(id)}
 
 	events := make(chan arcade.StatusEvent, applyQueueSize)
 	onEvent := func(ev arcade.StatusEvent) error {
@@ -119,29 +136,16 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 	go func() {
 		defer close(applierDone)
 		for {
-			// Block for the first event of a batch, then drain what is ready.
-			var batch []arcade.StatusEvent
-			select {
-			case <-ctx.Done():
+			batch := collectBatch(ctx, events, d.applyLinger, func() { cursor.flush(ctx) })
+			if len(batch) == 0 {
 				return
-			case ev := <-events:
-				batch = append(batch, ev)
 			}
-		drain:
-			for len(batch) < applyBatchMax {
-				select {
-				case ev := <-events:
-					batch = append(batch, ev)
-				default:
-					break drain
-				}
-			}
-			d.applyStatusBatch(ctx, batch, &cursorMu, &lastEventID)
+			d.applyStatusBatch(ctx, batch, cursor)
 		}
 	}()
 
 	for ctx.Err() == nil {
-		streamErr := d.oracle.StreamStatus(ctx, readCursor(), onEvent)
+		streamErr := d.oracle.StreamStatus(ctx, cursor.resume(ctx), onEvent)
 		if ctx.Err() != nil {
 			break
 		}
@@ -157,7 +161,147 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 	}
 
 	<-applierDone
+	// The applier holds the cursor between flushes, so persist what it earned
+	// before returning — on a context the shutdown has NOT already canceled, or
+	// a clean stop would replay up to cursorFlushBatches batches on next start.
+	flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorFlushTimeout)
+	cursor.flush(flushCtx)
+	cancel()
+
 	d.logger.InfoContext(ctx, "arcade status event handler stopped")
+}
+
+// collectBatch assembles the next batch to apply. It blocks for the first event,
+// then fills the batch toward applyBatchMax: first with everything already
+// queued (which costs nothing) and, once that runs dry, for up to applyLinger
+// longer. It returns nil only when ctx is canceled with the queue empty.
+//
+// The linger is what stops the batch collapsing to "whatever arrived during the
+// previous apply" — see applyLinger — but an IDLE stream must not pay for it. It
+// is skipped for a lone event, which is exactly what idle looks like: the queue
+// was empty when we parked and held nothing more when we woke, so there is no
+// burst to coalesce and waiting would be pure added latency.
+//
+// onIdle runs when the queue is found empty, i.e. the burst is over and the
+// applier is about to park. That is the moment to do deferred work — flushing
+// the replay cursor — for free: nothing is waiting behind it.
+func collectBatch(ctx context.Context, events <-chan arcade.StatusEvent, linger time.Duration, onIdle func()) []arcade.StatusEvent {
+	batch := make([]arcade.StatusEvent, 0, applyBatchMax)
+	select {
+	case ev := <-events:
+		batch = append(batch, ev)
+	default:
+		onIdle()
+		select {
+		case <-ctx.Done():
+			return nil
+		case ev := <-events:
+			batch = append(batch, ev)
+		}
+	}
+
+ready:
+	for len(batch) < applyBatchMax {
+		select {
+		case ev := <-events:
+			batch = append(batch, ev)
+		default:
+			break ready
+		}
+	}
+
+	if len(batch) == 1 || len(batch) >= applyBatchMax || linger <= 0 {
+		return batch
+	}
+
+	timer := time.NewTimer(linger)
+	defer timer.Stop()
+	for len(batch) < applyBatchMax {
+		select {
+		case ev := <-events:
+			batch = append(batch, ev)
+		case <-timer.C:
+			return batch
+		}
+	}
+	return batch
+}
+
+// cursorFlushTimeout bounds the shutdown flush of the replay cursor, which runs
+// on a detached context and so has no deadline of its own.
+const cursorFlushTimeout = 5 * time.Second
+
+// cursorTracker owns the SSE replay cursor: the id of the last event of the last
+// FULLY-applied batch. It exists to decouple "a batch applied" from "the cursor
+// was written", which used to be the same act — one key_values write per batch,
+// i.e. ~72k writes to move one block's 1.1M records.
+//
+// Deferring the write is safe in the one direction that matters. The cursor may
+// lag what has been applied (a reconnect then re-delivers events we already
+// applied, which is a no-op — every apply is idempotent) but it may never LEAD
+// it, because leading is how events are skipped and lost for good. So `durable`
+// only ever advances after the database has confirmed the write, and `pending`
+// only ever holds fully-applied positions.
+type cursorTracker struct {
+	daemon *Daemon
+
+	mu sync.Mutex
+	// durable is the id key_values holds: what a restart resumes from.
+	durable string
+	// pending is a fully-applied id not yet written; "" or == durable when there
+	// is nothing owed.
+	pending string
+	// batches counts applied batches since the last successful write.
+	batches int
+}
+
+// record takes the id of the last event of a batch that applied in full, and
+// writes it out once cursorFlushBatches have accumulated. Between those the
+// applier just moves on; the idle flush in collectBatch covers everything else.
+func (c *cursorTracker) record(ctx context.Context, eventID string) {
+	c.mu.Lock()
+	c.pending = eventID
+	c.batches++
+	due := c.batches >= cursorFlushBatches
+	c.mu.Unlock()
+
+	if due {
+		c.flush(ctx)
+	}
+}
+
+// flush persists the pending cursor, if any. It is a no-op when nothing is owed,
+// so the idle path can call it unconditionally.
+func (c *cursorTracker) flush(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.pending == "" || c.pending == c.durable {
+		c.batches = 0
+		return
+	}
+	if err := c.daemon.storage.SetKeyValue(ctx, LastEventIDKey, []byte(c.pending)); err != nil {
+		// Hold BOTH: the old durable cursor, so a reconnect resumes from a
+		// position the DB actually reached, and the pending one, so the next
+		// flush retries it instead of dropping the window.
+		c.daemon.logger.ErrorContext(ctx, "failed to persist SSE replay cursor",
+			slog.String("eventID", c.pending), slog.String("error", err.Error()))
+		return
+	}
+	c.durable = c.pending
+	c.batches = 0
+}
+
+// resume returns the position a (re)connect must resume from. It flushes first,
+// so the answer is one the database actually holds: an in-process reconnect and
+// a restart resume from the same place, and the reconnect does not re-request a
+// burst's worth of events the applier has already applied.
+func (c *cursorTracker) resume(ctx context.Context) string {
+	c.flush(ctx)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.durable
 }
 
 // applyStatusBatch hands the whole batch to storage.ApplyStatusBatch (records in
@@ -184,7 +328,11 @@ func (d *Daemon) handleStatusEvents(ctx context.Context) {
 // its final surviving status, honoring supersession), so this method simply
 // preserves arrival order in the slice it passes down. (The queue drains FIFO =
 // SSE ns-id arrival order.)
-func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEvent, cursorMu *sync.Mutex, lastEventID *string) {
+//
+// The cursor is handed to [cursorTracker], which decides when it is worth a
+// write; the "only when the whole batch applied" rule is enforced here, by not
+// recording anything on the failure path.
+func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEvent, cursor *cursorTracker) {
 	records := make([]arcade.TxRecord, len(batch))
 	for i := range batch {
 		records[i] = batch[i].Record
@@ -223,15 +371,7 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 		d.logger.WarnContext(ctx, "status batch carried no event ids, replay cursor not advanced", slog.Int("batchSize", len(batch)))
 		return
 	}
-	if err := d.storage.SetKeyValue(ctx, LastEventIDKey, []byte(cursorID)); err != nil {
-		// Keep the old in-memory cursor so a reconnect resumes from the last
-		// DURABLY persisted position, not one the DB never reached.
-		d.logger.ErrorContext(ctx, "failed to persist SSE replay cursor", slog.String("eventID", cursorID), slog.String("error", err.Error()))
-		return
-	}
-	cursorMu.Lock()
-	*lastEventID = cursorID
-	cursorMu.Unlock()
+	cursor.record(ctx, cursorID)
 }
 
 // traceBatch emits opt-in txtrace lines for an applied batch: one "mined_batch"
