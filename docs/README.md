@@ -5,6 +5,7 @@
 - [Arcade integration](arcade-integration.md) — the full status lifecycle table (with wire values), EF broadcast semantics, the SSE contract, ChainTracks local root verification, and the reject→release reconciler.
 - [Reject→release vs unfail](reject-release-vs-unfail.md) — why the automatic verified reconciler replaces manual unfail, how the two-pass and winner-union guards work, and why that is safer under Arcade’s async status model. ([HTML](reject-release-vs-unfail.html) for local browser viewing)
 - [High-throughput guide](high-throughput-guide.md) — the denominated fuel-pool workflow, config tuning, the **measured** throughput/durability tradeoff, hardware notes, and a failure-mode playbook.
+- [Application throughput playbook](application-throughput-playbook.md) — the **application author's** companion to the above: what limits you and in what order, bounding the input BEEF, unconfirmed chain depth vs the mempool ancestor limit, output-shape fragility, the two-step covenant path, the load loop, and a failure-mode playbook keyed by observed symptom.
 - [Migration from go-wallet-toolbox](migration-from-go-wallet-toolbox.md) — the import-path rewrite, the byte-compatibility guarantees, behavior deltas, dropped features, and config-file migration.
 - [Operations](operations.md) — **backup is a correctness requirement**, per-backend backup/restore, the Aerospike fund-safety requirements, monitoring, running the storage server, and the rootless-podman test setup.
 - [Benchmarks](benchmarks/README.md) — the raw measured write-path throughput numbers.
