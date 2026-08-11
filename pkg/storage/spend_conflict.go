@@ -2,6 +2,7 @@ package storage
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -83,11 +84,17 @@ func parseSpendConflictExtra(extra string) spendConflictInfo {
 		if err != nil {
 			continue
 		}
-		var vout uint32
-		for _, c := range m[2] {
-			vout = vout*10 + uint32(c-'0')
+		// Parse with an explicit 32-bit bound. The hand-rolled accumulator this
+		// replaces wrapped silently: the regex admits up to 10 digits, so e.g.
+		// ":4294967296" folded to vout 0 and asserted the WRONG outpoint spent —
+		// holding an input the conflict never named while leaving the real one
+		// releasable. A vout that does not fit is not a real outpoint reference,
+		// so skip it rather than invent one.
+		vout64, perr := strconv.ParseUint(m[2], 10, 32)
+		if perr != nil {
+			continue
 		}
-		info.Spent[utxostore.Outpoint{TxID: *h, Vout: vout}] = struct{}{}
+		info.Spent[utxostore.Outpoint{TxID: *h, Vout: uint32(vout64)}] = struct{}{}
 	}
 
 	// "spent by tx <txid>" spenders.

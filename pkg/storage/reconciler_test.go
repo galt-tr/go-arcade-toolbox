@@ -403,10 +403,18 @@ func TestReconciler_Rejected_UTXOSpent_PartialRelease(t *testing.T) {
 	inFree := opFor(0x52, 0)  // not mentioned → safe residual
 
 	// Build ExtraInfo in the live Teranode shape (outpoint + spender txid).
+	winner := newTxID(0xEE)
 	extra := "UTXO_SPENT (70): " + inSpent.TxID.String() + ":2 utxo already spent by tx " +
-		newTxID(0xEE) + "[0]\n"
+		winner + "[0]\n"
 
 	changeOp := h.seedKnownTx(txid, []utxostore.Outpoint{inSpent, inFree}, 2500)
+	// Seed the winner in the LOCAL ledger spending only inSpent. This is the
+	// production shape: on the scale cluster 8 of 8 sampled UTXO_SPENT rejections
+	// named a spender already in our own known_txs (the wallet re-spent an
+	// outpoint an earlier tx of ours had taken). Resolving the winner is what
+	// licenses releasing the residual — see the winner guard in
+	// releaseSpendConflict.
+	h.seedKnownTx(winner, []utxostore.Outpoint{inSpent}, 0)
 	h.mintAndSpendFunding(inSpent, txid)
 	h.mintAndSpendFunding(inFree, txid)
 	h.markSuspect(txid, arcade.StatusRejected, nil)
@@ -762,4 +770,84 @@ func TestReconciler_ConcurrentDoublePass_NoDoubleRelease(t *testing.T) {
 	h.requireClaimable(inA, "input released exactly once")
 	h.requireRemoved(changeOp, "change removed exactly once")
 	require.Equal(t, wdk.ProvenTxStatusInvalid, h.knownTx(txid).Status)
+}
+
+// TestReconciler_Rejected_ForeignOutpoint_NoReleaseAll pins the guard against
+// arcade attaching a conflict line that names an outpoint this tx never spent.
+//
+// Arcade does this on a real path: for a size-1 propagation batch it assigns the
+// best unattributable ("alien") failure line to the only tx in the batch WITHOUT
+// verifying the outpoint belongs to it, and every Teranode conflict line also
+// names the competing SPENDER txid. So ExtraInfo routinely contains 64-hex
+// values that are neither this tx nor its inputs.
+//
+// The pre-guard gate asked "did we parse any outpoint?" rather than "do we hold
+// one?": a foreign outpoint made the spent set non-empty, it intersected none of
+// our inputs, and every input was released — exactly the release-all this
+// feature exists to prevent. The suspect must defer instead.
+func TestReconciler_Rejected_ForeignOutpoint_NoReleaseAll(t *testing.T) {
+	h := newReconStack(t)
+	txid := newTxID(0xD1)
+	inA := opFor(0x61, 0)
+	inB := opFor(0x62, 1)
+
+	// Conflict line about an outpoint belonging to some OTHER transaction.
+	foreign := opFor(0x99, 7)
+	foreignWinner := newTxID(0xAB)
+	extra := "UTXO_SPENT (70): UTXO_SPENT (70): " + foreign.TxID.String() +
+		":7 utxo already spent by tx " + foreignWinner + "[3]\n"
+
+	h.seedKnownTx(txid, []utxostore.Outpoint{inA, inB}, 2500)
+	// Seed the named winner so it RESOLVES (it spends only the foreign outpoint,
+	// none of ours). This isolates the guard under test: with the winner known,
+	// the unresolved-winner guard cannot fire, so the only thing standing between
+	// a foreign outpoint and a full release is the "held == 0" check.
+	h.seedKnownTx(foreignWinner, []utxostore.Outpoint{foreign}, 0)
+	h.mintAndSpendFunding(inA, txid)
+	h.mintAndSpendFunding(inB, txid)
+	h.markSuspect(txid, arcade.StatusRejected, nil)
+	h.scriptTx(txid, arcade.StatusRejected, withExtraInfo(extra))
+
+	h.clock.Advance(reconGrace + time.Second)
+	_ = h.verify() // pass 1: stamp
+	h.clock.Advance(reconGrace + time.Second)
+	r2 := h.verify()
+
+	require.Equal(t, 0, r2.Released,
+		"a conflict naming no outpoint of ours proves nothing about our inputs; releasing all of them reinstates the bug")
+	h.requireSpentBy(inA, txid, "input must not be released on a foreign-outpoint conflict")
+	h.requireSpentBy(inB, txid, "input must not be released on a foreign-outpoint conflict")
+}
+
+// TestReconciler_Rejected_UnresolvedWinner_HoldsResidual pins the winner rule for
+// the residual inputs. ExtraInfo names ONE of our inputs as spent, but the
+// winning spender cannot be resolved (not in our ledger, and the oracle does not
+// report it MINED/IMMUTABLE). The winner may well have taken our other inputs
+// too — Teranode reports the first conflicting input it hits, not all of them —
+// so the residual is not provably free and must be held, not released.
+func TestReconciler_Rejected_UnresolvedWinner_HoldsResidual(t *testing.T) {
+	h := newReconStack(t)
+	txid := newTxID(0xD2)
+	inSpent := opFor(0x71, 1)
+	inResidual := opFor(0x72, 0)
+
+	// Winner txid is never seeded locally and never scripted on the oracle.
+	extra := "UTXO_SPENT (70): " + inSpent.TxID.String() + ":1 utxo already spent by tx " +
+		newTxID(0xCD) + "[0]\n"
+
+	h.seedKnownTx(txid, []utxostore.Outpoint{inSpent, inResidual}, 2500)
+	h.mintAndSpendFunding(inSpent, txid)
+	h.mintAndSpendFunding(inResidual, txid)
+	h.markSuspect(txid, arcade.StatusRejected, nil)
+	h.scriptTx(txid, arcade.StatusRejected, withExtraInfo(extra))
+
+	h.clock.Advance(reconGrace + time.Second)
+	_ = h.verify()
+	h.clock.Advance(reconGrace + time.Second)
+	r2 := h.verify()
+
+	require.Equal(t, 0, r2.Released,
+		"residual inputs are only provably free once the winner's consumption set is known")
+	h.requireSpentBy(inSpent, txid, "named-spent input stays held")
+	h.requireSpentBy(inResidual, txid, "residual must be held while the winner is unresolved")
 }

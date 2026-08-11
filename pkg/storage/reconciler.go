@@ -285,8 +285,24 @@ func (p *Provider) releaseSpendConflict(ctx context.Context, kt *metastore.Known
 		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "double_spend_unreadable_winner")
 	}
 
+	winnerResolved := false
 	if winnerInputs, ok := p.findWinnerInputs(ctx, spenders); ok {
+		winnerResolved = true
 		for op := range winnerInputs {
+			spent[op] = struct{}{}
+		}
+	}
+	// findWinnerInputs only accepts a MINED/IMMUTABLE winner, but in practice the
+	// winner is one of OUR OWN earlier txs that is merely SEEN — measured on the
+	// scale cluster, 8 of 8 sampled UTXO_SPENT rejections named a spender already
+	// in the local ledger, created before the loser. Its raw tx is therefore on
+	// hand, so resolve the consumption set locally: no oracle round-trip, no
+	// confirmation wait, and it is strictly hold-biased (it can only ADD outpoints
+	// to the spent set, never release one). Without this the winner stays
+	// unresolved in the common case and Guard 2 below would defer every conflict.
+	if localInputs, ok := p.localWinnerInputs(ctx, spenders); ok {
+		winnerResolved = true
+		for op := range localInputs {
 			spent[op] = struct{}{}
 		}
 	}
@@ -303,6 +319,47 @@ func (p *Provider) releaseSpendConflict(ctx context.Context, kt *metastore.Known
 		return defs.ReconcilerReport{}, err
 	}
 	releaseInputs, held := filterReleaseInputs(allInputs, spent)
+
+	// Guard 1 — the spent set must intersect OUR inputs before it authorizes
+	// anything. len(spent) > 0 only means "we parsed an outpoint somewhere in
+	// ExtraInfo", not "we hold an outpoint that is provably gone". Arcade can
+	// legitimately attach a conflict line naming an outpoint this tx never spent:
+	// for a size-1 propagation batch it assigns the best unattributable ("alien")
+	// line to the only tx in the batch WITHOUT verifying the outpoint belongs to
+	// it (arcade services/propagation/propagator.go, the len(batch)==1 backstop,
+	// whose own comment flags it as unverified), and every Teranode conflict line
+	// additionally names the competing SPENDER txid. A foreign outpoint therefore
+	// passes the len(spent) check, intersects nothing, and every input is released
+	// — reinstating the exact release-all this function exists to prevent. Hold
+	// nothing of ours ⇒ we have learned nothing about our inputs ⇒ defer.
+	if held == 0 {
+		p.logger.InfoContext(ctx, "reconciler: spend conflict names no outpoint of this tx; deferring",
+			slog.String("txid", kt.TxID),
+			slog.Int("parsedSpent", len(spent)),
+			slog.Int("inputs", len(allInputs)))
+		p.freezeChange(ctx, kt.TxID)
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "spend_conflict_foreign_outpoint")
+	}
+
+	// Guard 2 — releasing the RESIDUAL inputs (the ones the conflict did not
+	// name) claims they are still ours. That is only knowable from the winner's
+	// consumption set: the winner may have spent several of our inputs while
+	// ExtraInfo named just one. ExtraInfo text alone does not license it.
+	// hasConfirmedUnreadableWinner above only catches a MINED/IMMUTABLE winner we
+	// cannot parse; a winner that is merely unresolvable — still SEEN, or GetTx
+	// errored (both swallowed by findWinnerInputs' `continue`) — reaches here with
+	// winnerResolved false. In that state hold everything and retry later rather
+	// than free inputs the winner may already own. When nothing is released there
+	// is no residual to get wrong, so this only guards the partial-release case.
+	if !winnerResolved && len(releaseInputs) > 0 {
+		p.logger.InfoContext(ctx, "reconciler: spend conflict winner unresolved; holding residual inputs",
+			slog.String("txid", kt.TxID),
+			slog.Int("heldSpent", held),
+			slog.Int("wouldRelease", len(releaseInputs)),
+			slog.Int("spenders", len(spenders)))
+		p.freezeChange(ctx, kt.TxID)
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "spend_conflict_unresolved_winner")
+	}
 
 	plan := p.buildReleasePlan(ctx, kt, wdk.ProvenTxStatusDoubleSpend, releaseInputs)
 	cascaded, released, err := p.releaseVerifiedDead(ctx, plan)
@@ -325,6 +382,47 @@ func (p *Provider) releaseSpendConflict(ctx context.Context, kt *metastore.Known
 // hasConfirmedUnreadableWinner reports whether any competing tx is
 // MINED/IMMUTABLE but lacks a parseable rawTx — the case that forces a full
 // release defer under the winner-union safety rule.
+// localWinnerInputs resolves a competing spender's consumption set from the
+// LOCAL ledger. The spender in a Teranode UTXO_SPENT line is very often one of
+// our own earlier transactions (the wallet re-spent an outpoint it had already
+// consumed), so its raw bytes are already in known_txs and no oracle call is
+// needed. Unlike findWinnerInputs this does not require the winner to be
+// MINED/IMMUTABLE: a SEEN winner has still taken the outpoint as far as the
+// node's UTXO set is concerned, which is exactly what the reject told us.
+//
+// It is safe in the only direction that matters: every outpoint it returns is
+// ADDED to the spent set, so it can only ever cause MORE inputs to be held, and
+// a miss simply leaves the winner unresolved for the caller's guard to handle.
+// Errors and unparseable bodies are treated as "not resolved" for the same
+// reason. Returns ok=true only when at least one spender was genuinely read.
+func (p *Provider) localWinnerInputs(ctx context.Context, competingTxs []string) (map[utxostore.Outpoint]struct{}, bool) {
+	consumed := make(map[utxostore.Outpoint]struct{})
+	anyWinner := false
+	for _, competitor := range competingTxs {
+		if competitor == "" {
+			continue
+		}
+		kt, found, err := p.meta.KnownTx().FindByTxID(ctx, competitor)
+		if err != nil || !found || kt == nil || len(kt.RawTx) == 0 {
+			continue
+		}
+		wtx, perr := transaction.NewTransactionFromBytes(kt.RawTx)
+		if perr != nil {
+			p.logger.DebugContext(ctx, "reconciler: local winner rawTx unparseable",
+				slog.String("winner", competitor), slog.String("error", perr.Error()))
+			continue
+		}
+		anyWinner = true
+		for _, in := range wtx.Inputs {
+			if in.SourceTXID == nil {
+				continue
+			}
+			consumed[utxostore.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex}] = struct{}{}
+		}
+	}
+	return consumed, anyWinner
+}
+
 func (p *Provider) hasConfirmedUnreadableWinner(ctx context.Context, competingTxs []string) bool {
 	for _, competitor := range competingTxs {
 		if competitor == "" {

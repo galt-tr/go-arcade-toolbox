@@ -61,3 +61,17 @@ func TestFilterReleaseInputs(t *testing.T) {
 	assert.Equal(t, 1, held)
 	assert.Equal(t, []utxostore.Outpoint{a, c}, rel)
 }
+
+// TestParseSpendConflictExtra_VoutOverflow pins the 32-bit bound on the vout.
+// The regex admits up to ten digits, and the previous hand-rolled accumulator
+// wrapped: ":4294967296" became vout 0, asserting a DIFFERENT outpoint spent —
+// it would hold an input the conflict never named and leave the real one free.
+func TestParseSpendConflictExtra_VoutOverflow(t *testing.T) {
+	txid := "9a6d553f45b0a61b88d15a89adb8e6b59577a4b3051bca5e30f552cfdc7d7325"
+	info := parseSpendConflictExtra("UTXO_SPENT (70): " + txid + ":4294967296 utxo already spent by tx " +
+		"908c12554e495b36797905d9d40ee8aa4ff9c431794ae7a1de580b218af615b5[0]")
+	h, err := chainhash.NewHashFromHex(txid)
+	require.NoError(t, err)
+	_, wrapped := info.Spent[utxostore.Outpoint{TxID: *h, Vout: 0}]
+	require.False(t, wrapped, "an out-of-range vout must not wrap to 0 and assert the wrong outpoint")
+}
