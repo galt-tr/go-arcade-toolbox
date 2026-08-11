@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -525,6 +526,116 @@ func TestCircuitBreaker_BackpressureDoesNotTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	require.Equal(t, int32(6), txHits.Load(), "breaker stayed closed across all 503s")
+}
+
+// A canceled caller context says nothing about arcade's health, so it must NOT
+// trip the breaker. This is the blast-stop / errgroup-cancel case: many workers
+// abort at once and the breaker used to count every one of them as an outage,
+// then refuse healthy broadcasts long afterwards.
+func TestCircuitBreaker_CallerCancellationDoesNotTrip(t *testing.T) {
+	srv := newCBServer(t)
+	srv.healthy.Store(true)
+
+	cfg := defaultConfig(srv.server.URL)
+	cfg.CircuitBreaker = defs.ArcadeCircuitBreaker{FailureThreshold: 2, HealthProbeIntervalSeconds: 1}
+	client := newClient(t, cfg)
+	client.breaker.now = (&fakeClock{t: time.Unix(1_700_000_000, 0)}).now
+
+	ef := mustDecodeEF(t)
+
+	// Far more cancellations than the threshold, as a blast stop delivers.
+	for range 10 {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := client.Broadcast(ctx, testTxID, ef)
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotErrorIs(t, err, ErrCircuitOpen)
+	}
+
+	// An expired deadline is the same signal and must behave the same.
+	for range 10 {
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		_, err := client.Broadcast(ctx, testTxID, ef)
+		cancel()
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.NotErrorIs(t, err, ErrCircuitOpen)
+	}
+
+	// The breaker never opened: healthy traffic still reaches /tx, on the very
+	// next call and without waiting for a /health probe to close anything.
+	before := srv.txHits.Load()
+	res, err := client.Broadcast(t.Context(), testTxID, ef)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, before+1, srv.txHits.Load(), "breaker stayed closed across every cancellation")
+	require.Equal(t, int32(0), srv.hpHits.Load(), "a closed breaker never probes /health")
+}
+
+// A cancellation mixed into a genuine outage must not *reset* the failure count
+// either: it is neither success nor failure, so the real 5xx failures either
+// side of it still add up to an open breaker.
+func TestCircuitBreaker_CancellationDoesNotResetFailureCount(t *testing.T) {
+	srv := newCBServer(t)
+	srv.txFail.Store(true) // arcade is genuinely broken
+
+	cfg := defaultConfig(srv.server.URL)
+	cfg.CircuitBreaker = defs.ArcadeCircuitBreaker{FailureThreshold: 2, HealthProbeIntervalSeconds: 1}
+	client := newClient(t, cfg)
+	client.breaker.now = (&fakeClock{t: time.Unix(1_700_000_000, 0)}).now
+
+	ef := mustDecodeEF(t)
+
+	_, err := client.Broadcast(t.Context(), testTxID, ef)
+	require.Error(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = client.Broadcast(ctx, testTxID, ef)
+	require.ErrorIs(t, err, context.Canceled)
+
+	_, err = client.Broadcast(t.Context(), testTxID, ef)
+	require.Error(t, err)
+
+	// Two real failures reached the threshold despite the cancellation between them.
+	_, err = client.Broadcast(t.Context(), testTxID, ef)
+	require.ErrorIs(t, err, ErrCircuitOpen)
+}
+
+// An open breaker must not spend its throttled /health probe on a caller whose
+// context is already dead: that probe cannot succeed, and burning it delays the
+// recovery of every live caller by a full probe interval.
+func TestCircuitBreaker_DeadContextDoesNotBurnTheProbeSlot(t *testing.T) {
+	srv := newCBServer(t)
+	srv.txFail.Store(true)
+
+	cfg := defaultConfig(srv.server.URL)
+	cfg.CircuitBreaker = defs.ArcadeCircuitBreaker{FailureThreshold: 2, HealthProbeIntervalSeconds: 1}
+	client := newClient(t, cfg)
+	fake := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	client.breaker.now = fake.now
+
+	ef := mustDecodeEF(t)
+	for range 2 {
+		_, err := client.Broadcast(t.Context(), testTxID, ef)
+		require.Error(t, err)
+	}
+
+	// Arcade recovers, and the probe window opens.
+	srv.txFail.Store(false)
+	srv.healthy.Store(true)
+	fake.advance(2 * time.Second)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := client.Broadcast(ctx, testTxID, ef)
+	require.ErrorIs(t, err, ErrCircuitOpen)
+	require.Equal(t, int32(0), srv.hpHits.Load(), "a dead context must not consume the probe")
+
+	// The live caller behind it still gets its probe in the same interval.
+	res, err := client.Broadcast(t.Context(), testTxID, ef)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, int32(1), srv.hpHits.Load())
 }
 
 // fakeClock is a monotonic test clock guarded for use across the breaker's

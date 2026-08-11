@@ -184,8 +184,10 @@ func (c *Client) Broadcast(ctx context.Context, txid string, ef []byte) (*Broadc
 
 	// Feed the breaker: a 202 accept, a 4xx rejection and a 503 backpressure
 	// reply are all evidence arcade is serving; only an opaque failure counts.
+	// A caller-side cancellation is neither — see [isCallerCancellation].
 	var bp *BackpressureError
 	switch {
+	case isCallerCancellation(err):
 	case err == nil, errors.As(err, &bp):
 		c.breaker.recordSuccess()
 	default:
@@ -193,6 +195,26 @@ func (c *Client) Broadcast(ctx context.Context, txid string, ef []byte) (*Broadc
 	}
 
 	return result, err
+}
+
+// isCallerCancellation reports whether err is our own context being canceled or
+// expiring, rather than anything arcade did.
+//
+// Such an error carries NO information about arcade's health, so it must count
+// as neither success nor failure for the circuit breaker. Counting it as a
+// failure is how a *client* shutdown took arcade down for everyone: stopping a
+// 200-worker load generator cancels 200 in-flight broadcasts at once, which blew
+// straight past failure_threshold: 10 and opened the breaker — 538 "short-
+// circuited by open circuit breaker" warnings against zero transport errors and
+// zero arcade 5xx, 102 of them refusing healthy broadcasts in the *next* run.
+// The fuel keeper's errgroup does the same thing on every sibling failure, and
+// it shares this client with the payment path.
+//
+// The client sets no overall HTTP timeout of its own, so a deadline in the chain
+// is always the caller's; arcade going slow or dead still surfaces as a
+// transport error and still opens the breaker.
+func isCallerCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // broadcast performs the POST /tx request and maps the outcome per the
@@ -314,7 +336,15 @@ func (c *Client) errBody(apiErr *apiError, response *resty.Response) string {
 
 // wrapTransportError distinguishes an unreachable arcade (a net.Error) from
 // other request-send failures; both are opaque failures with an unknown tx fate.
+//
+// A canceled/expired caller context is called out first and by name: net/http
+// reports it as a *url.Error, which satisfies net.Error, so it would otherwise
+// be mislabelled "arcade is unreachable" when arcade was never at fault. The
+// wrap keeps errors.Is(err, context.Canceled) working for [isCallerCancellation].
 func wrapTransportError(err error) error {
+	if isCallerCancellation(err) {
+		return fmt.Errorf("arcade request canceled before completion: %w", err)
+	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return fmt.Errorf("arcade is unreachable: %w", netErr)

@@ -60,7 +60,11 @@ func (cb *circuitBreaker) allow(ctx context.Context) error {
 		return nil
 	}
 	// Open: throttle probes so a storm of broadcasts can't hammer /health.
-	if cb.now().Sub(cb.lastProbe) < cb.probeInterval {
+	// A caller whose context is already dead cannot probe — GET /health would
+	// fail on that context alone — so it must not burn the one probe slot this
+	// interval has, or a wave of cancellations keeps the breaker open by
+	// starving the recovery path of a probe that could actually succeed.
+	if ctx.Err() != nil || cb.now().Sub(cb.lastProbe) < cb.probeInterval {
 		cb.mu.Unlock()
 		return ErrCircuitOpen
 	}
