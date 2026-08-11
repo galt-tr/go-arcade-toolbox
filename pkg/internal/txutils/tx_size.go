@@ -51,6 +51,34 @@ func TransactionSizeFromScriptLengths(inputScriptLengths, outputScriptLengths []
 		outputsSize
 }
 
+// MinRequiredFee returns the smallest fee, in satoshis, that a node applying a
+// satPerKB floor will accept for a transaction of sizeBytes.
+//
+// It reproduces bitcoin-sv's CFeeRate::GetFee exactly — integer arithmetic, so
+// TRUNCATING division, then a one-satoshi minimum for any non-empty transaction
+// at a non-zero rate — because that is the arithmetic the receiving node runs.
+// Reimplementing it in floating point, or rounding the other way, would put the
+// client's idea of "enough" a satoshi away from the node's on some sizes, which
+// is the entire failure mode this function exists to rule out.
+//
+// The size is the STANDARD serialization, not the extended format. Extended
+// format is only the encoding a transaction is submitted in; the prevout
+// satoshis and source locking scripts it carries inline are handed to the
+// validator as separate spent-coin data and are not billed. Verified directly
+// against arcade's BDK engine: a 1-input transaction whose source locking script
+// is 1000 bytes has a 73-byte standard size and a 1090-byte extended size, and
+// at 100 sat/kB it is accepted with a fee of 7 — floor(100*73/1000) — not 109.
+func MinRequiredFee(sizeBytes uint64, satPerKB int64) uint64 {
+	if satPerKB <= 0 || sizeBytes == 0 {
+		return 0
+	}
+	fee := sizeBytes * uint64(satPerKB) / 1000
+	if fee == 0 {
+		return 1
+	}
+	return fee
+}
+
 func varIntSize(val uint64) uint64 {
 	length := sdk.VarInt(val).Length()
 	return toU64(length)

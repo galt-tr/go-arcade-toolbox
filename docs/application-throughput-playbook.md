@@ -472,31 +472,47 @@ construction, so the floor there is the marginal fuel-input fee
 ### 3.3 Fee rate: 125, not 100
 
 The toolbox's default fee model is 100 sat/kB (`pkg/defs/fee_model.go:36-42`).
-Leaving it there gives you **zero margin** against arcade's validator, and the
-margin is not zero-cost — the two sides do not measure the same bytes.
+Leaving it there gives you **zero margin**, and the thing the margin protects
+you from is not what this section used to claim.
 
-Arcade's validator prices the **extended-format** transaction. Extended format
-carries, per input, the source satoshis and the source locking script inline.
-The toolbox's fee arithmetic prices the standard serialization: an input is
-`32 + 4 + 4` bytes plus the varint and the unlocking script
-(`pkg/internal/txutils/tx_size.go:11-23`), with no prevout term at all. So a fee
-computed at exactly 100 sat/kB over the standard size is *below* 100 sat/kB of
-the extended-format size that gets validated, and the broadcast comes back as a
-final 4xx — we saw it as `PROCESSING (4): failed to validate transaction`,
-with no competing transactions and nothing else wrong with the transaction.
+**Correction.** This section previously said arcade prices the extended-format
+transaction, so a fee computed at 100 sat/kB over the standard size necessarily
+falls below the floor. That is wrong, and it was measured to be wrong by driving
+arcade's BDK validator directly: a transaction whose source locking script is
+1000 bytes has a **73-byte standard** encoding and a **1090-byte extended**
+encoding, and at 100 sat/kB it is accepted with a fee of **7** satoshis —
+`floor(100 × 73 / 1000)`, not `floor(100 × 1090 / 1000) = 109`. The prevout
+satoshis and source locking scripts that extended format carries inline are
+handed to the validator as separate spent-coin data and are not billed
+(`/git/arcade/validator/convert.go:22-45`). The node's arithmetic also
+*truncates* where the toolbox's *rounds up*
+(`pkg/storage/internal/funder/fee_calculator.go:50`), so at the same size the
+toolbox pays at or above the floor.
 
-Set **125 sat/kB**. That is the reference app's own default
+**What actually bites.** The fee is committed during `CreateAction` from an
+*estimate* of the transaction's size, made before the unlocking scripts exist,
+and nothing ever rechecks it against the finished transaction. Every input whose
+real unlocking script is longer than declared eats the margin directly — and an
+input that declares neither an `unlockingScript` nor an `unlockingScriptLength`
+is silently assumed to be a 107-byte P2PKH (`pkg/storage/create.go:587-591`). A
+covenant input with a two-kilobyte unlocking script priced as 107 bytes
+underpays by ~190 satoshis at 100 sat/kB.
+
+So: **declare `unlockingScriptLength` on every caller-provided input and
+over-estimate it**, and enable `storage.WithMinBroadcastFeeRate(100)`, which
+measures the finished transaction and turns an underpayment into a local error
+naming the shortfall instead of a remote 4xx. See
+`docs/rejection-hardening-audit.md` finding 3.
+
+Set **125 sat/kB** as well. That is the reference app's own default
 (`toolbox-app-arcade/internal/config/config.go:198`) and every cluster benchmark
 in `docs/benchmarks` that reached four figures ran `FEE_SAT_PER_KB=125` — see
 `benchmarks/20260808-app-blast-end-to-end-aerospike-hybrid.md:13`,
 `benchmarks/20260809-sse-delivery-and-mined-apply-fix-validation.md:30`,
 `benchmarks/20260810-three-phase-1500tps-and-ceiling.md:43`.
 
-125 is a margin, not a computation. If your inputs are unusually numerous or
-your source locking scripts unusually large — a covenant spending its own
-several-kilobyte output is exactly that case — work out the extended-format
-overhead for your shape and add margin over *that*, rather than copying the
-constant.
+125 is a margin, not a computation — margin against your own size estimate being
+wrong, which is the failure that is actually reachable.
 
 ### 3.4 4xx is final; 503 is backpressure
 

@@ -52,8 +52,14 @@ type KnownTx struct {
 	CompetingTxs        []string
 	SuspectSince        *time.Time
 	VerifiedRejectedAt  *time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// RejectReason is arcade's own prose explaining why it refused this
+	// transaction (the 4xx body on the synchronous path, extraInfo on the async
+	// one), captured the first time it is learned. nil means no reason has ever
+	// been recorded — which for a REJECTED transaction is itself a finding, not
+	// a default. See the 00007 migration.
+	RejectReason *string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // KnownTxRepo persists the known-transaction state.
@@ -127,7 +133,7 @@ func (r KnownTxRepo) CountByArcadeStatus(ctx context.Context) (map[string]int, e
 const knownTxCols = "txid, status, arcade_status, attempts, rebroadcast_attempts, " +
 	"was_broadcast, notified, batch, notify, raw_tx, input_beef, block_height, " +
 	"block_hash, merkle_path, merkle_root, competing_txs, suspect_since, created_at, updated_at, " +
-	"verified_rejected_at"
+	"verified_rejected_at, reject_reason"
 
 func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 	var (
@@ -146,6 +152,7 @@ func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 		createdAt    tsScan
 		updatedAt    tsScan
 		verifiedRej  tsScan
+		rejectReason sql.NullString
 	)
 	dest := []any{
 		&txidBytes, &status, &arcadeStatus, &attempts, &rebroadcast,
@@ -153,6 +160,7 @@ func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 		&kt.RawTx, &kt.InputBEEF, &blockHeight, &kt.BlockHash, &kt.MerklePath,
 		&kt.MerkleRoot, &competing, r.s.tsDest(&suspectSince),
 		r.s.tsDest(&createdAt), r.s.tsDest(&updatedAt), r.s.tsDest(&verifiedRej),
+		&rejectReason,
 	}
 	if err := sc.Scan(dest...); err != nil {
 		return nil, err
@@ -182,6 +190,7 @@ func (r KnownTxRepo) scan(sc rowScanner) (*KnownTx, error) {
 	kt.CreatedAt = r.s.tsTime(createdAt)
 	kt.UpdatedAt = r.s.tsTime(updatedAt)
 	kt.VerifiedRejectedAt = r.s.tsTimePtr(verifiedRej)
+	kt.RejectReason = nullStr(rejectReason)
 	return &kt, nil
 }
 
@@ -235,7 +244,13 @@ func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...
 		"block_height = EXCLUDED.block_height, block_hash = EXCLUDED.block_hash, " +
 		"merkle_path = EXCLUDED.merkle_path, merkle_root = EXCLUDED.merkle_root, " +
 		"competing_txs = EXCLUDED.competing_txs, suspect_since = EXCLUDED.suspect_since, " +
-		"updated_at = EXCLUDED.updated_at, verified_rejected_at = EXCLUDED.verified_rejected_at"
+		"updated_at = EXCLUDED.updated_at, verified_rejected_at = EXCLUDED.verified_rejected_at, " +
+		// Sticky, like was_broadcast: an upsert that carries no reason must never
+		// erase one already recorded. Only the rejection writers set this column,
+		// and they are the only ones that ever have a reason to give; every other
+		// upsert (the freshly-signed-tx insert, an internalize) passes nil and
+		// would otherwise blank a diagnosis we cannot re-fetch.
+		"reject_reason = COALESCE(EXCLUDED.reject_reason, known_txs.reject_reason)"
 	var guardArgs []any
 	if len(skipForStatuses) > 0 {
 		conflict += " WHERE known_txs.status NOT IN (" + inPlaceholders(len(skipForStatuses)) + ")"
@@ -246,7 +261,7 @@ func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...
 
 	q := r.s.rebind(
 		`INSERT INTO known_txs (` + knownTxCols + `)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ` + conflict,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ` + conflict,
 	)
 	args := []any{
 		//nolint:gosec // attempt counters are small, well within int64.
@@ -254,7 +269,7 @@ func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...
 		r.s.boolVal(wasBroadcast), r.s.boolVal(kt.Notified), strPtrArg(kt.Batch), notify,
 		bytesArg(kt.RawTx), bytesArg(kt.InputBEEF), blockHeight, bytesArg(kt.BlockHash),
 		bytesArg(kt.MerklePath), bytesArg(kt.MerkleRoot), competing, r.s.encTimePtr(kt.SuspectSince),
-		now, now, r.s.encTimePtr(kt.VerifiedRejectedAt),
+		now, now, r.s.encTimePtr(kt.VerifiedRejectedAt), strPtrArg(kt.RejectReason),
 	}
 	args = append(args, guardArgs...)
 
@@ -375,6 +390,18 @@ func (r KnownTxRepo) existsByTxID(ctx context.Context, raw []byte) (bool, error)
 	return true, nil
 }
 
+// rejectReasonArg binds a rejection reason for a `COALESCE(?, reject_reason)`
+// assignment: a non-empty reason is written, an empty one binds NULL so the
+// COALESCE keeps whatever was recorded before. Arcade legitimately emits a
+// REJECTED record with no reason at all, and that must not erase the reason an
+// earlier event (or the synchronous 4xx body) already supplied.
+func rejectReasonArg(reason string) any {
+	if reason == "" {
+		return nil
+	}
+	return reason
+}
+
 // boolTrueLiteral renders a literal true for the engine (postgres TRUE, sqlite
 // 1). Used where a value, not a bound parameter, is wanted.
 func (s *Store) boolTrueLiteral() string {
@@ -387,14 +414,23 @@ func (s *Store) boolTrueLiteral() string {
 // MarkSuspectFailed moves a known tx into the suspect-failed grace window,
 // recording suspectSince and resetting verified_rejected_at to NULL so the
 // reconciler's two-pass guard starts fresh for this suspect cycle.
-func (r KnownTxRepo) MarkSuspectFailed(ctx context.Context, txid string, suspectSince time.Time) error {
+//
+// rejectReason is arcade's own explanation of the refusal (the 4xx body on the
+// synchronous broadcast path). It is recorded here because this is the only
+// moment it exists: arcade may drop the transaction's record entirely — a
+// REJECTED event followed by a 404 on GET /tx is something we have actually
+// observed — after which no amount of polling can recover the cause. An empty
+// reason leaves any previously-recorded one intact rather than blanking it.
+func (r KnownTxRepo) MarkSuspectFailed(ctx context.Context, txid string, suspectSince time.Time, rejectReason string) error {
 	raw, err := encTxID(txid)
 	if err != nil {
 		return err
 	}
-	q := r.s.rebind("UPDATE known_txs SET status = ?, suspect_since = ?, verified_rejected_at = NULL, updated_at = ? WHERE txid = ?")
+	q := r.s.rebind("UPDATE known_txs SET status = ?, suspect_since = ?, verified_rejected_at = NULL, " +
+		"reject_reason = COALESCE(?, reject_reason), updated_at = ? WHERE txid = ?")
 	res, err := r.s.execer(ctx).ExecContext(ctx, q,
-		string(KnownTxStatusSuspectFailed), r.s.encTime(suspectSince), r.s.encTime(r.s.now()), raw)
+		string(KnownTxStatusSuspectFailed), r.s.encTime(suspectSince),
+		rejectReasonArg(rejectReason), r.s.encTime(r.s.now()), raw)
 	if err != nil {
 		return fmt.Errorf("metastore: mark suspect failed: %w", err)
 	}

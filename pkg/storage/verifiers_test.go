@@ -50,7 +50,7 @@ func TestScriptsVerifier_ChronicleOpcodes(t *testing.T) {
 	tx := txSpending(t, "OP_2MUL OP_4 OP_EQUAL", "OP_2")
 
 	t.Run("genesis rejects OP_2MUL", func(t *testing.T) {
-		ok, err := newDefaultScriptsVerifier(false).VerifyScripts(context.Background(), tx)
+		ok, err := newDefaultScriptsVerifier(false, 0).VerifyScripts(context.Background(), tx)
 		if err == nil || ok {
 			t.Fatalf("expected Genesis rules to reject OP_2MUL, got ok=%v err=%v", ok, err)
 		}
@@ -60,7 +60,7 @@ func TestScriptsVerifier_ChronicleOpcodes(t *testing.T) {
 	})
 
 	t.Run("chronicle accepts OP_2MUL", func(t *testing.T) {
-		ok, err := newDefaultScriptsVerifier(true).VerifyScripts(context.Background(), tx)
+		ok, err := newDefaultScriptsVerifier(true, 0).VerifyScripts(context.Background(), tx)
 		if err != nil || !ok {
 			t.Fatalf("expected Chronicle rules to accept OP_2MUL, got ok=%v err=%v", ok, err)
 		}
@@ -72,7 +72,7 @@ func TestScriptsVerifier_ChronicleOpcodes(t *testing.T) {
 func TestScriptsVerifier_ChronicleStillRejectsBadScripts(t *testing.T) {
 	tx := txSpending(t, "OP_2MUL OP_5 OP_EQUAL", "OP_2") // 2*2 == 4, not 5
 
-	ok, err := newDefaultScriptsVerifier(true).VerifyScripts(context.Background(), tx)
+	ok, err := newDefaultScriptsVerifier(true, 0).VerifyScripts(context.Background(), tx)
 	if err == nil || ok {
 		t.Fatalf("Chronicle verifier accepted a script that evaluates false: ok=%v err=%v", ok, err)
 	}
@@ -84,7 +84,7 @@ func TestScriptsVerifier_GenesisUnchanged(t *testing.T) {
 	tx := txSpending(t, "OP_3 OP_EQUAL", "OP_3")
 
 	for _, chronicle := range []bool{false, true} {
-		ok, err := newDefaultScriptsVerifier(chronicle).VerifyScripts(context.Background(), tx)
+		ok, err := newDefaultScriptsVerifier(chronicle, 0).VerifyScripts(context.Background(), tx)
 		if err != nil || !ok {
 			t.Errorf("chronicle=%v: ordinary script should verify, got ok=%v err=%v", chronicle, ok, err)
 		}
@@ -105,11 +105,11 @@ func TestScriptsVerifier_RequiresSourceOutput(t *testing.T) {
 		UnlockingScript:  unlock,
 	})
 
-	if ok, err := newDefaultScriptsVerifier(false).VerifyScripts(context.Background(), tx); err == nil || ok {
+	if ok, err := newDefaultScriptsVerifier(false, 0).VerifyScripts(context.Background(), tx); err == nil || ok {
 		t.Fatalf("expected an error when the input has no source output, got ok=%v err=%v", ok, err)
 	}
 
-	if ok, err := newDefaultScriptsVerifier(false).VerifyScripts(context.Background(), nil); err == nil || ok {
+	if ok, err := newDefaultScriptsVerifier(false, 0).VerifyScripts(context.Background(), nil); err == nil || ok {
 		t.Fatalf("expected an error for a nil transaction, got ok=%v err=%v", ok, err)
 	}
 }
@@ -123,7 +123,7 @@ func TestWithChronicleOpcodesOption(t *testing.T) {
 		t.Fatal("WithChronicleOpcodes did not set chronicleScripts")
 	}
 
-	v := newDefaultScriptsVerifier(p.chronicleScripts)
+	v := newDefaultScriptsVerifier(p.chronicleScripts, p.genesisHeight)
 	if !v.chronicle {
 		t.Fatal("verifier did not inherit the Chronicle setting")
 	}

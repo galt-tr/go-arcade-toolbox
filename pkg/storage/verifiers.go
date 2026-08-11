@@ -62,10 +62,14 @@ func (v *defaultBeefVerifier) VerifyBeef(ctx context.Context, beef *transaction.
 type defaultScriptsVerifier struct {
 	// chronicle selects Chronicle-era script rules. See [WithChronicleOpcodes].
 	chronicle bool
+	// genesisHeight is the block height at which Genesis activated on this
+	// network. 0 disables per-input era selection. See
+	// [WithGenesisActivationHeight].
+	genesisHeight uint32
 }
 
-func newDefaultScriptsVerifier(chronicle bool) *defaultScriptsVerifier {
-	return &defaultScriptsVerifier{chronicle: chronicle}
+func newDefaultScriptsVerifier(chronicle bool, genesisHeight uint32) *defaultScriptsVerifier {
+	return &defaultScriptsVerifier{chronicle: chronicle, genesisHeight: genesisHeight}
 }
 
 var _ wdk.ScriptsVerifier = (*defaultScriptsVerifier)(nil)
@@ -94,16 +98,60 @@ func (v *defaultScriptsVerifier) VerifyScripts(_ context.Context, tx *transactio
 // executionOptions builds the interpreter flags for one input. Chronicle
 // implies after-genesis, so the two eras are mutually exclusive rather than
 // additive.
+//
+// The era is a property of the INPUT, not of the transaction. go-sdk names the
+// flag UTXOAfterGenesis for exactly that reason: the rules a script is judged by
+// are those in force when the output it spends was created, and a node consults
+// each input's own source height. A wallet that picks one ruleset for the whole
+// transaction is therefore making a claim it has no right to make — see
+// [WithGenesisActivationHeight].
 func (v *defaultScriptsVerifier) executionOptions(
 	tx *transaction.Transaction, i int, src *transaction.TransactionOutput,
 ) []interpreter.ExecutionOptionFunc {
-	era := interpreter.WithAfterGenesis()
-	if v.chronicle {
-		era = interpreter.WithAfterChronicle()
-	}
-	return []interpreter.ExecutionOptionFunc{
+	opts := []interpreter.ExecutionOptionFunc{
 		interpreter.WithTx(tx, i, src),
 		interpreter.WithForkID(),
-		era,
 	}
+	if v.isPreGenesisUTXO(tx.Inputs[i]) {
+		// No era option at all IS the pre-Genesis ruleset: go-sdk's thread starts
+		// on beforeGenesisConfig and the era options only ever move it forward.
+		// That restores MAX_SCRIPT_ELEMENT_SIZE_BEFORE_GENESIS (520 bytes), the
+		// 500-opcode budget, and 4-byte script numbers.
+		//
+		// Bip16 (P2SH), which was also in force before Genesis, is deliberately
+		// NOT added: it changes how a locking script matching the exact P2SH
+		// pattern is evaluated, and this option exists to catch the limits that
+		// actually reject transactions, not to fully re-enact a retired era.
+		return opts
+	}
+	if v.chronicle {
+		return append(opts, interpreter.WithAfterChronicle())
+	}
+	return append(opts, interpreter.WithAfterGenesis())
+}
+
+// isPreGenesisUTXO reports whether an input provably spends an output created
+// before Genesis activated, and so must be judged by the pre-Genesis rules.
+//
+// "Provably" is the operative word. The only evidence is a merkle proof on the
+// input's source transaction, which pins it to a block height; the BEEF the
+// wallet stores for its inputs carries exactly that for every proven ancestor.
+// An input with no proof is spending an unconfirmed or unproven output, which by
+// definition cannot predate anything already mined — so an unknown height means
+// the newest era, never the oldest. Guessing the other way would refuse a wallet
+// its own freshly-created coins.
+//
+// Nothing here VERIFIES the proof; a caller-supplied BEEF could understate a
+// height and provoke a spurious local refusal. That is a denial of service
+// against the caller by the caller, not a way to get an invalid transaction
+// accepted, and the merkle roots are checked where it matters (internalize).
+func (v *defaultScriptsVerifier) isPreGenesisUTXO(in *transaction.TransactionInput) bool {
+	if v.genesisHeight == 0 || in == nil || in.SourceTransaction == nil {
+		return false
+	}
+	mp := in.SourceTransaction.MerklePath
+	if mp == nil {
+		return false
+	}
+	return mp.BlockHeight < v.genesisHeight
 }

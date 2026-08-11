@@ -452,8 +452,8 @@ func testKnownTx(t *testing.T, factory storeFactory) {
 	require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{TxID: old, Status: wdk.ProvenTxStatusUnsent}))
 	require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{TxID: recent, Status: wdk.ProvenTxStatusUnsent}))
 	now := time.Now().UTC()
-	require.NoError(t, s.KnownTx().MarkSuspectFailed(ctx, old, now.Add(-time.Hour)))
-	require.NoError(t, s.KnownTx().MarkSuspectFailed(ctx, recent, now))
+	require.NoError(t, s.KnownTx().MarkSuspectFailed(ctx, old, now.Add(-time.Hour), "insufficient fee"))
+	require.NoError(t, s.KnownTx().MarkSuspectFailed(ctx, recent, now, ""))
 
 	suspects, err := s.KnownTx().FindSuspectFailed(ctx, 30*time.Minute, 10)
 	require.NoError(t, err)

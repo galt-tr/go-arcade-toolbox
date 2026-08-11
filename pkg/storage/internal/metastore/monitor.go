@@ -158,14 +158,21 @@ func (r KnownTxRepo) MarkPolled(ctx context.Context, txids []string) error {
 
 // MarkSuspect moves a known tx into the suspect-failed grace window recording
 // everything the reject reconciler will read back via FindSuspectFailed:
-// status = suspectFailed, suspect_since, the competing txids, and the arcade
-// wire status. It resets verified_rejected_at to NULL so the reconciler's
-// two-pass guard starts fresh for this suspect cycle (a stale stamp from an
-// earlier cycle must never let a re-suspected tx skip the second pass). This is
-// the ASYNC-reject writer; unlike the synchronous 4xx path it does NOT release
-// the reserved inputs (that is the reconciler's job). It leaves raw_tx /
-// input_beef intact so the reconciler can re-verify.
-func (r KnownTxRepo) MarkSuspect(ctx context.Context, txid string, suspectSince time.Time, competingTxs []string, arcadeStatus string) error {
+// status = suspectFailed, suspect_since, the competing txids, the arcade wire
+// status, and arcade's own reason for the refusal. It resets
+// verified_rejected_at to NULL so the reconciler's two-pass guard starts fresh
+// for this suspect cycle (a stale stamp from an earlier cycle must never let a
+// re-suspected tx skip the second pass). This is the ASYNC-reject writer;
+// unlike the synchronous 4xx path it does NOT release the reserved inputs (that
+// is the reconciler's job). It leaves raw_tx / input_beef intact so the
+// reconciler can re-verify.
+//
+// rejectReason is the event's extraInfo. It is persisted HERE, at first sight,
+// because it is not re-fetchable: arcade drops a rejected transaction's record
+// on its own schedule, and a REJECTED event whose GET /tx already 404s leaves
+// no other way to learn the cause. An empty reason binds NULL and so preserves
+// any reason recorded earlier in this suspect cycle.
+func (r KnownTxRepo) MarkSuspect(ctx context.Context, txid string, suspectSince time.Time, competingTxs []string, arcadeStatus, rejectReason string) error {
 	raw, err := encTxID(txid)
 	if err != nil {
 		return err
@@ -181,12 +188,12 @@ func (r KnownTxRepo) MarkSuspect(ctx context.Context, txid string, suspectSince 
 	q := r.s.rebind(
 		`UPDATE known_txs
 		 SET status = ?, arcade_status = ?, competing_txs = ?, suspect_since = ?,
-		     verified_rejected_at = NULL, updated_at = ?
+		     verified_rejected_at = NULL, reject_reason = COALESCE(?, reject_reason), updated_at = ?
 		 WHERE txid = ?`,
 	)
 	res, err := r.s.execer(ctx).ExecContext(ctx, q,
 		string(KnownTxStatusSuspectFailed), arcadeStatus, competing,
-		r.s.encTime(suspectSince), r.s.encTime(r.s.now()), raw)
+		r.s.encTime(suspectSince), rejectReasonArg(rejectReason), r.s.encTime(r.s.now()), raw)
 	if err != nil {
 		return fmt.Errorf("metastore: mark suspect: %w", err)
 	}

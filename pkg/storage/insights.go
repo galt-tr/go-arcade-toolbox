@@ -15,11 +15,18 @@ const defaultKnownTxListLimit = 200
 
 // KnownTxRow is one transaction in a status drill-down.
 type KnownTxRow struct {
-	TxID          string  `json:"txid"`
-	Status        string  `json:"status"`
-	ArcadeStatus  string  `json:"arcade_status"`
-	BlockHeight   *uint32 `json:"block_height,omitempty"`
-	UpdatedAtUnix int64   `json:"updated_at_unix"`
+	TxID         string  `json:"txid"`
+	Status       string  `json:"status"`
+	ArcadeStatus string  `json:"arcade_status"`
+	BlockHeight  *uint32 `json:"block_height,omitempty"`
+	// RejectReason is arcade's own explanation of a refusal, captured when it was
+	// first learned. It is what makes a REJECTED bucket in this drill-down
+	// actionable: arcade discards a rejected transaction's record on its own
+	// schedule, so by the time an operator clicks through, GET /tx may well
+	// answer 404. Empty when the transaction was never rejected — or when arcade
+	// rejected it and said nothing, which is a finding in itself.
+	RejectReason  string `json:"reject_reason,omitempty"`
+	UpdatedAtUnix int64  `json:"updated_at_unix"`
 }
 
 func clampListLimit(limit int) int {
@@ -37,11 +44,16 @@ func toKnownTxRows(rows []metastore.KnownTx) []KnownTxRow {
 		if kt.ArcadeStatus != nil {
 			arcade = *kt.ArcadeStatus
 		}
+		reason := ""
+		if kt.RejectReason != nil {
+			reason = *kt.RejectReason
+		}
 		out = append(out, KnownTxRow{
 			TxID:          kt.TxID,
 			Status:        string(kt.Status),
 			ArcadeStatus:  arcade,
 			BlockHeight:   kt.BlockHeight,
+			RejectReason:  reason,
 			UpdatedAtUnix: kt.UpdatedAt.Unix(),
 		})
 	}

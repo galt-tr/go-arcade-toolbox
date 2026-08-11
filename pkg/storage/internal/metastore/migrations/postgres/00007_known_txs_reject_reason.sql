@@ -1,0 +1,32 @@
+-- +goose Up
+-- reject_reason is the ONLY durable record of WHY arcade refused a transaction.
+--
+-- WHY it has to be a column: arcade's reason arrives exactly once, on the wire,
+-- and it is not re-fetchable. On the synchronous path it is the 4xx body; on the
+-- async path it is the REJECTED record's extraInfo. Both were parsed and then
+-- dropped — applyRejected passed rec.CompetingTxs and rec.Status to MarkSuspect
+-- and simply never read rec.ExtraInfo. The reconciler re-read it later via
+-- GetTx, but only to run a regex classifier over it, and only for as long as
+-- arcade still had the record.
+--
+-- That "as long as" is the failure. We observed a REJECTED SSE event with an
+-- EMPTY extraInfo whose GET /api/v1/tx/<txid> then returned 404: arcade had
+-- already dropped the row, so there was no second chance to ask. The cause was
+-- recoverable only by reading teranode's propagation-pod logs by hand. A
+-- rejection whose cause is unknowable is a hardening failure in its own right,
+-- so the reason is now captured at the moment it is first learned and kept with
+-- the transaction it belongs to.
+--
+-- It is deliberately NULLable and free-text: arcade's reason is prose, its
+-- taxonomy is not ours to enumerate, and an absent reason ("REJECTED with empty
+-- extraInfo") is itself a distinct, diagnostically useful fact that must not be
+-- confused with the empty string.
+--
+-- Writers only ever set it from a non-empty reason (see MarkSuspect /
+-- MarkSuspectFailed / SetRejectReason, which COALESCE around a NULL argument),
+-- so a later status event that carries no reason can never erase one already
+-- recorded. The same rule holds on the Upsert conflict path.
+ALTER TABLE known_txs ADD COLUMN reject_reason TEXT NULL;
+
+-- +goose Down
+ALTER TABLE known_txs DROP COLUMN reject_reason;

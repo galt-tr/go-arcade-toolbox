@@ -279,15 +279,39 @@ func (p *Provider) applyMined(ctx context.Context, rec arcade.TxRecord) error {
 }
 
 // applyRejected marks a known tx suspectFailed and records the competing txids
-// + suspect_since + arcade status for the M4.2 reject reconciler. It does NOT
-// release inputs or touch change (see the ApplyStatusUpdate doc's asymmetry
-// note).
+// + suspect_since + arcade status + arcade's rejection reason for the M4.2
+// reject reconciler. It does NOT release inputs or touch change (see the
+// ApplyStatusUpdate doc's asymmetry note).
 func (p *Provider) applyRejected(ctx context.Context, rec arcade.TxRecord) error {
-	if err := p.meta.KnownTx().MarkSuspect(ctx, rec.TxID, p.now(), rec.CompetingTxs, string(rec.Status)); err != nil &&
+	p.logRejection(ctx, rec.TxID, string(rec.Status), rec.ExtraInfo, "status_event")
+	if err := p.meta.KnownTx().MarkSuspect(ctx, rec.TxID, p.now(), rec.CompetingTxs, string(rec.Status), rec.ExtraInfo); err != nil &&
 		!errors.Is(err, metastore.ErrNotFound) {
 		return fmt.Errorf("storage: mark suspect %s: %w", rec.TxID, err)
 	}
 	return nil
+}
+
+// logRejection emits the one log line that makes a rejection diagnosable
+// without a database query, at the instant the reason is first known.
+//
+// It exists because the reason is perishable. Arcade removes a rejected
+// transaction's record on its own schedule; we have seen a REJECTED event whose
+// GET /tx returned 404 immediately afterwards, leaving teranode's pod logs as
+// the only remaining source of truth. Logging at WARN — not DEBUG — is
+// deliberate: a rejection is never routine, and a rejection nobody can explain
+// is worse than the rejection itself.
+//
+// An empty reason is reported as such rather than omitted: "arcade rejected
+// this and told us nothing" is a distinct and actionable observation.
+func (p *Provider) logRejection(ctx context.Context, txid, status, reason, source string) {
+	if reason == "" {
+		reason = "(arcade supplied no reason)"
+	}
+	p.logger.WarnContext(ctx, "arcade rejected transaction",
+		slog.String("txid", txid),
+		slog.String("arcadeStatus", status),
+		slog.String("reason", reason),
+		slog.String("source", source))
 }
 
 // applyPendingRetry keeps a tx in flight: arcade's broadcast hit a retryable
@@ -874,7 +898,8 @@ func (p *Provider) applyMinedBatch(ctx context.Context, proofs []minedProof) err
 // frequency). Must run inside p.meta.Do.
 func (p *Provider) applyRejectedBatch(ctx context.Context, recs []arcade.TxRecord) error {
 	for _, rec := range recs {
-		if err := p.meta.KnownTx().MarkSuspect(ctx, rec.TxID, p.now(), rec.CompetingTxs, string(rec.Status)); err != nil &&
+		p.logRejection(ctx, rec.TxID, string(rec.Status), rec.ExtraInfo, "status_batch")
+		if err := p.meta.KnownTx().MarkSuspect(ctx, rec.TxID, p.now(), rec.CompetingTxs, string(rec.Status), rec.ExtraInfo); err != nil &&
 			!errors.Is(err, metastore.ErrNotFound) {
 			return fmt.Errorf("storage: batch mark suspect %s: %w", rec.TxID, err)
 		}
@@ -1092,8 +1117,11 @@ func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx) er
 	}
 	if res.Rejected {
 		// A tx-level rejection: mark suspect (the reconciler owns input release),
-		// matching the async-reject asymmetry.
-		if err := p.meta.KnownTx().MarkSuspect(ctx, txid, p.now(), nil, string(res.Status)); err != nil &&
+		// matching the async-reject asymmetry. The 4xx body is the whole diagnosis
+		// and it exists only here, so it goes to the log and to the row before
+		// anything else happens.
+		p.logRejection(ctx, txid, string(res.Status), res.ExtraInfo, "delayed_broadcast_4xx")
+		if err := p.meta.KnownTx().MarkSuspect(ctx, txid, p.now(), nil, string(res.Status), res.ExtraInfo); err != nil &&
 			!errors.Is(err, metastore.ErrNotFound) {
 			return fmt.Errorf("mark suspect %s: %w", txid, err)
 		}

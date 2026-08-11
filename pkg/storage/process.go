@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/txutils"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
 	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
@@ -129,6 +130,14 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 		return err
 	}
 
+	// Serialize once: the fee check measures these exact bytes and the known-tx
+	// row stores them, so there is no second serialization and no chance of the
+	// two disagreeing about what was priced.
+	rawTx := tx.Bytes()
+	if err := p.checkBroadcastFeeRate(tx, len(rawTx)); err != nil {
+		return err
+	}
+
 	txStatus, ktxStatus := newTxStatuses(args)
 
 	return p.meta.Do(ctx, func(ctx context.Context) error {
@@ -142,13 +151,69 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 			TxID:         txid,
 			Status:       ktxStatus,
 			WasBroadcast: false,
-			RawTx:        tx.Bytes(),
+			RawTx:        rawTx,
 			InputBEEF:    txRow.InputBEEF,
 		}); err != nil {
 			return fmt.Errorf("storage: upsert known tx: %w", err)
 		}
 		return p.mintChange(ctx, userID, txRow.TransactionID, txid)
 	})
+}
+
+// ErrFeeBelowFloor is returned when a signed transaction's actual fee is below
+// the locally-configured broadcast floor. It is a FINAL, local verdict: the
+// transaction bytes are underpriced and no retry of the same bytes will change
+// that. Callers match it with errors.Is to distinguish "this transaction is
+// wrong" from "the network is busy".
+var ErrFeeBelowFloor = errors.New("storage: transaction fee is below the configured broadcast floor")
+
+// checkBroadcastFeeRate refuses a signed transaction whose real fee is below the
+// configured sat/kB floor, so the wallet never offers the network something it
+// has already computed will be refused. Disabled (and free) when no floor is
+// configured — see [WithMinBroadcastFeeRate].
+//
+// It is deliberately measured, not estimated. The fee is the difference between
+// what the inputs bring and what the outputs take, read from the source outputs
+// the caller has already had to supply for script verification; the size is the
+// serialized length of the very bytes that will be broadcast. Both are facts
+// about the finished transaction, so this cannot drift from what the node sees
+// the way a pre-signing size estimate can.
+//
+// An input whose source output is unavailable makes the fee unknowable. That is
+// not a fee failure and is not reported as one: the check declines to judge and
+// lets the transaction through, because a wallet must not invent a verdict it
+// has no evidence for. Such a transaction cannot be EF-encoded anyway and will
+// fail later, with an accurate message.
+func (p *Provider) checkBroadcastFeeRate(tx *transaction.Transaction, sizeBytes int) error {
+	if p.minBroadcastFeeRate <= 0 {
+		return nil
+	}
+	var inSats, outSats uint64
+	for _, in := range tx.Inputs {
+		src := in.SourceTxOutput()
+		if src == nil {
+			return nil // fee not knowable; see the doc comment
+		}
+		inSats += src.Satoshis
+	}
+	for _, out := range tx.Outputs {
+		outSats += out.Satoshis
+	}
+	if outSats > inSats {
+		// Outputs exceeding inputs is a malformed transaction, not an underpaid
+		// one; report it as the (larger) problem it is rather than as a shortfall.
+		return fmt.Errorf("%w: outputs (%d sat) exceed inputs (%d sat)", ErrFeeBelowFloor, outSats, inSats)
+	}
+	fee := inSats - outSats
+	//nolint:gosec // a serialized length is non-negative.
+	required := txutils.MinRequiredFee(uint64(sizeBytes), p.minBroadcastFeeRate)
+	if fee >= required {
+		return nil
+	}
+	return fmt.Errorf("%w: %d sat over %d bytes is %d sat short of the %d sat/kB floor "+
+		"(the committed fee was computed from a size estimate that the signed transaction exceeded — "+
+		"check every input's declared unlockingScriptLength)",
+		ErrFeeBelowFloor, fee, sizeBytes, required-fee, p.minBroadcastFeeRate)
 }
 
 // mintChange mints the change outputs of a transaction into the change basket
@@ -363,13 +428,18 @@ func (p *Provider) commitRejected(ctx context.Context, userID int, txid string, 
 
 	txRow := p.firstTxByTxID(ctx, userID, txid)
 
+	// Record the reason before anything else: the 4xx body is the only statement
+	// of cause that will ever exist for this transaction, and arcade may have
+	// forgotten the transaction by the time anyone asks it again.
+	p.logRejection(ctx, txid, string(res.Status), res.ExtraInfo, "broadcast_4xx")
+
 	err := p.meta.Do(ctx, func(ctx context.Context) error {
 		if err := p.meta.Transactions().UpdateStatusByTxID(ctx, txid, wdk.TxStatusFailed,
 			wdk.TxStatusSending, wdk.TxStatusNoSend, wdk.TxStatusUnproven); err != nil &&
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) {
 			return fmt.Errorf("storage: mark failed: %w", err)
 		}
-		if err := p.meta.KnownTx().MarkSuspectFailed(ctx, txid, p.now()); err != nil &&
+		if err := p.meta.KnownTx().MarkSuspectFailed(ctx, txid, p.now(), res.ExtraInfo); err != nil &&
 			!errors.Is(err, metastore.ErrNotFound) {
 			return fmt.Errorf("storage: mark suspect failed: %w", err)
 		}

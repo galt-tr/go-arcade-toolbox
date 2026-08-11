@@ -721,13 +721,19 @@ func (p *Provider) doRemoveMinted(ctx context.Context, mintTxID chainhash.Hash, 
 	if err != nil {
 		return 0, fmt.Errorf("storage: remove minted change: %w", err)
 	}
-	return p.cascadeChildren(ctx, report.AlreadySpentBy)
+	return p.cascadeChildren(ctx, mintTxID, report.AlreadySpentBy)
 }
 
 // cascadeChildren re-marks each child tx (that spent a now-removed phantom
 // change coin) suspect, unless it is already terminal or proven — never
 // clobbering a completed tx. Returns how many it (re-)marked.
-func (p *Provider) cascadeChildren(ctx context.Context, children []chainhash.Hash) (int, error) {
+//
+// The recorded reason names the dead parent. A cascade is the case where the
+// child's OWN rejection reason is least informative — arcade will say the input
+// is unknown or the parent was rejected, which explains nothing on its own — so
+// the one fact worth keeping is which ancestor actually died.
+func (p *Provider) cascadeChildren(ctx context.Context, parent chainhash.Hash, children []chainhash.Hash) (int, error) {
+	reason := "cascade: parent " + parent.String() + " is terminally dead"
 	n := 0
 	for i := range children {
 		childTxid := children[i].String()
@@ -745,7 +751,7 @@ func (p *Provider) cascadeChildren(ctx context.Context, children []chainhash.Has
 		if kt.Status.IsTerminalFailure() {
 			continue // already invalidTx/doubleSpend
 		}
-		if err := p.meta.KnownTx().MarkSuspect(ctx, childTxid, p.now(), nil, "cascade"); err != nil &&
+		if err := p.meta.KnownTx().MarkSuspect(ctx, childTxid, p.now(), nil, "cascade", reason); err != nil &&
 			!errors.Is(err, metastore.ErrNotFound) {
 			return n, fmt.Errorf("storage: cascade mark child suspect %s: %w", childTxid, err)
 		}

@@ -58,10 +58,20 @@ type Provider struct {
 	// verifier. See [WithChronicleOpcodes].
 	chronicleScripts bool
 
+	// genesisHeight is this network's Genesis activation height, enabling
+	// per-input era selection in the default scripts verifier. 0 disables it.
+	// See [WithGenesisActivationHeight].
+	genesisHeight uint32
+
 	// requireChangeOutput forbids the funder from dropping a sub-dust change
 	// output, so every funded action keeps the output shape the caller planned.
 	// See [WithRequiredChangeOutput].
 	requireChangeOutput bool
+
+	// minBroadcastFeeRate is the sat/kB floor a signed transaction must clear
+	// locally before it is allowed to exist. 0 (the default) disables the check.
+	// See [WithMinBroadcastFeeRate].
+	minBroadcastFeeRate int64
 
 	feeModel     defs.FeeModel
 	changeBasket defs.ChangeBasket
@@ -136,6 +146,39 @@ func WithChronicleOpcodes() Option {
 	return func(p *Provider) { p.chronicleScripts = true }
 }
 
+// WithGenesisActivationHeight tells the default scripts verifier where Genesis
+// activated on this network, so an input spending a PRE-Genesis output is judged
+// by the pre-Genesis rules instead of the transaction-wide ruleset.
+//
+// Consensus rules attach to the output being spent, not to the transaction doing
+// the spending: a node resolves each input's source height and applies the era
+// in force then. Without this, the verifier applies one era to every input — the
+// newest one — and so passes transactions the network will refuse. The concrete
+// symptom is the pre-Genesis 520-byte push limit, which teranode still enforces
+// against an old UTXO and which the toolbox has no way to see coming:
+//
+//	utxoHeights=410|410 error=Push value size limit exceeded
+//
+// Note this is a divergence from ARCADE's intake, not agreement with it. Arcade
+// reports an unknown-parent sentinel for every input, which resolves to a height
+// above every activation, so its own validator accepts such a spend and answers
+// 202. The refusal arrives later, asynchronously, from teranode — which is the
+// worst shape of failure to debug and the reason it is worth catching locally.
+//
+// It is off by default because the toolbox cannot derive the height: Genesis
+// activated at 620538 on mainnet and 1344302 on testnet, but a private or
+// scaling network chooses its own, and inventing one would refuse valid spends.
+// Supply the height your network actually activated at, or leave it unset.
+//
+// A height is only claimed when an input's source transaction carries a merkle
+// proof; an unproven parent is treated as newest-era. Composes with
+// [WithChronicleOpcodes], which selects the era for everything that is not
+// pre-Genesis. Has no effect when [WithScriptsVerifier] supplies a custom
+// verifier.
+func WithGenesisActivationHeight(height uint32) Option {
+	return func(p *Provider) { p.genesisHeight = height }
+}
+
 // WithRequiredChangeOutput guarantees that every funded action carries a change
 // output, instead of letting the funder drop it when the leftover is small.
 //
@@ -176,6 +219,37 @@ func WithRandomizer(r wdk.Randomizer) Option {
 // WithFeeModel sets the static fee model used for change/fee computation.
 func WithFeeModel(m defs.FeeModel) Option {
 	return func(p *Provider) { p.feeModel = m }
+}
+
+// WithMinBroadcastFeeRate refuses to accept a signed transaction whose ACTUAL
+// fee falls below satPerKB of its ACTUAL serialized size, turning a remote 4xx
+// into a local error that names the shortfall in satoshis.
+//
+// The fee the funder commits is computed from an ESTIMATE of the transaction's
+// size, made before the unlocking scripts exist. Every input whose real script
+// turns out longer than the estimate erodes the margin, and one input silently
+// defaults to a 107-byte P2PKH guess when the caller declares neither an
+// unlocking script nor an unlockingScriptLength. A covenant input carrying a
+// two-kilobyte unlocking script priced as 107 bytes underpays by ~190 satoshis
+// at 100 sat/kB — enough to land under the floor, with nothing local to say so.
+// This check closes that gap by measuring the finished transaction instead of
+// the plan: fee = inputs − outputs, size = the bytes that will be broadcast, and
+// the required minimum computed with the node's own integer arithmetic
+// ([txutils.MinRequiredFee]).
+//
+// It is OFF by default and takes an explicit rate rather than reusing the wallet's
+// own fee model, because the floor is the receiving deployment's policy and not a
+// protocol constant: arcade's default is 100 sat/kB, an operator may set any other
+// value, and accept_zero_fee removes the floor entirely. Defaulting it on at 100
+// would refuse perfectly good transactions on a zero-fee network; deriving it from
+// the wallet's own (higher) target rate would refuse transactions the network would
+// have taken. Set it to the floor your arcade actually enforces.
+//
+// The check runs once, in ProcessAction, at the moment the signed transaction
+// first becomes real — before it is persisted, before change is minted, and
+// before anything is sent. A refusal therefore leaves nothing to clean up.
+func WithMinBroadcastFeeRate(satPerKB int64) Option {
+	return func(p *Provider) { p.minBroadcastFeeRate = satPerKB }
 }
 
 // WithChangeBasket sets the default change-basket configuration.
@@ -286,7 +360,7 @@ func New(
 		p.rand = newDefaultRandomizer()
 	}
 	if p.scripts == nil {
-		p.scripts = newDefaultScriptsVerifier(p.chronicleScripts)
+		p.scripts = newDefaultScriptsVerifier(p.chronicleScripts, p.genesisHeight)
 	}
 	if p.beef == nil {
 		if hdrs == nil {
