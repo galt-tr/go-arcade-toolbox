@@ -127,6 +127,8 @@ The reject→release reconciler is the headline correctness fix over the old man
 `unfail`: async-rejected transactions have their inputs auto-released **after
 verification**, with a two-pass false-positive guard and a double-spend
 winner-union rule, so there is no UTXO leak and no manual intervention. See
+[reject-release-vs-unfail](reject-release-vs-unfail.md) for why this model is
+safer than unfail, and
 [arcade-integration](arcade-integration.md#the-rejectrelease-reconciler) for the
 full guard rules.
 

@@ -37,7 +37,14 @@ import (
 //     after GetTx has returned REJECTED on TWO passes separated by the grace
 //     window (verified_rejected_at stamped on the first, checked on the second).
 //     A transient REJECTED that recovers in between is caught by the recovered
-//     branch and never released.
+//     branch and never released. "Pure" means ExtraInfo is NOT a spend-conflict
+//     class (fee/script/policy) — every input is assumed still free on chain.
+//   - Spend-conflict REJECTED (UTXO_SPENT / TX_CONFLICTING / CompetingTxs / ARC
+//     466): same two-pass, but release is PARTIAL — winner-union style. Inputs
+//     Arcade asserts already spent (ExtraInfo outpoints, or inputs of confirmed
+//     competing spenders) stay spent; only the residual inputs are returned to
+//     the pool. If conflict is detected but no spent set can be proven, release
+//     is deferred (safe bias → stuck), never "free everything".
 //   - Double-spend winner rule (DOUBLE_SPEND_ATTEMPTED): inputs are released only
 //     once some competing tx is itself terminal-successful (MINED/IMMUTABLE) — i.e.
 //     our inputs are provably consumed by the winner. Inputs the winner consumed
@@ -143,7 +150,7 @@ func (p *Provider) reconcileSuspect(ctx context.Context, kt *metastore.KnownTx, 
 	case isRecovered(rec.Status):
 		return p.handleRecovered(ctx, kt, rec)
 	case rec.Status == arcade.StatusRejected:
-		return p.handleRejected(ctx, kt, grace)
+		return p.handleRejected(ctx, kt, rec, grace, maxQuarantine)
 	case rec.Status == arcade.StatusDoubleSpendAttempted:
 		return p.handleDoubleSpend(ctx, kt, rec, maxQuarantine)
 	default:
@@ -185,7 +192,11 @@ func (p *Provider) handleRecovered(ctx context.Context, kt *metastore.KnownTx, r
 // handleRejected runs the two-pass false-positive guard for a still-REJECTED
 // suspect. Pass 1 (no prior stamp) records verified_rejected_at and freezes the
 // change; pass 2 (stamp older than grace) releases. In between it stays suspect.
-func (p *Provider) handleRejected(ctx context.Context, kt *metastore.KnownTx, grace time.Duration) (defs.ReconcilerReport, error) {
+//
+// On pass 2 the release set depends on whether rec is a spend-conflict class
+// (UTXO_SPENT / CompetingTxs / …): pure rejects free every funding input;
+// conflicts free only inputs not proven already spent (winner-union style).
+func (p *Provider) handleRejected(ctx context.Context, kt *metastore.KnownTx, rec *arcade.TxRecord, grace, maxQuarantine time.Duration) (defs.ReconcilerReport, error) {
 	switch {
 	case kt.VerifiedRejectedAt == nil:
 		// Pass 1: first authoritative REJECTED re-verification.
@@ -194,10 +205,15 @@ func (p *Provider) handleRejected(ctx context.Context, kt *metastore.KnownTx, gr
 		}
 		p.freezeChange(ctx, kt.TxID)
 		p.logger.DebugContext(ctx, "reconciler: rejected pass 1, stamped verified_rejected_at",
-			slog.String("txid", kt.TxID))
+			slog.String("txid", kt.TxID),
+			slog.Bool("spendConflict", isSpendConflictRecord(rec)))
 		return defs.ReconcilerReport{Ambiguous: 1}, nil
 	case p.now().Sub(*kt.VerifiedRejectedAt) >= grace:
-		// Pass 2: still rejected after the grace separation — provably dead.
+		// Pass 2: still rejected after the grace separation — provably dead
+		// (or spend-conflict with a proven residual release set).
+		if isSpendConflictRecord(rec) {
+			return p.releaseSpendConflict(ctx, kt, rec, maxQuarantine, "rejected_spend_conflict")
+		}
 		inputs, err := p.txInputs(kt)
 		if err != nil {
 			return defs.ReconcilerReport{}, err
@@ -225,29 +241,124 @@ func (p *Provider) handleRejected(ctx context.Context, kt *metastore.KnownTx, gr
 // and then releases only the inputs the winner did NOT consume. With no winner
 // yet it stays suspect (escalating past quarantine).
 func (p *Provider) handleDoubleSpend(ctx context.Context, kt *metastore.KnownTx, rec *arcade.TxRecord, maxQuarantine time.Duration) (defs.ReconcilerReport, error) {
-	winnerInputs, found := p.findWinnerInputs(ctx, rec.CompetingTxs)
-	if !found {
-		// No competitor has won (or a winner whose inputs we cannot read): SAFE —
-		// never release on ambiguity. Freeze and wait; escalate past quarantine.
+	return p.releaseSpendConflict(ctx, kt, rec, maxQuarantine, "double_spend_no_winner")
+}
+
+// releaseSpendConflict is the shared partial-release path for DOUBLE_SPEND_ATTEMPTED
+// and for REJECTED records that carry spend-conflict evidence (ExtraInfo UTXO_SPENT,
+// CompetingTxs, ARC 466, …). It unions:
+//
+//  1. outpoints Arcade's ExtraInfo asserts are already spent (trust the oracle
+//     text — does not require the spender to be MINED in our view), and
+//  2. inputs of every CompetingTxs / ExtraInfo spender that is itself
+//     terminal-successful with a readable rawTx (classic winner-union).
+//
+// Only inputs in neither set are released. If the conflict class is known but
+// neither source yields a non-empty spent set, release is deferred (safe bias).
+// A confirmed winner with unreadable rawTx also defers (cannot prove residual
+// inputs safe), matching the classic double-spend unreadable-winner rule.
+func (p *Provider) releaseSpendConflict(ctx context.Context, kt *metastore.KnownTx, rec *arcade.TxRecord, maxQuarantine time.Duration, deferReason string) (defs.ReconcilerReport, error) {
+	extraInfo := ""
+	var competing []string
+	if rec != nil {
+		extraInfo = rec.ExtraInfo
+		competing = rec.CompetingTxs
+	}
+	// Prefer known_tx stored competitors when the live record omits them
+	// (status apply may have persisted them on first reject).
+	if len(competing) == 0 && len(kt.CompetingTxs) > 0 {
+		competing = kt.CompetingTxs
+	}
+	extra := parseSpendConflictExtra(extraInfo)
+	spenders := mergeSpenders(competing, extra.Spenders)
+
+	spent := make(map[utxostore.Outpoint]struct{}, len(extra.Spent)+8)
+	for op := range extra.Spent {
+		spent[op] = struct{}{}
+	}
+
+	// Confirmed-but-unreadable winner: never free residuals (consumption set
+	// unknown). Applies even when ExtraInfo named some spent outpoints — another
+	// of our inputs might still belong to the unreadable winner.
+	if p.hasConfirmedUnreadableWinner(ctx, spenders) {
 		p.freezeChange(ctx, kt.TxID)
-		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "double_spend_no_winner")
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "double_spend_unreadable_winner")
+	}
+
+	winnerResolved := false
+	if winnerInputs, ok := p.findWinnerInputs(ctx, spenders); ok {
+		winnerResolved = true
+		for op := range winnerInputs {
+			spent[op] = struct{}{}
+		}
+	}
+	// findWinnerInputs only accepts a MINED/IMMUTABLE winner, but in practice the
+	// winner is one of OUR OWN earlier txs that is merely SEEN — measured on the
+	// scale cluster, 8 of 8 sampled UTXO_SPENT rejections named a spender already
+	// in the local ledger, created before the loser. Its raw tx is therefore on
+	// hand, so resolve the consumption set locally: no oracle round-trip, no
+	// confirmation wait, and it is strictly hold-biased (it can only ADD outpoints
+	// to the spent set, never release one). Without this the winner stays
+	// unresolved in the common case and Guard 2 below would defer every conflict.
+	if localInputs, ok := p.localWinnerInputs(ctx, spenders); ok {
+		winnerResolved = true
+		for op := range localInputs {
+			spent[op] = struct{}{}
+		}
+	}
+
+	// Nothing proven spent yet (competitors still SEEN, ExtraInfo had no
+	// outpoints): do NOT fall back to release-all.
+	if len(spent) == 0 {
+		p.freezeChange(ctx, kt.TxID)
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, deferReason)
 	}
 
 	allInputs, err := p.txInputs(kt)
 	if err != nil {
 		return defs.ReconcilerReport{}, err
 	}
-	// Release only the inputs the winner did NOT take. Winner-consumed inputs are
-	// left recorded as spent (they are genuinely gone to the winner) — excluding
-	// them from the release set keeps them out of the claimable pool.
-	var releaseInputs []utxostore.Outpoint
-	winnerTaken := 0
-	for _, op := range allInputs {
-		if winnerInputs[op] {
-			winnerTaken++
-			continue
-		}
-		releaseInputs = append(releaseInputs, op)
+	releaseInputs, held := filterReleaseInputs(allInputs, spent)
+
+	// Guard 1 — the spent set must intersect OUR inputs before it authorizes
+	// anything. len(spent) > 0 only means "we parsed an outpoint somewhere in
+	// ExtraInfo", not "we hold an outpoint that is provably gone". Arcade can
+	// legitimately attach a conflict line naming an outpoint this tx never spent:
+	// for a size-1 propagation batch it assigns the best unattributable ("alien")
+	// line to the only tx in the batch WITHOUT verifying the outpoint belongs to
+	// it (arcade services/propagation/propagator.go, the len(batch)==1 backstop,
+	// whose own comment flags it as unverified), and every Teranode conflict line
+	// additionally names the competing SPENDER txid. A foreign outpoint therefore
+	// passes the len(spent) check, intersects nothing, and every input is released
+	// — reinstating the exact release-all this function exists to prevent. Hold
+	// nothing of ours ⇒ we have learned nothing about our inputs ⇒ defer.
+	if held == 0 {
+		p.logger.InfoContext(ctx, "reconciler: spend conflict names no outpoint of this tx; deferring",
+			slog.String("txid", kt.TxID),
+			slog.Int("parsedSpent", len(spent)),
+			slog.Int("inputs", len(allInputs)))
+		p.freezeChange(ctx, kt.TxID)
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "spend_conflict_foreign_outpoint")
+	}
+
+	// Guard 2 — releasing the RESIDUAL inputs (the ones the conflict did not
+	// name) claims they are still ours. That is only knowable from the winner's
+	// consumption set: the winner may have spent several of our inputs while
+	// ExtraInfo named just one. ExtraInfo text alone does not license it.
+	// hasConfirmedUnreadableWinner above only catches a MINED/IMMUTABLE winner we
+	// cannot parse; a winner that is merely unresolvable — still SEEN, or GetTx
+	// errored (both swallowed by findWinnerInputs' `continue`) — reaches here with
+	// winnerResolved false. In that state hold everything and retry later rather
+	// than free inputs the winner may already own. When nothing is released there
+	// is no residual to get wrong, so this only guards the partial-release case.
+	if !winnerResolved && len(releaseInputs) > 0 {
+		p.logger.InfoContext(ctx, "reconciler: spend conflict winner unresolved; holding residual inputs",
+			slog.String("txid", kt.TxID),
+			slog.Int("heldSpent", held),
+			slog.Int("wouldRelease", len(releaseInputs)),
+			slog.Int("spenders", len(spenders)))
+		p.freezeChange(ctx, kt.TxID)
+		return p.leaveOrEscalate(ctx, kt, maxQuarantine, "spend_conflict_unresolved_winner")
 	}
 
 	plan := p.buildReleasePlan(ctx, kt, wdk.ProvenTxStatusDoubleSpend, releaseInputs)
@@ -258,12 +369,80 @@ func (p *Provider) handleDoubleSpend(ctx context.Context, kt *metastore.KnownTx,
 	if !released {
 		return defs.ReconcilerReport{}, nil // already finalized (no-double-release)
 	}
-	p.logger.InfoContext(ctx, "reconciler: released double-spent tx (winner confirmed)",
+	p.logger.InfoContext(ctx, "reconciler: partial release after spend conflict",
 		slog.String("txid", kt.TxID),
 		slog.Int("releasedInputs", len(releaseInputs)),
-		slog.Int("winnerConsumed", winnerTaken),
-		slog.Int("cascaded", cascaded))
+		slog.Int("heldSpent", held),
+		slog.Int("cascaded", cascaded),
+		slog.Int("spenders", len(spenders)),
+		slog.Int("extraSpent", len(extra.Spent)))
 	return defs.ReconcilerReport{Released: 1, Cascaded: cascaded}, nil
+}
+
+// hasConfirmedUnreadableWinner reports whether any competing tx is
+// MINED/IMMUTABLE but lacks a parseable rawTx — the case that forces a full
+// release defer under the winner-union safety rule.
+// localWinnerInputs resolves a competing spender's consumption set from the
+// LOCAL ledger. The spender in a Teranode UTXO_SPENT line is very often one of
+// our own earlier transactions (the wallet re-spent an outpoint it had already
+// consumed), so its raw bytes are already in known_txs and no oracle call is
+// needed. Unlike findWinnerInputs this does not require the winner to be
+// MINED/IMMUTABLE: a SEEN winner has still taken the outpoint as far as the
+// node's UTXO set is concerned, which is exactly what the reject told us.
+//
+// It is safe in the only direction that matters: every outpoint it returns is
+// ADDED to the spent set, so it can only ever cause MORE inputs to be held, and
+// a miss simply leaves the winner unresolved for the caller's guard to handle.
+// Errors and unparseable bodies are treated as "not resolved" for the same
+// reason. Returns ok=true only when at least one spender was genuinely read.
+func (p *Provider) localWinnerInputs(ctx context.Context, competingTxs []string) (map[utxostore.Outpoint]struct{}, bool) {
+	consumed := make(map[utxostore.Outpoint]struct{})
+	anyWinner := false
+	for _, competitor := range competingTxs {
+		if competitor == "" {
+			continue
+		}
+		kt, found, err := p.meta.KnownTx().FindByTxID(ctx, competitor)
+		if err != nil || !found || kt == nil || len(kt.RawTx) == 0 {
+			continue
+		}
+		wtx, perr := transaction.NewTransactionFromBytes(kt.RawTx)
+		if perr != nil {
+			p.logger.DebugContext(ctx, "reconciler: local winner rawTx unparseable",
+				slog.String("winner", competitor), slog.String("error", perr.Error()))
+			continue
+		}
+		anyWinner = true
+		for _, in := range wtx.Inputs {
+			if in.SourceTXID == nil {
+				continue
+			}
+			consumed[utxostore.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex}] = struct{}{}
+		}
+	}
+	return consumed, anyWinner
+}
+
+func (p *Provider) hasConfirmedUnreadableWinner(ctx context.Context, competingTxs []string) bool {
+	for _, competitor := range competingTxs {
+		if competitor == "" {
+			continue
+		}
+		crec, err := p.oracle.GetTx(ctx, competitor)
+		if err != nil || crec == nil {
+			continue
+		}
+		if crec.Status != arcade.StatusMined && crec.Status != arcade.StatusImmutable {
+			continue
+		}
+		if len(crec.RawTx) == 0 {
+			return true
+		}
+		if _, perr := transaction.NewTransactionFromBytes(crec.RawTx); perr != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // leaveOrEscalate leaves an unresolved suspect for the next pass, unless it has
