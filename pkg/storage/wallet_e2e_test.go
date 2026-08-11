@@ -79,6 +79,15 @@ type e2eStack struct {
 
 func newE2EStack(t *testing.T, extraOpts ...storage.Option) *e2eStack {
 	t.Helper()
+	return newE2EStackWithUTXO(t, nil, extraOpts...)
+}
+
+// newE2EStackWithUTXO is newE2EStack with a hook to wrap the in-memory UTXO
+// store before the provider is built, so a test can inject a failure into one
+// store method (see TestStateReport_DegradesPerComponent). A nil wrap is the
+// plain stack.
+func newE2EStackWithUTXO(t *testing.T, wrap func(utxostore.Store) utxostore.Store, extraOpts ...storage.Option) *e2eStack {
+	t.Helper()
 	ctx := context.Background()
 	logger := logging.NewTestLogger(t)
 
@@ -91,7 +100,10 @@ func newE2EStack(t *testing.T, extraOpts ...storage.Option) *e2eStack {
 
 	meta, err := metastore.OpenSQLite(ctx, filepath.Join(t.TempDir(), "meta.db"))
 	require.NoError(t, err)
-	utxo := memstore.New()
+	var utxo utxostore.Store = memstore.New()
+	if wrap != nil {
+		utxo = wrap(utxo)
+	}
 	fnd := funder.New(logger, utxo, defs.DefaultFeeModel())
 
 	provider, err := storage.New(logger, meta, utxo, fnd, oracle, hdrs,

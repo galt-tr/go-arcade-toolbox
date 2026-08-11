@@ -116,6 +116,29 @@ type StateReport struct {
 	// (SEEN_ON_NETWORK/SEEN_MULTIPLE_NODES/MINED/REJECTED/…); "" means broadcast
 	// not yet reported. known_txs is deployment-wide, not user-scoped.
 	ArcadeStatuses map[string]int `json:"arcade_statuses"`
+	// Degraded names the components that could not be read, with the reason.
+	// The report is best-effort: a component that fails is OMITTED (never
+	// zero-filled, which would read as real data) and the rest are still
+	// collected. Empty on a fully successful report.
+	//
+	// This exists because the components have wildly different costs. Balance
+	// walks a secondary index — measured at ~300k entries per bval on a live
+	// fuel basket of ~900k coins — while the status rollups are indexed counts
+	// in the low hundreds of milliseconds. Failing the whole report on the
+	// expensive one meant a caller polling this for a dashboard silently froze
+	// every cheap number too, for as long as the load lasted.
+	Degraded []DegradedComponent `json:"degraded,omitempty"`
+}
+
+// DegradedComponent identifies one part of a StateReport that could not be
+// read, so a caller can surface it rather than mistaking stale or absent data
+// for a quiet system.
+type DegradedComponent struct {
+	// Component is "balance", "tx_statuses" or "arcade_statuses".
+	Component string `json:"component"`
+	// Basket is set only for "balance".
+	Basket string `json:"basket,omitempty"`
+	Error  string `json:"error"`
 }
 
 // tierOrder is the fixed sending → unproven → mined ordering used in reports.
@@ -145,6 +168,22 @@ func (p *Provider) reportUserID(ctx context.Context, auth wdk.AuthID) (int, erro
 // basket) and transaction-status counts. Baskets that do not exist simply
 // report zeros. It is intended for observability/visualization, not for
 // funding decisions.
+//
+// It is BEST-EFFORT and degrades per component. A component that cannot be read
+// is omitted and named in [StateReport.Degraded]; the others are still
+// collected. Only a failure that makes the whole report meaningless — resolving
+// the user — returns an error.
+//
+// This matters because the components differ in cost by orders of magnitude.
+// [utxostore.Store.Balance] walks a secondary index (~300k entries per bval
+// against a ~900k-coin fuel basket on the live system) while the status rollups
+// are indexed counts. When one slow basket failed the whole call, a dashboard
+// polling this froze ENTIRELY for the duration of a load run — every cheap
+// number included — and, because callers typically carry the previous snapshot
+// forward on error, did so silently. Reported statuses appeared to stop arriving
+// the moment a blast started and to resume the moment it ended, when in fact
+// they had been applying continuously the whole time. Callers should surface
+// Degraded rather than treat a partial report as a healthy one.
 func (p *Provider) StateReport(ctx context.Context, auth wdk.AuthID, baskets []string) (*StateReport, error) {
 	userID, err := p.reportUserID(ctx, auth)
 	if err != nil {
@@ -155,7 +194,13 @@ func (p *Provider) StateReport(ctx context.Context, auth wdk.AuthID, baskets []s
 	for _, basket := range baskets {
 		bal, err := p.utxo.Balance(ctx, int64(userID), basket)
 		if err != nil {
-			return nil, fmt.Errorf("storage: state report balance for basket %q: %w", basket, err)
+			// Omit, never zero-fill: a basket reported as empty reads as real
+			// data and is worse than an acknowledged gap (an empty fuel basket
+			// is indistinguishable from "we ran out of fuel").
+			rep.Degraded = append(rep.Degraded, DegradedComponent{
+				Component: "balance", Basket: basket, Error: err.Error(),
+			})
+			continue
 		}
 		bs := BasketState{
 			Basket:        basket,
@@ -173,10 +218,12 @@ func (p *Provider) StateReport(ctx context.Context, auth wdk.AuthID, baskets []s
 	}
 
 	if rep.TxStatuses, err = p.meta.Transactions().CountByStatus(ctx, userID); err != nil {
-		return nil, err
+		rep.TxStatuses = nil
+		rep.Degraded = append(rep.Degraded, DegradedComponent{Component: "tx_statuses", Error: err.Error()})
 	}
 	if rep.ArcadeStatuses, err = p.meta.KnownTx().CountByArcadeStatus(ctx); err != nil {
-		return nil, err
+		rep.ArcadeStatuses = nil
+		rep.Degraded = append(rep.Degraded, DegradedComponent{Component: "arcade_statuses", Error: err.Error()})
 	}
 	return rep, nil
 }
