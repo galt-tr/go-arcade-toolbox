@@ -92,6 +92,8 @@ func runMetastoreSuite(t *testing.T, factory storeFactory) {
 	t.Run("KnownTx_SuspectFailed", func(t *testing.T) { testKnownTx(t, factory) })
 	t.Run("KnownTx_PollProgressAndRepair", func(t *testing.T) { testKnownTxPollProgress(t, factory) })
 	t.Run("KnownTx_BulkMutatorsOverlappingTxIDs", func(t *testing.T) { testKnownTxBulkOverlap(t, factory) })
+	t.Run("Transactions_InputBEEF", func(t *testing.T) { testTransactionsInputBEEF(t, factory) })
+	t.Run("KnownTx_InputBEEFNotSticky", func(t *testing.T) { testKnownTxInputBEEFNotSticky(t, factory) })
 	t.Run("SyncState_RoundTrip", func(t *testing.T) { testSyncState(t, factory) })
 	t.Run("KeyValue", func(t *testing.T) { testKeyValue(t, factory) })
 	t.Run("Certificates", func(t *testing.T) { testCertificates(t, factory) })
@@ -858,4 +860,116 @@ func testOutboxConcurrentDrain(t *testing.T, factory storeFactory) {
 	n, err := s.Outbox().CountPending(ctx)
 	require.NoError(t, err)
 	require.Zero(t, n)
+}
+
+// testTransactionsInputBEEF covers the read half of the input-BEEF
+// de-duplication. known_txs no longer carries a second copy for transactions
+// created through CreateAction, so these two methods are the only way the
+// broadcast paths reach a transaction's ancestry — and ClearInputBEEFByTxID
+// now deletes the ONLY copy rather than one of two.
+func testTransactionsInputBEEF(t *testing.T, factory storeFactory) {
+	ctx := context.Background()
+	s := factory(t)
+	uid := mustUser(ctx, t, s, "beef-user")
+	other := mustUser(ctx, t, s, "beef-user-2")
+
+	const txA = "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+	const txB = "bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+	blobA := []byte("ancestry-for-A")
+	blobOther := []byte("ancestry-for-A-from-the-other-user")
+	blobB := []byte("ancestry-for-B")
+
+	// Lowest transaction_id wins: seed the creating user's row FIRST, then a
+	// second row for a different user carrying the same txid. transactions.txid
+	// is nullable and NOT unique, so this ambiguity is real.
+	idA, err := s.Transactions().Insert(ctx, metastore.NewTx{
+		UserID: uid, Status: wdk.TxStatusUnsigned, Reference: "beef-ref-a", InputBEEF: blobA,
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.Transactions().SetTxID(ctx, idA, txA))
+
+	idOther, err := s.Transactions().Insert(ctx, metastore.NewTx{
+		UserID: other, Status: wdk.TxStatusUnsigned, Reference: "beef-ref-a2", InputBEEF: blobOther,
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.Transactions().SetTxID(ctx, idOther, txA))
+	require.Less(t, idA, idOther)
+
+	idB, err := s.Transactions().Insert(ctx, metastore.NewTx{
+		UserID: uid, Status: wdk.TxStatusUnsigned, Reference: "beef-ref-b", InputBEEF: blobB,
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.Transactions().SetTxID(ctx, idB, txB))
+
+	got, found, err := s.Transactions().GetInputBEEFByTxID(ctx, txA)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, blobA, got, "the lowest transaction_id wins — the row CreateAction wrote")
+
+	// Bulk: same tie-break, and an unknown txid is simply absent.
+	const txUnknown = "cc11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+	m, err := s.Transactions().InputBEEFByTxIDs(ctx, []string{txA, txB, txUnknown})
+	require.NoError(t, err)
+	require.Equal(t, blobA, m[txA], "bulk must use the same lowest-id tie-break as the single read")
+	require.Equal(t, blobB, m[txB])
+	require.NotContains(t, m, txUnknown, "an unknown txid is absent, not an empty entry")
+
+	// Clearing removes the only remaining copy, for EVERY row carrying the txid.
+	require.NoError(t, s.Transactions().ClearInputBEEFByTxID(ctx, txA))
+	_, found, err = s.Transactions().GetInputBEEFByTxID(ctx, txA)
+	require.NoError(t, err)
+	require.False(t, found, "a cleared blob reports found=false, not an empty slice")
+
+	m, err = s.Transactions().InputBEEFByTxIDs(ctx, []string{txA, txB})
+	require.NoError(t, err)
+	require.NotContains(t, m, txA, "cleared rows drop out of the bulk read")
+	require.Equal(t, blobB, m[txB], "clearing one txid must not touch another")
+
+	// The IS NOT NULL guard exists so a re-apply is a cheap no-op: a second
+	// clear must not rewrite the rows (which would be pure WAL for nothing).
+	before := mustUpdatedAt(ctx, t, s, idA)
+	require.NoError(t, s.Transactions().ClearInputBEEFByTxID(ctx, txA))
+	require.Equal(t, before, mustUpdatedAt(ctx, t, s, idA), "re-clearing must not touch updated_at")
+
+	// Bulk clear, same three properties.
+	require.NoError(t, s.Transactions().BulkClearInputBEEFByTxIDs(ctx, []string{txB}))
+	_, found, err = s.Transactions().GetInputBEEFByTxID(ctx, txB)
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
+// mustUpdatedAt reads a transaction row's updated_at for no-op assertions.
+func mustUpdatedAt(ctx context.Context, t *testing.T, s *metastore.Store, id uint) string {
+	t.Helper()
+	row, found, err := s.Transactions().FindByID(ctx, id)
+	require.NoError(t, err)
+	require.True(t, found)
+	return row.UpdatedAt.String()
+}
+
+// testKnownTxInputBEEFNotSticky pins that Upsert does NOT preserve a previous
+// input_beef, deliberately unlike its neighbors was_broadcast and
+// reject_reason. That is what lets a re-processed legacy row reclaim its
+// duplicate blob instead of carrying it forever.
+func testKnownTxInputBEEFNotSticky(t *testing.T, factory storeFactory) {
+	ctx := context.Background()
+	s := factory(t)
+	const txid = "dd11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+
+	require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{
+		TxID: txid, Status: wdk.ProvenTxStatusUnsent, RawTx: []byte{0x01}, InputBEEF: []byte("legacy-blob"),
+	}))
+	kt, found, err := s.KnownTx().FindByTxID(ctx, txid)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotEmpty(t, kt.InputBEEF)
+
+	// Re-upsert without a blob — what the create path now always does.
+	require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{
+		TxID: txid, Status: wdk.ProvenTxStatusUnsent, RawTx: []byte{0x01},
+	}))
+	kt, found, err = s.KnownTx().FindByTxID(ctx, txid)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Empty(t, kt.InputBEEF, "input_beef is not sticky: the duplicate is reclaimed")
 }

@@ -992,6 +992,15 @@ func (p *Provider) SendWaitingTransactions(ctx context.Context, limit int) error
 		return nil
 	}
 
+	// Resolve the whole sweep's ancestry in ONE query. The blob now lives on the
+	// transactions row (see Provider.inputBEEFFor); the loop below fans out at
+	// sendConcurrency, so a per-transaction lookup here would trade the write
+	// saving this indirection exists for against read latency on the same path.
+	beefs, err := p.inputBEEFForBatch(ctx, waiting)
+	if err != nil {
+		return err
+	}
+
 	// Broadcast the batch with bounded concurrency. Each POST /tx is an arcade
 	// round-trip; done sequentially the drainer cannot keep pace with a
 	// high-throughput creation rate and the delayed queue grows without bound.
@@ -1011,7 +1020,7 @@ func (p *Provider) SendWaitingTransactions(ctx context.Context, limit int) error
 			if gctx.Err() != nil {
 				return gctx.Err()
 			}
-			if serr := p.sendOneWaiting(gctx, kt); serr != nil {
+			if serr := p.sendOneWaiting(gctx, kt, beefs[kt.TxID]); serr != nil {
 				failed.Add(1)
 				p.logger.WarnContext(gctx, "send waiting: broadcast failed, will retry next cycle",
 					slog.String("txid", kt.TxID), slog.String("error", serr.Error()))
@@ -1091,7 +1100,7 @@ func (p *Provider) reservationResendable(ctx context.Context, userID int, refere
 
 // sendOneWaiting EF-encodes and broadcasts one delayed tx, then commits the
 // outcome.
-func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx) error {
+func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx, inputBEEF []byte) error {
 	txid := kt.TxID
 	if len(kt.RawTx) == 0 {
 		return fmt.Errorf("no stored raw tx for %s", txid)
@@ -1100,7 +1109,7 @@ func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx) er
 	if err != nil {
 		return fmt.Errorf("parse stored raw tx %s: %w", txid, err)
 	}
-	if err := p.hydrateInputs(tx, kt.InputBEEF); err != nil {
+	if err := p.hydrateInputs(tx, inputBEEF); err != nil {
 		return err
 	}
 	if ok, verr := p.scripts.VerifyScripts(ctx, tx); verr != nil || !ok {

@@ -152,7 +152,11 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 			Status:       ktxStatus,
 			WasBroadcast: false,
 			RawTx:        rawTx,
-			InputBEEF:    txRow.InputBEEF,
+			// InputBEEF deliberately omitted: the ancestry stays on the
+			// transactions row this function already read it from. Storing it
+			// twice cost a second ~3.4kB TOASTed write per transaction plus a
+			// second clearing UPDATE at MINED, on the WAL-bound hot path. See
+			// Provider.inputBEEFFor for the read side.
 		}); err != nil {
 			return fmt.Errorf("storage: upsert known tx: %w", err)
 		}
@@ -296,7 +300,11 @@ func (p *Provider) broadcastOne(ctx context.Context, userID int, txid string) (w
 	if err != nil {
 		return swr, nil, fmt.Errorf("storage: parse stored raw tx %s: %w", txid, err)
 	}
-	if err := p.hydrateInputs(tx, kt.InputBEEF); err != nil {
+	stored, err := p.inputBEEFFor(ctx, txid, kt.InputBEEF)
+	if err != nil {
+		return swr, nil, err
+	}
+	if err := p.hydrateInputs(tx, stored); err != nil {
 		return swr, nil, err
 	}
 	if ok, verr := p.scripts.VerifyScripts(ctx, tx); verr != nil || !ok {

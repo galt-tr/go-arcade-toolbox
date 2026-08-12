@@ -6,6 +6,8 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
 )
 
 // maxBEEFDepth bounds the ancestry walk in getBEEFForTxIDs.
@@ -34,6 +36,66 @@ func (p *Provider) getBEEFForTxIDs(ctx context.Context, txids []string, base *tr
 		}
 	}
 	return beef, nil
+}
+
+// inputBEEFFor resolves the ancestry BEEF retained for a known transaction.
+//
+// The blob is written by CreateAction to the TRANSACTIONS row — before the txid
+// exists, which is exactly why that copy and not this one is authoritative:
+// CreateAction and ProcessAction are separate requests, possibly separate
+// processes, and the wallet holds its own copy only in memory with no API to
+// hand it back. known_txs therefore cannot be its home.
+//
+// known_txs.input_beef is still PREFERRED when present. That is not a
+// correctness fallback but a cost one: it arrived free with the row the caller
+// already loaded, and two writers still fill it — InternalizeAction (whose txid
+// is known up front, so it has no pre-txid window to bridge) and every row
+// created before this de-duplication. Only rows written by the new create path
+// pay the extra lookup.
+//
+// A miss is not an error. Both copies are dropped at MINED and hydrateInputs
+// no-ops on empty bytes, so "no retained ancestry" is a legitimate answer.
+func (p *Provider) inputBEEFFor(ctx context.Context, txid string, ktInputBEEF []byte) ([]byte, error) {
+	if len(ktInputBEEF) > 0 {
+		return ktInputBEEF, nil
+	}
+	blob, found, err := p.meta.Transactions().GetInputBEEFByTxID(ctx, txid)
+	if err != nil {
+		return nil, fmt.Errorf("storage: load input beef for %s: %w", txid, err)
+	}
+	if !found {
+		return nil, nil
+	}
+	return blob, nil
+}
+
+// inputBEEFForBatch is inputBEEFFor over a batch, in ONE query. Rows carrying
+// their own copy are answered from it and never reach the database.
+//
+// The delayed broadcaster fans out at sendConcurrency over a whole sweep, so a
+// per-transaction round trip there would trade the write saving this change
+// exists for against read latency on the same path.
+func (p *Provider) inputBEEFForBatch(ctx context.Context, kts []metastore.KnownTx) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(kts))
+	missing := make([]string, 0, len(kts))
+	for i := range kts {
+		if len(kts[i].InputBEEF) > 0 {
+			out[kts[i].TxID] = kts[i].InputBEEF
+			continue
+		}
+		missing = append(missing, kts[i].TxID)
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+	found, err := p.meta.Transactions().InputBEEFByTxIDs(ctx, missing)
+	if err != nil {
+		return nil, fmt.Errorf("storage: load input beefs: %w", err)
+	}
+	for txid, blob := range found {
+		out[txid] = blob
+	}
+	return out, nil
 }
 
 func (p *Provider) buildBEEF(ctx context.Context, beef *transaction.Beef, txid string, known map[string]struct{}, depth int) error {
@@ -95,8 +157,15 @@ func (p *Provider) buildBEEF(ctx context.Context, beef *transaction.Beef, txid s
 		return nil
 	}
 
-	if len(kt.InputBEEF) > 0 {
-		if err := beef.MergeBeefBytes(kt.InputBEEF); err != nil {
+	// Ancestry is retained on the transactions row (see inputBEEFFor). This is
+	// reached only in the non-direct mode and only for an UNPROVEN ancestor —
+	// the proven branch above returns — so a mined tx never issues the lookup.
+	stored, err := p.inputBEEFFor(ctx, txid, kt.InputBEEF)
+	if err != nil {
+		return err
+	}
+	if len(stored) > 0 {
+		if err := beef.MergeBeefBytes(stored); err != nil {
 			return fmt.Errorf("storage: merge input beef %s: %w", txid, err)
 		}
 	}
