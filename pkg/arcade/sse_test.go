@@ -380,6 +380,12 @@ func TestStreamStatus_OversizedFrameNoHotLoop(t *testing.T) {
 	client := newClient(t, defaultConfig(server.URL))
 	client.sseBackoffBase = 40 * time.Millisecond
 	client.sseBackoffMax = 5 * time.Second
+	// Pin the jitter to take the whole ceiling, so the sleeps are exactly the
+	// doubling ceiling (40ms, 80ms, 160ms) instead of a random draw beneath it.
+	// Without this the gaps are samples of full jitter and "each gap exceeds the
+	// last" is simply not true of them — the assertion below would be testing the
+	// RNG, not the backoff. Same pin as the internal/sse test of this rule.
+	client.sseRand = func() float64 { return 1 }
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
