@@ -39,7 +39,8 @@ import (
 //   - a MINED batch carrying a headers-verifiable single-leaf BUMP → the tx
 //     completes, the proof is stored, the change is promoted to TierMined, the
 //     spent funding input is PRUNED from the Aerospike inventory (RemoveSpentBy),
-//     and both input_beef copies (known_txs + transactions) are dropped.
+//     and the single retained input_beef copy (transactions) is dropped —
+//     known_txs never carried one, since the de-duplication.
 //
 // Finally it re-applies the MINED batch to prove idempotency (a no-op).
 //
@@ -128,11 +129,20 @@ func TestHybrid_ApplyStatusBatch_SeenThenMinedPrunes(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, wdk.ProvenTxStatusUnconfirmed, ktBefore.Status)
 	require.Nil(t, ktBefore.ArcadeStatus, "synchronous accept path does not record an arcade_status")
-	require.NotEmpty(t, ktBefore.InputBEEF, "known tx carries input_beef before mining")
+	require.Empty(t, ktBefore.InputBEEF,
+		"known_txs no longer duplicates the ancestry; transactions.input_beef is authoritative")
 	txRowsBefore, err := meta.Transactions().FindByTxIDAllUsers(ctx, txid)
 	require.NoError(t, err)
 	require.NotEmpty(t, txRowsBefore)
-	require.NotEmpty(t, txRowsBefore[0].InputBEEF, "transactions row carries input_beef before mining")
+	require.NotEmpty(t, txRowsBefore[0].InputBEEF,
+		"the transactions row carries the ONLY input_beef before mining")
+
+	// Prove the read-through resolves against a real Postgres, not just SQLite:
+	// this is the query broadcastOne and sendOneWaiting now depend on.
+	gotBEEF, foundBEEF, err := meta.Transactions().GetInputBEEFByTxID(ctx, txid)
+	require.NoError(t, err)
+	require.True(t, foundBEEF, "the read-through resolves the blob the broadcast hydrated from")
+	require.Equal(t, []byte(txRowsBefore[0].InputBEEF), gotBEEF)
 
 	balBroadcast, err := p.GetBalance(ctx, auth, "")
 	require.NoError(t, err)
@@ -203,7 +213,7 @@ func TestHybrid_ApplyStatusBatch_SeenThenMinedPrunes(t *testing.T) {
 	}
 
 	// (d) input_beef dropped for the mined tx (both copies).
-	require.Empty(t, ktMined.InputBEEF, "known_txs input_beef dropped by SetProof")
+	require.Empty(t, ktMined.InputBEEF, "known_txs input_beef still NULL after SetProof")
 	txRowsMined, err := meta.Transactions().FindByTxIDAllUsers(ctx, txid)
 	require.NoError(t, err)
 	require.NotEmpty(t, txRowsMined)

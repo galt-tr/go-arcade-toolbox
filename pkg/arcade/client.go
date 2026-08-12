@@ -106,7 +106,11 @@ type Client struct {
 // New constructs a Client for a single Arcade instance. httpClient is the resty
 // client used for REST calls (a fresh one is created when nil); it is configured
 // in place with JSON Accept, a User-Agent, and the toolbox logger.
-func New(logger *slog.Logger, httpClient *resty.Client, config defs.Arcade) *Client {
+//
+// Options tune the long-lived SSE stream; see [WithSSEHTTPClient],
+// [WithSSEBackoff] and [WithReadWatchdogTimeout]. Passing none leaves the
+// documented defaults in place.
+func New(logger *slog.Logger, httpClient *resty.Client, config defs.Arcade, opts ...Option) *Client {
 	logger = logging.Child(logger, "arcade")
 
 	if httpClient == nil {
@@ -157,6 +161,14 @@ func New(logger *slog.Logger, httpClient *resty.Client, config defs.Arcade) *Cli
 		sseReadWatchdogTimeout: readWatchdogTimeout,
 		sseBackoffBase:         sseBackoffBase,
 		sseBackoffMax:          sseBackoffMax,
+	}
+
+	// After the defaults, so an option always wins; before the breaker, which
+	// reads nothing an option can change.
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
 	}
 
 	probeInterval := time.Duration(must.ConvertToInt64FromUnsigned(config.CircuitBreaker.HealthProbeIntervalSeconds)) * time.Second

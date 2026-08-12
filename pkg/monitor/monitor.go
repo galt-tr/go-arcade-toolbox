@@ -73,6 +73,10 @@ type Daemon struct {
 	// tests, where a long linger makes the coalescing assertions exact instead
 	// of timing-dependent.
 	applyLinger time.Duration
+	// statusObserver, when set, is handed each applied batch so an application
+	// can react to arcade status without opening a second SSE stream. See
+	// [WithStatusObserver] for the contract.
+	statusObserver func([]arcade.TxRecord)
 
 	startLock sync.Mutex
 	started   bool

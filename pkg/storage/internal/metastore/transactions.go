@@ -292,7 +292,10 @@ func (r TransactionsRepo) UpdateStatusByTxID(ctx context.Context, txid string, s
 }
 
 // ClearInputBEEFByTxID drops the stored input BEEF for every row carrying txid
-// (display hex). Called once a tx is mined+proven: the merkle proof anchors it,
+// (display hex). Since the input-BEEF de-duplication this is the ONLY retained
+// copy for a transaction created through CreateAction — SetProof's matching
+// known_txs clear is a no-op for those rows. Called once a tx is mined+proven:
+// the merkle proof anchors it,
 // so the input ancestry is no longer needed to build a descendant's BEEF, and
 // clearing it bounds the transactions blob growth under sustained load. The
 // `input_beef IS NOT NULL` guard makes a re-apply a cheap no-op.
@@ -306,6 +309,103 @@ func (r TransactionsRepo) ClearInputBEEFByTxID(ctx context.Context, txid string)
 		return fmt.Errorf("metastore: clear input beef: %w", err)
 	}
 	return nil
+}
+
+// GetInputBEEFByTxID returns the stored input BEEF for txid (display hex), or
+// found=false when no row carries one.
+//
+// This is the read half of the input-BEEF de-duplication: known_txs no longer
+// carries a second copy for transactions created through CreateAction, so this
+// column is usually the only one there is. It cannot live on known_txs instead,
+// because CreateAction writes it before the transaction is signed — there is no
+// txid yet — and CreateAction and ProcessAction are separate requests, possibly
+// separate processes.
+//
+// transactions.txid is nullable and NOT unique (one row per user may carry the
+// same txid), so this takes the LOWEST transaction_id still holding a blob: the
+// row that created the transaction, which is the row CreateAction wrote the
+// ancestry to. The `input_beef IS NOT NULL` predicate makes a mined transaction
+// — whose blob ClearInputBEEFByTxID dropped — report found=false rather than an
+// empty slice, matching what known_txs.input_beef gives after SetProof.
+//
+// Deliberately not user-scoped: known_txs is already deployment-wide and
+// buildBEEF has no userID to scope by. The blob is public ancestry for a
+// transaction whose raw bytes the caller already holds; it is not user-private.
+func (r TransactionsRepo) GetInputBEEFByTxID(ctx context.Context, txid string) ([]byte, bool, error) {
+	raw, err := encTxID(txid)
+	if err != nil {
+		return nil, false, err
+	}
+	clause, pageArgs := r.s.limitOffsetClause(1, 0)
+	q := r.s.rebind("SELECT input_beef FROM transactions " +
+		"WHERE txid = ? AND input_beef IS NOT NULL ORDER BY transaction_id ASC" + clause)
+	args := append([]any{raw}, pageArgs...)
+
+	var blob []byte
+	err = r.s.execer(ctx).QueryRowContext(ctx, q, args...).Scan(&blob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("metastore: get input beef: %w", err)
+	}
+	if len(blob) == 0 {
+		return nil, false, nil
+	}
+	return blob, true, nil
+}
+
+// InputBEEFByTxIDs bulk-loads the stored input BEEF for each of txids in ONE
+// query, keyed by display-hex txid. A txid with no row, or whose blob was
+// cleared at MINED, is simply ABSENT from the map — the same convention as
+// [KnownTxRepo.FindByTxIDs].
+//
+// Where several rows share a txid the lowest transaction_id wins, matching
+// [TransactionsRepo.GetInputBEEFByTxID]. That falls out of one pass: rows come
+// back newest-id-first and each assignment overwrites, so the last write per
+// txid — the lowest id — is the one left standing.
+func (r TransactionsRepo) InputBEEFByTxIDs(ctx context.Context, txids []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(txids))
+	if len(txids) == 0 {
+		return out, nil
+	}
+	ph := make([]string, 0, len(txids))
+	args := make([]any, 0, len(txids))
+	for _, t := range txids {
+		raw, err := encTxID(t)
+		if err != nil {
+			return nil, err
+		}
+		ph = append(ph, "?")
+		args = append(args, raw)
+	}
+	q := r.s.rebind("SELECT txid, input_beef FROM transactions " +
+		"WHERE txid IN (" + joinComma(ph) + ") AND input_beef IS NOT NULL " +
+		"ORDER BY transaction_id DESC")
+	rows, err := r.s.execer(ctx).QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("metastore: input beef by txids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var (
+			rawTxID []byte
+			blob    []byte
+		)
+		if err := rows.Scan(&rawTxID, &blob); err != nil {
+			return nil, fmt.Errorf("metastore: scan input beef: %w", err)
+		}
+		id := decTxIDPtr(rawTxID)
+		if id == nil || len(blob) == 0 {
+			continue
+		}
+		out[*id] = blob
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metastore: iterate input beef: %w", err)
+	}
+	return out, nil
 }
 
 // BulkUpdateStatusByTxIDs transitions every transaction row whose txid is in

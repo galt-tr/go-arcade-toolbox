@@ -179,6 +179,60 @@ func TestSync_RoundTrip(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, def.Outputs, 1, "only the wallet-payment change is in default")
+
+	// The ancestry must survive the round-trip. Since the input-BEEF
+	// de-duplication, transactions.input_beef is the authoritative (and for
+	// create-path rows, the only) copy — so sync.go's `InputBEEF: t.InputBEEF`
+	// is no longer redundant with a known_txs copy, and dropping it would
+	// silently strip a synced storage of every transaction's ancestry.
+	dstRows, _, err := b.meta.Transactions().ListActions(ctx, metastore.ListActionsFilter{UserID: uid, Limit: 10})
+	require.NoError(t, err)
+	require.NotEmpty(t, dstRows)
+	require.NotEmpty(t, chunk.Transactions[0].InputBEEF, "the chunk carries the ancestry")
+	require.Equal(t, []byte(chunk.Transactions[0].InputBEEF), []byte(dstRows[0].InputBEEF),
+		"ProcessSyncChunk must persist the ancestry byte-for-byte")
+}
+
+// TestSync_RoundTrip_DoesNotPopulateKnownTxs characterizes a PRE-EXISTING gap,
+// recorded here so it is not later mistaken for a consequence of the input-BEEF
+// de-duplication.
+//
+// ProcessSyncChunk rebuilds transactions and outputs but never writes known_txs.
+// A synced storage therefore cannot re-broadcast or assemble BEEF for the
+// migrated transactions — getBEEFForTxIDs stubs their parents — and that was
+// true before this change too. What the de-duplication DID change is that
+// transactions.input_beef is now the only ancestry a synced storage receives,
+// which is exactly what the assertion above pins.
+func TestSync_RoundTrip_DoesNotPopulateKnownTxs(t *testing.T) {
+	ctx := context.Background()
+	a := newHarness(t)
+
+	atomic, txid := buildMinedAtomicBEEF(t, 0xC2, 830000, 21_000, 4_000)
+	_, err := a.p.InternalizeAction(ctx, a.auth, wdk.InternalizeActionArgs{
+		Tx: primitives.ExplicitByteArray(atomic),
+		Outputs: []*wdk.InternalizeOutput{{
+			OutputIndex:       0,
+			Protocol:          wdk.WalletPaymentProtocol,
+			PaymentRemittance: &wdk.WalletPayment{DerivationPrefix: "cHJlZml4", DerivationSuffix: "c3VmZml4", SenderIdentityKey: testIdentityKey},
+		}},
+	})
+	require.NoError(t, err)
+
+	syncArgs := wdk.RequestSyncChunkArgs{
+		FromStorageIdentityKey: "storage-identity-key",
+		ToStorageIdentityKey:   "storage-b",
+		IdentityKey:            testIdentityKey,
+	}
+	chunk, err := a.p.GetSyncChunk(ctx, syncArgs)
+	require.NoError(t, err)
+
+	b := newSyncTargetProvider(t)
+	_, err = b.p.ProcessSyncChunk(ctx, syncArgs, chunk)
+	require.NoError(t, err)
+
+	_, found, err := b.meta.KnownTx().FindByTxID(ctx, txid)
+	require.NoError(t, err)
+	require.False(t, found, "sync does not populate known_txs — a pre-existing gap, not a regression")
 }
 
 // syncTarget is a second provider used as a sync destination.

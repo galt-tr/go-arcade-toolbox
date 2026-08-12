@@ -135,6 +135,59 @@ Set `Arcade.CallbackToken` so the SSE stream is scoped to this wallet instance:
 arcade uses it to identify the consumer, which is what lets its mid-stream
 catch-up engage on reconnect instead of leaving the poll to do all the repair.
 
+### Observing status from an application — do NOT open a second stream
+
+An application that wants transaction status for its own purposes — driving a
+UI, maintaining its own projection — has an obvious wrong answer available to it:
+call `TxOracle.StreamStatus` itself. Do not. Arcade's `GET /events` takes exactly
+one query parameter (`callbackToken`) and one header (`Last-Event-ID`), with no
+per-client filter anywhere, so a second connection on the same token receives a
+**full duplicate of every event** and **doubles arcade's per-event cost** — the
+token→txid membership probe runs once per client inside the single fan-out
+goroutine that is already the bottleneck. At 1000 TPS that fan-out serves ~1,600
+events/s against ~4,000/s of demand; a second subscriber makes it worse for both.
+
+Register `monitor.WithStatusObserver` instead. The daemon hands it every batch it
+has just applied, off the one connection that already exists:
+
+```go
+daemon, err := monitor.NewDaemon(logger, provider, hdrs, oracle, cfg,
+    monitor.WithApplyConcurrency(32),
+    monitor.WithStatusObserver(func(recs []arcade.TxRecord) {
+        // Update memory and return. See the contract below.
+        ui.Apply(recs)
+    }),
+)
+```
+
+The contract, in full:
+
+- **It must not block.** The observer runs inline on the applier goroutine, so
+  time spent in it is time the applier is not draining the 16,384-slot hand-off
+  queue. Once that queue fills the SSE reader blocks, and arcade — seeing a slow
+  client — drops events for us outright. Update memory, return, do I/O elsewhere.
+- **It must not panic.** There is no recover on this path.
+- **Delivery is at-least-once**, so it must be idempotent: a held cursor
+  re-delivers after a reconnect.
+- **Only applied batches are reported.** A batch that failed to apply is held for
+  redelivery rather than observed.
+- **Records arrive unfiltered and in arrival order** — including txids the wallet
+  has no row for, which is what an application tracking its own transactions
+  needs.
+- **The slice must not be retained or mutated.**
+
+The poll fallbacks do not route through the observer; the stream is the fast
+path, not the authority. An application that needs a convergence guarantee should
+still reconcile against `GET /tx`, exactly as the monitor does for the wallet.
+
+### Tuning the stream
+
+`arcade.New` accepts options for the three SSE knobs, mirroring `pkg/headers`:
+`WithSSEHTTPClient`, `WithSSEBackoff` and `WithReadWatchdogTimeout`. All three
+are optional and non-positive values are ignored. Note that the watchdog must
+stay comfortably above arcade's 15s keepalive cadence — set it below and every
+healthy connection kills itself between keepalives.
+
 ## ChainTracks (headers)
 
 The headers client (`pkg/headers`) talks to ChainTracks under

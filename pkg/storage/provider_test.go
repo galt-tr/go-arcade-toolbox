@@ -90,8 +90,11 @@ func (alwaysValidScripts) VerifyScripts(context.Context, *transaction.Transactio
 // --- harness -------------------------------------------------------------
 
 type harness struct {
-	p      *Provider
-	meta   *metastore.Store
+	p    *Provider
+	meta *metastore.Store
+	// path is the metastore file, so a test can reopen the same durable state
+	// with a fresh Provider (see coldprocess_test.go).
+	path   string
 	utxo   *memstore.Store
 	oracle *fakeOracle
 	hdrs   *fakeHeaders
@@ -137,6 +140,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 	return &harness{
 		p:      p,
 		meta:   meta,
+		path:   path,
 		utxo:   utxo,
 		oracle: oracle,
 		hdrs:   hdrs,
