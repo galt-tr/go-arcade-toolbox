@@ -470,7 +470,7 @@ func TestE2E_StateReport(t *testing.T) {
 
 // assertBasketCoins asserts a (user, basket) holds exactly count claimable coins
 // summing to count*denom sats — i.e. count coins of exactly denom each.
-func assertBasketCoins(t *testing.T, ctx context.Context, store utxostore.Store, userID int64, basket string, count int, denom uint64) {
+func assertBasketCoins(ctx context.Context, t *testing.T, store utxostore.Store, userID int64, basket string, count int, denom uint64) {
 	t.Helper()
 	bal, err := store.Balance(ctx, userID, basket)
 	require.NoError(t, err)
@@ -507,14 +507,14 @@ func TestE2E_FanOutFuel_BootstrapsPool(t *testing.T) {
 	chunk, err := s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: chunkCount, Satoshis: chunkDenom, Basket: "reserve"}, e2eOriginator)
 	require.NoError(t, err, "chunk fan-out must fund from the default basket and mint reserve coins")
 	s.seeTx(chunk.Txid.String()) // reserve coins become claimable
-	assertBasketCoins(t, ctx, s.utxo, userID, "reserve", chunkCount, chunkDenom)
+	assertBasketCoins(ctx, t, s.utxo, userID, "reserve", chunkCount, chunkDenom)
 
 	// Stage 2 — leaf fan-out: fund from the reserve, mint into the fuel pool.
 	const leafCount, leafDenom = 5, 1000
 	leaf, err := s.wallet.FanOutFuel(ctx, wdk.ShapedChange{Count: leafCount, Satoshis: leafDenom, Basket: "fuel"}, e2eOriginator)
 	require.NoError(t, err, "leaf fan-out must fund from the reserve basket and mint pool coins")
 	s.seeTx(leaf.Txid.String()) // pool coins become claimable
-	assertBasketCoins(t, ctx, s.utxo, userID, "fuel", leafCount, leafDenom)
+	assertBasketCoins(ctx, t, s.utxo, userID, "fuel", leafCount, leafDenom)
 
 	// The pool coins are selectable by exact denomination — the ClaimExact fast
 	// path the throughput funder relies on.

@@ -1079,7 +1079,7 @@ func (p *Provider) reservationResendable(ctx context.Context, userID int, refere
 	if !found || txRow.TxID == nil {
 		return false, nil
 	}
-	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, string(*txRow.TxID))
+	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, *txRow.TxID)
 	if err != nil {
 		return false, err
 	}

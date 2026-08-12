@@ -96,7 +96,7 @@ type Store struct {
 	logger         *slog.Logger
 	durableDeletes bool
 
-	// claimCache amortises ClaimExact's claimKey index probe across many claims.
+	// claimCache amortizes ClaimExact's claimKey index probe across many claims.
 	// nil when disabled (WithClaimCache(0)), in which case ClaimExact falls back
 	// to a fresh probe per call.
 	claimCache *claimCache
@@ -157,7 +157,7 @@ func WithDurableDeletes(on bool) Option { return func(c *config) { c.durableDele
 // WithClaimCache sets the ClaimExact candidate-cache refill batch size. A single
 // claimKey index probe fetches up to n candidates that subsequent ClaimExact
 // calls drain with direct CAS reserves, collapsing the per-claim query rate that
-// otherwise serialises on the aerospike client's per-node query-routing lock.
+// otherwise serializes on the aerospike client's per-node query-routing lock.
 // n <= 0 disables the cache (a fresh probe per claim). Defaults to
 // [defaultClaimCacheSize].
 func WithClaimCache(n int) Option { return func(c *config) { c.claimCacheSize = n } }
