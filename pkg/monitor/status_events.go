@@ -595,6 +595,14 @@ func (d *Daemon) applyStatusBatch(ctx context.Context, batch []arcade.StatusEven
 		return
 	}
 
+	// Applied, so an observer may now be told. Inline and before the cursor is
+	// recorded: this is the point at which the batch is a fact, and an observer
+	// that respects its no-blocking contract costs nothing here. See
+	// [WithStatusObserver].
+	if d.statusObserver != nil {
+		d.statusObserver(records)
+	}
+
 	cursor.record(ctx, batch)
 }
 

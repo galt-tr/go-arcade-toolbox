@@ -1,6 +1,10 @@
 package monitor
 
-import "time"
+import (
+	"time"
+
+	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+)
 
 // Option configures a [Daemon] at construction.
 type Option func(*Daemon)
@@ -37,6 +41,38 @@ func WithApplyConcurrency(n int) Option {
 			d.applyConcurrency = n
 		}
 	}
+}
+
+// WithStatusObserver registers a callback handed every batch of arcade status
+// records the SSE apply pipeline has just applied, in arrival order.
+//
+// It exists so an application can react to transaction status — drive a UI,
+// update its own projection — WITHOUT opening a second SSE stream. That second
+// stream is the obvious approach and it is a trap: arcade's GET /events takes
+// one query parameter and one header, with no per-client filter, so a second
+// connection on the same callback token receives a full duplicate of every
+// event AND doubles arcade's per-event cost, because the token→txid membership
+// probe runs once per client inside the single fan-out goroutine that is
+// already the bottleneck. See [arcade.Client.StreamStatus] for the measurement.
+//
+// THE OBSERVER MUST NOT BLOCK. It runs inline on the applier goroutine, so time
+// spent here is time the applier is not draining the hand-off queue — and once
+// that queue fills, the SSE reader blocks, arcade sees a slow client and drops
+// our events outright. Update memory and return; do any I/O elsewhere. For the
+// same reason it must not panic: there is no recover on this path, and a panic
+// takes the apply pipeline down with it.
+//
+// The batch is delivered only after it applied successfully, and carries the
+// records as they arrived — not filtered by what the wallet already knew — so an
+// application tracking its own transactions sees every one of them. Delivery is
+// at-least-once (a held cursor re-delivers after a reconnect), so the callback
+// must be idempotent. The slice must not be retained or mutated.
+//
+// The poll fallbacks do not route through here; the stream is the fast path, not
+// the authority. An application that needs a convergence guarantee should still
+// reconcile against [arcade.TxOracle.GetTx].
+func WithStatusObserver(fn func([]arcade.TxRecord)) Option {
+	return func(d *Daemon) { d.statusObserver = fn }
 }
 
 // WithReconcilerWindows overrides the reject→release reconciler's grace window
