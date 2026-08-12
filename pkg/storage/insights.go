@@ -239,3 +239,45 @@ func (p *Provider) StateReport(ctx context.Context, auth wdk.AuthID, baskets []s
 	}
 	return rep, nil
 }
+
+// maxRawTxBatch bounds one RawTxs query. It is a placeholder-count limit, not a
+// tuning knob: PostgreSQL caps a statement at 65535 bind parameters and SQLite
+// at 32766 (SQLITE_MAX_VARIABLE_NUMBER since 3.32), so a caller with a large
+// txid list must be chunked rather than allowed to fail at the driver.
+const maxRawTxBatch = 512
+
+// RawTxs returns the retained raw transaction bytes for each requested txid.
+//
+// Read-only, and deliberately bulk: it exists for callers that hold a set of
+// txids and need the transactions themselves back — reconstructing a spend of
+// their outputs, or verifying that some recorded txid really is the transaction
+// it claims to be. Going through the provider rather than the caller's own SQL
+// keeps it backend-agnostic, which matters when the caller's own records live in
+// a different database from the wallet.
+//
+// A txid with no known_txs row, or a row whose raw_tx was never retained, is
+// simply ABSENT from the result — never an error and never a nil entry. The
+// caller must decide what a miss means; this cannot know.
+//
+// raw_tx is retained for the life of the row: [metastore.KnownTxRepo.SetProof]
+// clears input_beef once a proof anchors the transaction but deliberately keeps
+// raw_tx, "needed to reconstruct the tx when spending its outputs". So a mined
+// transaction from long ago is still expected to be here.
+func (p *Provider) RawTxs(ctx context.Context, txids []string) (map[string][]byte, error) {
+	p.trace(ctx, "RawTxs")
+	out := make(map[string][]byte, len(txids))
+	for start := 0; start < len(txids); start += maxRawTxBatch {
+		batch := txids[start:min(start+maxRawTxBatch, len(txids))]
+		rows, err := p.meta.KnownTx().FindByTxIDs(ctx, batch)
+		if err != nil {
+			return nil, fmt.Errorf("storage: raw txs: %w", err)
+		}
+		for i := range rows {
+			if len(rows[i].RawTx) == 0 {
+				continue
+			}
+			out[rows[i].TxID] = rows[i].RawTx
+		}
+	}
+	return out, nil
+}
