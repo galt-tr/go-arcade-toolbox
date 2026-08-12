@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,6 +41,154 @@ func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
 		t.Fatalf("timed out waiting for %s", what)
 		var zero T
 		return zero
+	}
+}
+
+// --- jitter / retry / watchdog ----------------------------------------------
+
+// TestSleepFor_JittersBeneathTheCeiling pins the reconnect delay distribution.
+// Without jitter every client that shared a server wakes at exactly the same
+// offsets and re-dials in lockstep, so a restart lands as synchronized spikes
+// rather than a ramp.
+func TestSleepFor_JittersBeneathTheCeiling(t *testing.T) {
+	r := New(Config{BackoffBase: time.Second, BackoffMax: time.Minute})
+
+	for _, tc := range []struct {
+		name    string
+		draw    float64
+		ceiling time.Duration
+		want    time.Duration
+	}{
+		{"full draw takes the ceiling", 1, 8 * time.Second, 8 * time.Second},
+		{"mid draw lands beneath it", 0.5, 8 * time.Second, 4 * time.Second},
+		{"zero draw is floored, never a hot loop", 0, 8 * time.Second, 500 * time.Millisecond},
+		{"ceiling at or under the floor is used verbatim", 0, 200 * time.Millisecond, 200 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r.cfg.Rand = func() float64 { return tc.draw }
+			if got := r.sleepFor(tc.ceiling); got != tc.want {
+				t.Errorf("sleepFor(%s) with draw %v = %s, want %s", tc.ceiling, tc.draw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRun_AdoptsServerRetryDirective verifies the `retry:` field is parsed and
+// honored. A server that knows it is about to sever every stream can hand out
+// its own spread; the client cannot infer that on its own.
+func TestRun_AdoptsServerRetryDirective(t *testing.T) {
+	conns := make(chan time.Time, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case conns <- time.Now():
+		default:
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// A complete frame carrying only a retry directive, then close.
+		_, _ = io.WriteString(w, "retry: 400\nevent: shutdown\ndata: {}\n\n")
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader := New(Config{
+		Name:            "test",
+		Logger:          discardLogger(),
+		Client:          server.Client(),
+		Request:         getRequest(server.URL),
+		Handler:         func(context.Context, Frame) bool { return true },
+		ResetBackoff:    func(ConnResult) bool { return false },
+		BackoffBase:     10 * time.Millisecond,
+		BackoffMax:      5 * time.Second,
+		WatchdogTimeout: 5 * time.Second,
+		Rand:            func() float64 { return 1 }, // take the whole ceiling
+	})
+	go func() { _ = reader.Run(ctx) }()
+
+	t0 := waitFor(t, conns, "connect #1")
+	t1 := waitFor(t, conns, "connect #2")
+
+	// Without the directive the ceiling would still be BackoffBase (10ms); the
+	// server asked for 400ms and it must win.
+	if gap := t1.Sub(t0); gap < 300*time.Millisecond {
+		t.Errorf("reconnect gap = %s, want >= 300ms (server retry directive ignored)", gap)
+	}
+}
+
+// TestRun_SlowHandlerDoesNotTripItsOwnWatchdog covers the read-liveness
+// watchdog's scope: it measures the SOCKET, not the consumer. A handler that
+// blocks longer than WatchdogTimeout used to cancel its own healthy connection,
+// and the reconnect made the backlog it was working through worse.
+func TestRun_SlowHandlerDoesNotTripItsOwnWatchdog(t *testing.T) {
+	var conns atomic.Int32
+	const watchdog = 100 * time.Millisecond
+
+	// slowDone is closed by the handler once it has blocked for longer than the
+	// watchdog. The server waits for it before writing the second frame, so
+	// that frame can only be read over a connection that SURVIVED the slow
+	// handler — reading it from a buffer or over a redial is not possible.
+	slowDone := make(chan struct{})
+	var slowOnce sync.Once
+	hold := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conns.Add(1)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("response writer is not a flusher")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		_, _ = io.WriteString(w, "event: status\ndata: {\"n\":1}\n\n")
+		flusher.Flush()
+		select {
+		case <-slowDone:
+		case <-hold:
+			return
+		}
+		_, _ = io.WriteString(w, "event: status\ndata: {\"n\":2}\n\n")
+		flusher.Flush()
+		<-hold
+	}))
+	defer server.Close()
+	defer close(hold)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	gotSecond := make(chan struct{}, 1)
+	reader := New(Config{
+		Name:    "test",
+		Logger:  discardLogger(),
+		Client:  server.Client(),
+		Request: getRequest(server.URL),
+		Handler: func(_ context.Context, f Frame) bool {
+			if strings.Contains(f.Data, `"n":2`) {
+				select {
+				case gotSecond <- struct{}{}:
+				default:
+				}
+				return true
+			}
+			// Block for well over the watchdog while the socket sits silent.
+			time.Sleep(3 * watchdog)
+			slowOnce.Do(func() { close(slowDone) })
+			return true
+		},
+		ResetBackoff:    func(ConnResult) bool { return true },
+		BackoffBase:     10 * time.Millisecond,
+		BackoffMax:      time.Second,
+		WatchdogTimeout: watchdog,
+	})
+	go func() { _ = reader.Run(ctx) }()
+
+	waitFor(t, gotSecond, "second frame over the surviving connection")
+	if got := conns.Load(); got != 1 {
+		t.Errorf("connections = %d, want 1: the slow handler canceled its own connection", got)
 	}
 }
 
@@ -175,6 +325,10 @@ func TestRun_ResetBackoffFalseGrowsGaps(t *testing.T) {
 		BackoffBase:     30 * time.Millisecond,
 		BackoffMax:      5 * time.Second,
 		WatchdogTimeout: 5 * time.Second,
+		// Draw the full ceiling every time: this test is about the ceiling
+		// doubling, and an unpinned jitter draw would make "gaps grow" a coin
+		// flip rather than an assertion.
+		Rand: func() float64 { return 1 },
 	})
 	go func() { _ = reader.Run(ctx) }()
 

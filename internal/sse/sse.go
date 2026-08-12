@@ -28,8 +28,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,6 +70,11 @@ type Frame struct {
 	ID    string
 	Event string
 	Data  string
+	// RetryMS is the server's requested reconnect delay in milliseconds from a
+	// `retry:` line, or 0 when the frame carried none. Per the SSE spec this is
+	// a stream-level directive rather than per-frame state, so the reader hoists
+	// the most recent value onto [ConnResult.ServerRetry].
+	RetryMS int
 }
 
 // ConnResult summarizes a single finished connection, handed to
@@ -83,6 +90,12 @@ type ConnResult struct {
 	// stall). It does NOT include an outer-context cancellation - that is handled
 	// by [Reader.Run] returning before ResetBackoff is consulted.
 	Err error
+	// ServerRetry is the last `retry:` directive the server sent on this
+	// connection, or 0 if it sent none. [Reader.Run] adopts it as the next
+	// backoff ceiling, clamped to [BackoffBase, BackoffMax], which lets a server
+	// that knows it is restarting spread the reconnect herd it is about to
+	// create - something the client cannot infer on its own.
+	ServerRetry time.Duration
 }
 
 // Config parameterizes a [Reader]. Client, Request, Handler and ResetBackoff are
@@ -111,9 +124,13 @@ type Config struct {
 	// the reconnect backoff to BackoffBase.
 	ResetBackoff func(ConnResult) bool
 	// BackoffBase and BackoffMax bound the reconnect exponential backoff
-	// (BackoffBase, x2 each reconnect, capped at BackoffMax).
+	// ceiling (BackoffBase, x2 each reconnect, capped at BackoffMax). The
+	// actual delay is drawn randomly beneath the ceiling - see [Reader.sleepFor].
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	// Rand returns a value in [0,1) for the reconnect jitter. Defaults to
+	// math/rand/v2; tests pin it to make backoff deterministic.
+	Rand func() float64
 	// WatchdogTimeout drops and redials a connection on which no line has been
 	// read for this long (a dead TCP peer); the drop cancels only the connection,
 	// not the outer ctx, so the stream reconnects instead of returning.
@@ -144,7 +161,7 @@ func New(cfg Config) *Reader {
 // of hot-looping. A watchdog-triggered stall drops just the connection and loops;
 // only an outer-ctx cancellation returns.
 func (r *Reader) Run(ctx context.Context) error {
-	backoff := r.cfg.BackoffBase
+	ceiling := r.cfg.BackoffBase
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -161,26 +178,65 @@ func (r *Reader) Run(ctx context.Context) error {
 				slog.String("stream", r.cfg.Name),
 				slog.String("error", res.Err.Error()),
 				slog.Int("delivered", res.Delivered),
-				slog.Duration("backoff", backoff))
+				slog.Duration("backoff_ceiling", ceiling))
 		} else {
 			r.cfg.Logger.DebugContext(ctx, "sse stream closed, reconnecting",
 				slog.String("stream", r.cfg.Name),
 				slog.Int("delivered", res.Delivered),
-				slog.Duration("backoff", backoff))
+				slog.Duration("backoff_ceiling", ceiling))
 		}
 
 		if r.cfg.ResetBackoff(res) {
-			backoff = r.cfg.BackoffBase
+			ceiling = r.cfg.BackoffBase
+		}
+		// A server that knows it is about to sever every stream (a rolling
+		// restart) can hand out its own spread; honor it, but never let it pin
+		// us at 0 or park us for an hour.
+		if res.ServerRetry > 0 {
+			ceiling = min(max(res.ServerRetry, r.cfg.BackoffBase), r.cfg.BackoffMax)
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(r.sleepFor(ceiling)):
 		}
 
-		backoff = min(backoff*2, r.cfg.BackoffMax)
+		ceiling = min(ceiling*2, r.cfg.BackoffMax)
 	}
+}
+
+// sleepFor draws the actual reconnect delay for a backoff ceiling.
+//
+// The ceiling advances deterministically (doubling) but the sleep is randomized
+// beneath it - AWS "full jitter". Without this, every client that was connected
+// to the same server wakes at exactly the same offsets (1s, 2s, 4s...) and
+// re-dials in lockstep, so the reconnect storm that follows a restart lands as
+// a series of synchronized spikes on a server that is still cold. Spreading the
+// draws turns those spikes into a ramp.
+//
+// The draw is floored at half the base delay so a reset ceiling can never
+// degenerate into a hot reconnect loop against a server that accepts and
+// immediately closes.
+func (r *Reader) sleepFor(ceiling time.Duration) time.Duration {
+	floor := r.cfg.BackoffBase / 2
+	if ceiling <= floor {
+		return ceiling
+	}
+	d := time.Duration(r.random() * float64(ceiling))
+	return max(d, floor)
+}
+
+// random returns a value in [0,1), from Config.Rand when set (tests pin it for
+// determinism) and math/rand/v2 otherwise.
+func (r *Reader) random() float64 {
+	if r.cfg.Rand != nil {
+		return r.cfg.Rand()
+	}
+	// Reconnect jitter is a load-spreading device, not a security primitive:
+	// predicting it buys an attacker nothing, and crypto/rand on every reconnect
+	// would be pure cost.
+	return rand.Float64() //nolint:gosec // non-cryptographic by design
 }
 
 // runOnce performs a single connection and dispatches frames until the stream
@@ -227,7 +283,23 @@ func (r *Reader) runOnce(ctx context.Context) ConnResult {
 
 		// A blank line marks the end of a frame.
 		if line == "" {
-			if r.cfg.Handler(ctx, frame) {
+			if frame.RetryMS > 0 {
+				res.ServerRetry = time.Duration(frame.RetryMS) * time.Millisecond
+			}
+			// Suspend the watchdog across the hand-off. It measures SOCKET
+			// liveness, not pipeline liveness: while we are parked handing a
+			// frame to a slow consumer the peer is by definition fine - we are
+			// the slow one. Without this, a Handler that blocks longer than
+			// WatchdogTimeout cancels its own healthy connection, and the
+			// resulting reconnect makes the backlog it was working through
+			// worse. Note that moving Handler onto its own goroutine behind a
+			// bounded queue does NOT fix this on its own: once that queue fills,
+			// the reader blocks on the enqueue instead and the watchdog fires
+			// anyway.
+			watchdog.Stop()
+			delivered := r.cfg.Handler(ctx, frame)
+			watchdog.Reset(r.cfg.WatchdogTimeout)
+			if delivered {
 				res.Delivered++
 			}
 			frame = Frame{}
@@ -274,6 +346,11 @@ func accumulate(line string, frame *Frame) {
 			frame.Data += "\n"
 		}
 		frame.Data += value
+	case "retry":
+		// Spec: ignore the field unless the value is all ASCII digits.
+		if ms, err := strconv.Atoi(value); err == nil && ms >= 0 {
+			frame.RetryMS = ms
+		}
 	}
 }
 

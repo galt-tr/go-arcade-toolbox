@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -449,6 +450,81 @@ func TestCursorTracker_HoldIsBounded(t *testing.T) {
 	}
 	require.Equal(t, fill[len(fill)-1].ID, cursor.resume(ctx),
 		"past its bound the hold is released so the stream can make progress again")
+}
+
+// nsRec builds an event with a REAL arcade event id: a nanosecond timestamp as
+// a decimal string. The other helpers use synthetic non-numeric ids, which the
+// cursor guard deliberately treats as incomparable, so a monotonicity test has
+// to use the real shape.
+func nsRec(ns int64, txid string, status arcade.Status) arcade.StatusEvent {
+	return arcade.StatusEvent{
+		ID:     strconv.FormatInt(ns, 10),
+		Record: arcade.TxRecord{TxID: txid, Status: status},
+	}
+}
+
+// TestCursorTracker_NeverRegressesPastAHighWaterMark pins the resume cursor as a
+// high-water mark.
+//
+// Arcade emits NON-MONOTONIC ids across a drop/catchup boundary by design: a
+// mid-stream catchup round replays from the store (older ids) and then hands the
+// live channel back (newer ids). So the last event in an arrival-ordered batch
+// is not necessarily the furthest position, and taking it verbatim moves the
+// cursor backwards.
+//
+// That regression is not a harmless replay. The next reconnect asks arcade for a
+// much larger window, arcade truncates it at its frame cap, and everything past
+// the cap is skipped — a benign inefficiency turned into missed events.
+func TestCursorTracker_NeverRegressesPastAHighWaterMark(t *testing.T) {
+	store := newModelStorage(nil)
+	dmn, err := NewDaemon(logging.NewTestLogger(t), store, nil, nil, defs.DefaultMonitorConfig(), WithoutDistributedLock())
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	cursor := &cursorTracker{daemon: dmn}
+
+	const live = int64(1_800_000_000_000_000_000)
+	cursor.record(ctx, []arcade.StatusEvent{nsRec(live, "aaaa", arcade.StatusSeenOnNetwork)})
+	require.Equal(t, strconv.FormatInt(live, 10), cursor.resume(ctx))
+
+	// A mid-stream catchup round: replayed history, so the batch ends on an id
+	// OLDER than what we already hold.
+	replayed := []arcade.StatusEvent{
+		nsRec(live-3_000_000_000, "bbbb", arcade.StatusSeenOnNetwork),
+		nsRec(live-2_000_000_000, "cccc", arcade.StatusSeenOnNetwork),
+	}
+	cursor.record(ctx, replayed)
+	require.Equal(t, strconv.FormatInt(live, 10), cursor.resume(ctx),
+		"a replayed batch must not drag the resume cursor backwards")
+
+	// Live delivery resumes and the cursor advances again.
+	ahead := live + 5_000_000_000
+	cursor.record(ctx, []arcade.StatusEvent{nsRec(ahead, "dddd", arcade.StatusMined)})
+	require.Equal(t, strconv.FormatInt(ahead, 10), cursor.resume(ctx),
+		"the guard must not freeze a cursor that is genuinely moving forward")
+}
+
+func TestCursorLess(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"older is less", "100", "200", true},
+		{"newer is not less", "200", "100", false},
+		{"equal is not less", "100", "100", false},
+		// String order agrees with numeric order only at equal width; this is
+		// the case a lexical compare would get wrong.
+		{"width difference compares numerically", "9999999999", "10000000000", true},
+		{"empty is never older", "", "100", false},
+		{"empty target is never newer", "100", "", false},
+		{"non-numeric ids are incomparable, never suppress an advance", "abc", "200", false},
+		{"non-numeric target likewise", "100", "xyz", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, cursorLess(tc.a, tc.b))
+		})
+	}
 }
 
 func mustKV(t *testing.T, m *modelStorage, key string) []byte {

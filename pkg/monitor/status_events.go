@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -403,6 +404,22 @@ func (c *cursorTracker) record(ctx context.Context, batch []arcade.StatusEvent) 
 		return
 	}
 
+	// The cursor is a high-water mark and must never move backwards. Arcade
+	// deliberately emits NON-MONOTONIC ids across a drop/catchup boundary: a
+	// mid-stream catchup round replays from the store and then hands the live
+	// channel back, so ids jump backwards to the replayed window and forwards
+	// again. "Last event in the batch" is therefore not necessarily the furthest
+	// position, and taking it verbatim regresses the cursor.
+	//
+	// A regressed cursor is not a harmless replay: the next reconnect asks for a
+	// much larger window, the server truncates it at its frame cap, and the
+	// history beyond the cap is skipped. Losing ground here is how a benign
+	// inefficiency turns into missed events.
+	if cursorLess(newest, c.positionLocked()) {
+		c.mu.Unlock()
+		return
+	}
+
 	c.pending = newest
 	c.batches++
 	due := c.batches >= cursorFlushBatches
@@ -411,6 +428,28 @@ func (c *cursorTracker) record(ctx context.Context, batch []arcade.StatusEvent) 
 	if due {
 		c.flush(ctx)
 	}
+}
+
+// cursorLess reports whether replay cursor a is strictly older than b.
+//
+// Cursors are arcade event ids: nanosecond timestamps as decimal strings. They
+// are compared NUMERICALLY, not lexically — string order agrees with numeric
+// order only while the values have equal width, which is not a property to
+// depend on for a correctness guard. An unparsable or empty cursor is treated
+// as not-older so it can never suppress a real advance.
+func cursorLess(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	an, err := strconv.ParseInt(a, 10, 64)
+	if err != nil {
+		return false
+	}
+	bn, err := strconv.ParseInt(b, 10, 64)
+	if err != nil {
+		return false
+	}
+	return an < bn
 }
 
 // releaseIfPastBoundLocked gives up a hold that has grown past
@@ -449,9 +488,13 @@ func (c *cursorTracker) positionLocked() string {
 	return c.durable
 }
 
-// newestEventID is the id of the last event in the batch that carries one. A
-// batch is in arrival order, so that is the furthest a resume position could
-// move; events with no id cannot be resumed from and are skipped over.
+// newestEventID is the id of the last event in the batch that carries one.
+// Events with no id cannot be resumed from and are skipped over.
+//
+// Note this is ARRIVAL order, not id order: arcade emits non-monotonic ids
+// across a drop/catchup boundary, so the last event in a batch is not
+// necessarily the highest id. [cursorTracker.record] applies the high-water
+// mark guard; do not assume this value only ever moves forward.
 func newestEventID(batch []arcade.StatusEvent) string {
 	for i := len(batch) - 1; i >= 0; i-- {
 		if batch[i].ID != "" {
