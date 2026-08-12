@@ -35,7 +35,7 @@ func TestMarkMarked(t *testing.T) {
 	}
 }
 
-func TestEmitNilLoggerNoPanic(t *testing.T) {
+func TestEmitNilLoggerNoPanic(_ *testing.T) {
 	// Must be a safe no-op so callers need not nil-check.
 	Emit(nil, "created", "abc", "k", "v")
 }

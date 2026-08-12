@@ -4,10 +4,10 @@ import (
 	"sync"
 )
 
-// claimCache amortises the per-claim claimKey secondary-index probe that is the
+// claimCache amortizes the per-claim claimKey secondary-index probe that is the
 // dominant cost of high-throughput claiming on Aerospike. Every claim used to
 // issue its own index query, and on a single-node cluster the aerospike client
-// serialises concurrent queries on a per-node routing lock — the bottleneck
+// serializes concurrent queries on a per-node routing lock — the bottleneck
 // profiled at the hybrid throughput ceiling. The cache turns per-claim queries
 // into per-batch queries: one whole-bucket probe fills a bounded snapshot that
 // many concurrent claims then drain with direct single-record CAS reserves, and

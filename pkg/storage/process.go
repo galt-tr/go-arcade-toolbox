@@ -509,18 +509,6 @@ func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Tran
 	return nil
 }
 
-// promoteChange promotes a transaction's change coins to the given tier.
-func (p *Provider) promoteChange(ctx context.Context, userID int, transactionID uint, txid string, tier utxostore.Tier) error {
-	ops, err := p.changeOutpoints(ctx, userID, transactionID, txid)
-	if err != nil || len(ops) == 0 {
-		return err
-	}
-	if _, err := p.utxo.Promote(ctx, ops, tier); err != nil {
-		return fmt.Errorf("storage: promote change: %w", err)
-	}
-	return nil
-}
-
 // changeOutpoints returns the outpoints of a transaction's change coins.
 func (p *Provider) changeOutpoints(ctx context.Context, userID int, transactionID uint, txid string) ([]utxostore.Outpoint, error) {
 	change := true

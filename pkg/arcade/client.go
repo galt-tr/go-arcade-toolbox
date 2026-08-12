@@ -97,6 +97,10 @@ type Client struct {
 	// reconnect assertions fast and deterministic.
 	sseBackoffBase time.Duration
 	sseBackoffMax  time.Duration
+	// sseRand draws the reconnect jitter in [0,1). nil (the default) means
+	// math/rand/v2, i.e. real full jitter; tests pin it so the sleep is a fixed
+	// fraction of the ceiling and the reconnect gaps become exactly predictable.
+	sseRand func() float64
 }
 
 // New constructs a Client for a single Arcade instance. httpClient is the resty

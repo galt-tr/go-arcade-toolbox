@@ -154,7 +154,7 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 }
 
 // claimCands returns up to want claimable candidates for claimKey that satisfy
-// pred, preferring by prefer (nil = any order). It draws from the amortised
+// pred, preferring by prefer (nil = any order). It draws from the amortized
 // claim cache when enabled — one whole-bucket probe feeds many claims — and
 // falls back to a direct value-filtered index probe (sorted by prefer) when the
 // cache is disabled. Either way the caller must still win the reserve CAS: the
@@ -244,7 +244,7 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 
 // ClaimExact implements [utxostore.Store]. Every coin of a given denomination
 // shares one bucket, so candidates come from that bucket filtered to sats ==
-// denomination — served from the amortised claim cache (one whole-bucket probe
+// denomination — served from the amortized claim cache (one whole-bucket probe
 // per batch) when enabled, or a direct index probe otherwise. A result shorter
 // than count is pool underflow, not an error.
 func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation string, denomination uint64, count int) ([]*utxostore.UTXO, error) {
@@ -266,7 +266,7 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	losses := 0
 	for len(claimed) < count {
 		// Exact matches are interchangeable, so no preference ordering — the
-		// cache serves any denomination coin, amortising the index probe.
+		// cache serves any denomination coin, amortizing the index probe.
 		cands, err := s.claimCands(claimKey, valueFilter, exact, nil, count-len(claimed))
 		if err != nil {
 			return nil, err

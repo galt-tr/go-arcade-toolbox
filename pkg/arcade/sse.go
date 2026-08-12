@@ -112,6 +112,7 @@ func (c *Client) StreamStatus(ctx context.Context, lastEventID string, onEvent f
 		},
 		BackoffBase:     c.sseBackoffBase,
 		BackoffMax:      c.sseBackoffMax,
+		Rand:            c.sseRand,
 		WatchdogTimeout: c.sseReadWatchdogTimeout,
 	})
 
