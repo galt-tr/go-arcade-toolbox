@@ -11,12 +11,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/conformance"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/conformance"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // Every concurrency test in this module races HOMOGENEOUS operations: many
@@ -59,7 +59,7 @@ func TestSweepRacingCreateActionNeverDoubleAllocates(t *testing.T) {
 	// The ledger tracks LIVE claims only. A coin whose reservation was swept is
 	// legitimately reallocated — that is the sweep's entire purpose — so counting
 	// reuse-after-sweep as a collision would assert the opposite of the desired
-	// behaviour. What must never happen is two live actions sharing a coin.
+	// behavior. What must never happen is two live actions sharing a coin.
 	seen := &outpointLedger{seen: map[string]string{}}
 
 	// Strand some reservations: CreateAction with no ProcessAction, exactly as a

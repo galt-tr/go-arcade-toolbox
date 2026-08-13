@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"embed"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqlkit"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqlkit"
 )
 
 // migrationsFS holds the embedded goose migration sets, one directory per

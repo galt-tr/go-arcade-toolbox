@@ -1,6 +1,6 @@
 package wdk
 
-import "github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+import "github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 
 // StorageCreateTransactionSdkInput represents the input for SDK transaction creation
 type StorageCreateTransactionSdkInput struct {

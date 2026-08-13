@@ -31,9 +31,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/perfprovider"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/perfprovider"
 )
 
 // TargetTPS is the headline throughput target the report compares against.

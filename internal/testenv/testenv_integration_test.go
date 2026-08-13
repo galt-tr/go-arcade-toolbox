@@ -15,7 +15,7 @@ import (
 	// Registers the "pgx" database/sql driver.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
 )
 
 // TestPostgresHelper_SelfTest proves StartPostgres works end-to-end against a

@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pkgerrors "github.com/bsv-blockchain/go-arcade-toolbox/pkg/errors"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	pkgerrors "github.com/galt-tr/go-arcade-toolbox/pkg/errors"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 func TestTransactionError_Success(t *testing.T) {

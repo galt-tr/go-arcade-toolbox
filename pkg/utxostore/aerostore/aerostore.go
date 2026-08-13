@@ -58,7 +58,7 @@ import (
 	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // Bin names (each ≤ 15 chars, the Aerospike bin-name limit).

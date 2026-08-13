@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // Client is the remote-storage HTTP client: a full [wdk.WalletStorageProvider]

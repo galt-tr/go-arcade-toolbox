@@ -3,7 +3,7 @@ package wdk
 import (
 	"fmt"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // TODO: Check if the types below can be replaced by go-sdk types

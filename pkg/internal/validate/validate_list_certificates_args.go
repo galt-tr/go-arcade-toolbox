@@ -3,7 +3,7 @@ package validate
 import (
 	"fmt"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // ListCertificatesArgs is ported from go-wallet-toolbox (see upstream docs).

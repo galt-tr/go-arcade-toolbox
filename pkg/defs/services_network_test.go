@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 func TestDefaultServicesConfigPerNetwork(t *testing.T) {
@@ -23,14 +23,14 @@ func TestDefaultServicesConfigPerNetwork(t *testing.T) {
 		require.NoError(t, cfg.Validate())
 	})
 
-	t.Run("test disables Arcade and ChainTracks", func(t *testing.T) {
+	t.Run("test points Arcade+ChainTracks at the public testnet arcade host", func(t *testing.T) {
 		cfg := defs.DefaultServicesConfig(defs.NetworkTestnet)
 
-		require.False(t, cfg.Arcade.Enabled)
-		require.Empty(t, cfg.Arcade.URL)
-		require.Empty(t, cfg.Arcade.EventsURL)
-		require.False(t, cfg.ChainTracks.Enabled)
-		require.Empty(t, cfg.ChainTracks.URL)
+		require.True(t, cfg.Arcade.Enabled)
+		require.Equal(t, defs.ArcadeTestnetURL, cfg.Arcade.URL)
+		require.Equal(t, "https://arcade-v2-testnet-us-1.bsvblockchain.tech", cfg.Arcade.EventsURL)
+		require.True(t, cfg.ChainTracks.Enabled)
+		require.Equal(t, "https://arcade-v2-testnet-us-1.bsvblockchain.tech/chaintracks/v2", cfg.ChainTracks.URL)
 
 		require.NoError(t, cfg.Validate())
 	})
@@ -122,9 +122,12 @@ func TestWalletServicesValidateChain(t *testing.T) {
 	t.Run("typo'd network fails validation instead of yielding an inert config", func(t *testing.T) {
 		cfg := defs.DefaultServicesConfig("mian")
 
-		// endpointsForChain treats an unknown chain like testnet (everything off),
-		// so without the chain check this config would validate silently.
+		// endpointsForChain gives an unknown chain NO endpoints (everything off, empty
+		// URL), so without the chain check this config would validate silently. Every
+		// NAMED network now has an arcade URL, so the empty URL is what keeps a typo
+		// from inheriting one of them.
 		require.False(t, cfg.Arcade.Enabled)
+		require.Empty(t, cfg.Arcade.URL)
 		require.False(t, cfg.ChainTracks.Enabled)
 
 		err := cfg.Validate()

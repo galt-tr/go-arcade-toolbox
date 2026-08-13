@@ -8,8 +8,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/sqlstore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/sqlstore"
 )
 
 // BenchmarkClaim_Postgres reports per-claim cost at each pool size on

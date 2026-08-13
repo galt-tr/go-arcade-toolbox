@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/perfprovider"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/perfprovider"
 )
 
 func TestPercentile(t *testing.T) {

@@ -12,16 +12,16 @@ import (
 	"github.com/go-softwarelab/common/pkg/to"
 	"go.opentelemetry.io/otel/attribute"
 
-	pkgerrors "github.com/bsv-blockchain/go-arcade-toolbox/pkg/errors"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/assembler"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/tracing"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/mapping"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/party"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	pkgerrors "github.com/galt-tr/go-arcade-toolbox/pkg/errors"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/assembler"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/tracing"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/mapping"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/party"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/pending"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // SignAction is ported from go-wallet-toolbox (see upstream docs).

@@ -3,7 +3,7 @@ package txutils_test
 import (
 	"testing"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/txutils"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/txutils"
 )
 
 func TestMinRequiredFee(t *testing.T) {

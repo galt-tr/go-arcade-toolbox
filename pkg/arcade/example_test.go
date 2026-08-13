@@ -3,7 +3,7 @@ package arcade_test
 import (
 	"fmt"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
 )
 
 // Terminal statuses are final outcomes that a later, lower-priority update must

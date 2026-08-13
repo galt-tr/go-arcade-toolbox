@@ -5,7 +5,7 @@ import (
 
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // DiscoverByIdentityKeyArgs validates arguments for DiscoverByIdentityKey()

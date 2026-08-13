@@ -30,7 +30,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // NewTxID returns a deterministic transaction ID derived from seed, so tests

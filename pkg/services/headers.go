@@ -6,8 +6,8 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/headers"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/headers"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // FindChainTipHeader returns the header of the current chain tip, resolved as

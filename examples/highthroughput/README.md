@@ -28,9 +28,9 @@ What it shows:
   relaxed durability** (`synchronous_commit=off`). Exceeding 1000 TPS durably is
   a scale-out (N nodes) or group-commit story. Numbers are measured — see
   [`../../docs/benchmarks`](../../docs/benchmarks).
-- **The dedicated, wallet-signable fuel basket is a follow-up.** Storage does not
-  yet honor `Options.FuelShape`, so `FanOutFuel` currently mints its outputs as
-  ordinary change into the default basket rather than into a separate pool
-  basket. The denominated `ClaimExact` funding path itself is wired and
-  benchmarked; provisioning the pool through the public wallet API is the
-  remaining piece (see the gap analysis in the benchmarks README).
+- **The 2026-08-07 benchmark numbers predate the dedicated fuel basket.** Those
+  runs sized the pool in the `default` basket because `FanOutFuel` could not yet
+  provision a separate one. Storage now honors `Options.FuelShape`
+  (`pkg/storage/create.go:357-377`), minting wallet-signable denominated coins
+  straight into the pool basket, so those figures are a floor for the denominated
+  path rather than a ceiling.

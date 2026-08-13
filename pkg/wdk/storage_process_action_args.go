@@ -1,6 +1,6 @@
 package wdk
 
-import "github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+import "github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 
 // ProcessActionArgs defines the arguments required to process an action with transaction and sending options.
 type ProcessActionArgs struct {

@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/brc29"
 )
 
 const mustGetAddressMsg = "Must get address from BRC29 locking script"

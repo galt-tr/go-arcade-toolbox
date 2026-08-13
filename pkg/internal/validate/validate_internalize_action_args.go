@@ -6,8 +6,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/brc29"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // ValidInternalizeActionArgs is ported from go-wallet-toolbox (see upstream docs).

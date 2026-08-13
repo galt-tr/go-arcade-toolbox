@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/randomizer"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/randomizer"
 )
 
 func TestRandomBase64(t *testing.T) {

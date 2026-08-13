@@ -10,13 +10,29 @@ import (
 // ArcadeServiceName is the service name used in queues/results for the Arcade broadcaster.
 const ArcadeServiceName = "Arcade"
 
-// ArcadeURL is the default mainnet Arcade instance.
-const ArcadeURL = "https://arcade-v2-us-1.bsvblockchain.tech"
+// The public Arcade instances hosted by the BSV Association. Each network is served
+// from two regions; the US instance is the built-in default and the EU instance is an
+// equivalent alternative an operator may configure explicitly (arcade.url).
+//
+// Every one of these hosts serves the whole gateway on one host+port by path: the
+// broadcast/status API at the base, the SSE stream at /events, and ChainTracks at
+// /chaintracks/v2. DefaultServicesConfig derives the latter two from the base.
+const (
+	// ArcadeURL is the default mainnet Arcade instance (US).
+	ArcadeURL = "https://arcade-v2-us-1.bsvblockchain.tech"
+	// ArcadeEUURL is the EU mainnet Arcade instance.
+	ArcadeEUURL = "https://arcade-v2-eu-1.bsvblockchain.tech"
 
-// ArcadeTTNURL is the default Arcade instance for the public Teranode Test Net (ttn).
-// The same host+port also serves ChainTracks (path /chaintracks/v2) and the SSE events
-// stream (path /events); those URLs are derived from this base by DefaultServicesConfig.
-const ArcadeTTNURL = "https://arcade-v2-ttn-us-1.bsvblockchain.tech"
+	// ArcadeTTNURL is the default Arcade instance for the public Teranode Test Net (ttn), US.
+	ArcadeTTNURL = "https://arcade-v2-ttn-us-1.bsvblockchain.tech"
+	// ArcadeTTNEUURL is the EU Arcade instance for the public Teranode Test Net (ttn).
+	ArcadeTTNEUURL = "https://arcade-v2-ttn-eu-1.bsvblockchain.tech"
+
+	// ArcadeTestnetURL is the default Arcade instance for the legacy BSV testnet (test), US.
+	ArcadeTestnetURL = "https://arcade-v2-testnet-us-1.bsvblockchain.tech"
+	// ArcadeTestnetEUURL is the EU Arcade instance for the legacy BSV testnet (test).
+	ArcadeTestnetEUURL = "https://arcade-v2-testnet-eu-1.bsvblockchain.tech"
+)
 
 // ArcadeCircuitBreaker configures when the wallet fails over away from Arcade.
 type ArcadeCircuitBreaker struct {

@@ -3,7 +3,7 @@ package mapping
 import (
 	"github.com/bsv-blockchain/go-sdk/overlay"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // MapToOverlayNetwork is ported from go-wallet-toolbox (see upstream docs).

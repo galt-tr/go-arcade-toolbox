@@ -3,7 +3,7 @@ package monitor
 import (
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
 )
 
 // Option configures a [Daemon] at construction.

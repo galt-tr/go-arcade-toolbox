@@ -9,9 +9,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqltx"
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/metastore"
 )
 
 // newPostgresMeta opens a migrated metastore on a fresh isolated schema.

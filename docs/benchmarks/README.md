@@ -329,8 +329,9 @@ leverage:
    broadcast. The task's prior guess that the next bottleneck would be
    sign/commit/broadcast does **not** hold: it is squarely the funding/persist
    create path.
-2. **Give the fuel pool a dedicated basket (this is the biggest single lever, and
-   it is currently *blocked* — see [Known gap](#known-gap-a-dedicated-signable-fuel-basket-is-unreachable)).**
+2. **Give the fuel pool a dedicated basket (this is the biggest single lever; it
+   was blocked when these runs were captured and is now available — see
+   [Closed gap](#closed-gap-the-dedicated-signable-fuel-basket)).**
    `CreateAction` calls `changeBasketCount` — a `SELECT COUNT(*)` over the funding
    basket — on *every* op (`create.go`). Because the harness pool lives in the
    `default` basket, that COUNT scans the whole pool per op, and its cost grows
@@ -347,31 +348,36 @@ leverage:
 5. **Denomination sizing** so one `ClaimExact` claims exactly one coin per payment
    (it already does here: `n=1`), keeping change minimal.
 
-### Known gap: a dedicated, signable fuel basket is unreachable
+### Closed gap: the dedicated, signable fuel basket
 
-The fuel-pool captures fund from the **`default`** basket, not a dedicated `fuel`
-basket, because **no public wallet API can put a wallet-*signable* coin into a
-non-default basket today**:
+**This gap is closed. The runs below predate the fix and size their pool in the
+`default` basket; read their numbers with that in mind.**
 
-- `FanOutFuel` / `Options.FuelShape` (the intended pool-minting primitive) is
-  **dead in storage** — `pkg/storage/create.go` never reads `FuelShape`, so a
-  fan-out mints ordinary change into `default`, not shaped denominations into the
-  pool basket. (Confirmed: `FuelShape` is referenced only by `wallet.FanOutFuel`
-  and the wdk type; storage ignores it.)
-- `InternalizeAction`'s **wallet-payment** protocol (the only one that records the
-  BRC-29 derivation material the signer needs) hardcodes the `default` basket; its
-  **basket-insertion** protocol can target any basket but records no derivation
-  material, and the assembler's fallback derivation uses an *empty* key ID, which
-  `brc29` rejects (`KeyID.Validate`) — so basket-insertion coins are unspendable.
+When these benchmarks were captured, no public wallet API could put a
+wallet-*signable* coin into a non-default basket: `Options.FuelShape` was dead in
+storage, so `FanOutFuel` minted ordinary change into `default` rather than shaped
+denominations into a pool basket.
 
-Net: to spend from a **dedicated** pool basket via the real wallet you must first
-implement `FuelShape` (shaped change into the pool basket, carrying derivation
-material) and mine those fan-out txs so `ClaimExact`'s mined-tier fast path can
-see them. Until then the pool lives in `default`, which is a faithful end-to-end
-exercise of `ClaimExact` (change there is non-denominated and invisible to the
-exact claim) but pays the `changeBasketCount` cost of #2 and forces a large,
-non-recycling pool. This is a larger change than Task 27's funding-route wiring
-and is called out here rather than hacked into the harness.
+Storage now reads `FuelShape` on the create path — it sizes the fan-out outputs
+(`pkg/storage/create.go:97-102`), adds their value to the funding target
+(`:113-115`), resolves the fan-out's source basket (`:134`, `:455-467`) and emits
+them as shaped change into the pool or reserve basket (`:357-377`). Those coins
+carry derivation material like ordinary change, so they are wallet-signable and
+`ClaimExact`-selectable. **Mint into a dedicated `fuel` basket; do not size around
+the old caveat.**
+
+One related limitation is still real: `InternalizeAction`'s **wallet-payment**
+protocol (the only one recording the BRC-29 derivation material the signer needs)
+hardcodes the `default` basket, while its **basket-insertion** protocol can target
+any basket but records no derivation material — the assembler's fallback
+derivation uses an *empty* key ID, which `brc29` rejects (`KeyID.Validate`). So
+basket-insertion coins remain unspendable; `FanOutFuel`, not `InternalizeAction`,
+is how you provision a dedicated basket.
+
+Because the runs below pooled in `default`, they pay the `changeBasketCount` cost
+of #2 and force a large, non-recycling pool. They remain a faithful end-to-end
+exercise of `ClaimExact` — treat their absolute numbers as a **floor** for the
+denominated path.
 
 ## How these were produced
 

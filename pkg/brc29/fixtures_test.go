@@ -1,7 +1,7 @@
 package brc29_test
 
 import (
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/brc29"
 )
 
 const (

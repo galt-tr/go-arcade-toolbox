@@ -30,9 +30,13 @@ const (
 //
 //	network  Arcade                       ChainTracks
 //	main     arcade-v2-us-1               on (derived from arcade host)
-//	test     off                          off
+//	test     arcade-v2-testnet-us-1       on (derived from arcade host)
 //	ttn      arcade-v2-ttn-us-1           on (derived from arcade host)
 //	tstn     $TSTN_ARCADE_URL             on ($TSTN_CHAINTRACKS_URL or derived from arcade host)
+//
+// An UNKNOWN chain is deliberately NOT covered by this table: it falls to the default
+// arm below with everything off and an empty URL, so a typo'd network never inherits
+// another network's endpoints. WalletServices.Validate then rejects it by name.
 //
 // The SSE events URL (Arcade) and the ChainTracks URL are derived from the Arcade
 // base (same scheme+host+port, ChainTracks adding /chaintracks/v2) by
@@ -78,8 +82,15 @@ func endpointsForChain(chain BSVNetwork) networkEndpoints {
 			chaintracksURL: readEnv(EnvTstnChaintracksURL),
 		}
 	case NetworkTestnet:
-		fallthrough
+		return networkEndpoints{
+			arcadeEnabled:      true,
+			arcadeURL:          ArcadeTestnetURL,
+			chaintracksEnabled: true,
+		}
 	default:
+		// An unknown chain gets NO endpoints: everything off with an empty URL, so a
+		// typo'd network can neither inherit another network's arcade nor silently
+		// reach mainnet if something later flips Enabled. Validate rejects it by name.
 		return networkEndpoints{
 			arcadeEnabled:      false,
 			chaintracksEnabled: false,

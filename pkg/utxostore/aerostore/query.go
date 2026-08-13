@@ -8,7 +8,7 @@ import (
 
 	as "github.com/aerospike/aerospike-client-go/v8"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // streamQuery runs stmt and hands every record to visit, honoring ctx.

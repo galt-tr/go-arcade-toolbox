@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // KnownTxStatusSuspectFailed is an arcade-specific ProvenTxReqStatus (not part

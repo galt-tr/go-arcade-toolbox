@@ -1,7 +1,7 @@
 package fixtures
 
 import (
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // DefaultValidRelinquishCertificateArgs is ported from go-wallet-toolbox (see upstream docs).

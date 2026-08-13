@@ -11,7 +11,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction/template/pushdrop"
 	"github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
 )
 
 // MapLookupAnswerToVerifiableCertificates is ported from go-wallet-toolbox (see upstream docs).

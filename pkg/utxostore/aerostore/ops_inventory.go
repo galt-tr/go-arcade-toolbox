@@ -8,7 +8,7 @@ import (
 	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // Mint implements [utxostore.Store]. Each coin is a CREATE_ONLY put; a

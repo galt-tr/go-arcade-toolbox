@@ -4,7 +4,7 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // Configurer is the main interface for configuring a logger.

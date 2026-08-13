@@ -9,7 +9,7 @@ behavior deltas below are where you need to pay attention.
 Change the module prefix on every import:
 
 ```
-github.com/bsv-blockchain/go-wallet-toolbox  →  github.com/bsv-blockchain/go-arcade-toolbox
+github.com/bsv-blockchain/go-wallet-toolbox  →  github.com/galt-tr/go-arcade-toolbox
 ```
 
 e.g. `s#go-wallet-toolbox#go-arcade-toolbox#` across your imports. These

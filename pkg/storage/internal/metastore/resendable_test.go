@@ -8,8 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/metastore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/metastore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // TestFindResendable pins the SendWaiting work-list that makes stranded

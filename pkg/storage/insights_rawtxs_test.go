@@ -9,7 +9,7 @@ import (
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/fixtures"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/fixtures"
 )
 
 // TestRawTxs_ReturnsTheBroadcastBytes pins what Provider.RawTxs is for: a caller
