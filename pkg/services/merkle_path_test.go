@@ -10,9 +10,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // buildSingleLeafMerklePath returns a BUMP whose block contains only txid, so

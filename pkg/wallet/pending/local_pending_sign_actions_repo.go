@@ -9,8 +9,8 @@ import (
 
 	"github.com/go-softwarelab/common/pkg/to"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // SignActionLocalRepository is a cache for storing pending sign actions with a configurable time-to-live (TTL).

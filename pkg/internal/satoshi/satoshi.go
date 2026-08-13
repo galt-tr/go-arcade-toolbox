@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-softwarelab/common/pkg/types"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // Value is a signed satoshi amount. It may be negative during intermediate

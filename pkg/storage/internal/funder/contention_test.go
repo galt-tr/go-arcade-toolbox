@@ -7,9 +7,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 func contentionFunder(t *testing.T, store utxostore.Store, backoffs *atomic.Int64) *funder.Funder {

@@ -23,12 +23,12 @@ import (
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/fixtures"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/monitor"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/fixtures"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/monitor"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 func TestE2E_Monitor_SSE_MINED_PromotesOwnSentTx(t *testing.T) {

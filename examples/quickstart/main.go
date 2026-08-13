@@ -23,7 +23,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/examples/internal/demoenv"
+	"github.com/galt-tr/go-arcade-toolbox/examples/internal/demoenv"
 )
 
 func main() {

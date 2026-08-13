@@ -16,6 +16,11 @@ practical consequence is stated loudly up front: **operational backup of the
 wallet database is a correctness requirement — there is no restore-from-seed.**
 See [operations](docs/operations.md).
 
+> **New here?** Read the [**Getting started guide**](GETTING_STARTED.md) — wallet
+> creation, baskets, dependencies, BRC-100, the public Arcade instances for each
+> network, and example applications. Building with a coding agent? Point it at
+> [**AGENTS.md**](AGENTS.md).
+
 ## Three sources of truth
 
 The toolbox composes three independent sources of truth; none is trusted to do
@@ -124,10 +129,16 @@ inventory. See [storage](docs/storage.md).
 
 ## Documentation
 
+- [**Getting started**](GETTING_STARTED.md) — the front door: wallet creation, baskets, dependencies, BRC-100, Arcade and the public instances per network, and example applications.
+- [**AGENTS.md**](AGENTS.md) — the same ground for coding agents: canonical wiring, API contracts, the traps, and verification commands.
 - [Architecture](docs/architecture.md) — the three sources of truth, package map, write-path and async status lifecycle, trust model, what was removed and why.
 - [Storage](docs/storage.md) — the `WalletStorageProvider` contract, multi-user model, the pluggable `utxostore`, Mode A/B, the spendability seam, and how to add a backend.
 - [Arcade integration](docs/arcade-integration.md) — status lifecycle, EF broadcast semantics, the SSE contract, and the reject→release reconciler.
+- [Reject→release vs unfail](docs/reject-release-vs-unfail.md) — why the automatic verified reconciler replaces manual unfail, and the guards that make it safe.
 - [High-throughput guide](docs/high-throughput-guide.md) — the fuel-pool workflow, config tuning, the **measured** throughput/durability tradeoff, and a failure-mode playbook.
+- [Application throughput playbook](docs/application-throughput-playbook.md) — the application author's companion: what limits you and in what order, and how to measure honestly.
+- [Rejection hardening audit](docs/rejection-hardening-audit.md) — every way a client can get a transaction rejected, and what the library can prevent or explain locally.
+- [Aerospike value review](docs/aerospike-value-review.md) — whether Mode B is earning its keep.
 - [Migration from go-wallet-toolbox](docs/migration-from-go-wallet-toolbox.md) — import-path rewrite, behavior deltas, dropped features, config migration.
 - [Operations](docs/operations.md) — **backup is a correctness requirement**, per-backend backup/restore, monitoring, and running the storage server.
 - [Benchmarks](docs/benchmarks/README.md) — the raw measured numbers.

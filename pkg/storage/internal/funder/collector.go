@@ -7,9 +7,9 @@ import (
 	"github.com/go-softwarelab/common/pkg/must"
 	"github.com/go-softwarelab/common/pkg/to"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/satoshi"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/txutils"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/txutils"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // changeOutputSize is the serialized byte length of one P2PKH change output;

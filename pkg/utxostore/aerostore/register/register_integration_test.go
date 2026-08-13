@@ -9,9 +9,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	_ "github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/aerostore/register"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	_ "github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/aerostore/register"
 )
 
 // TestRegister_OpenViaDSN proves the blank-import factory path: after importing

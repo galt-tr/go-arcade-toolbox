@@ -7,8 +7,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/mapping"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/mapping"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 func TestMapListCertificatesArgs_ShortCertificateTypeNoZeroPad(t *testing.T) {

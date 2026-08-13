@@ -9,12 +9,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/conformance"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/conformance"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // respendClock is a manual clock. The release path is gated on a grace period,
@@ -169,8 +169,9 @@ func respendFund(t *testing.T, p *storage.Provider, auth wdk.AuthID, sats uint64
 	return txid
 }
 
-func respendProcess(t *testing.T, p *storage.Provider, auth wdk.AuthID,
-	res *wdk.StorageCreateActionResult) string {
+func respendProcess(
+	t *testing.T, p *storage.Provider, auth wdk.AuthID, res *wdk.StorageCreateActionResult,
+) string {
 	t.Helper()
 	tx := conformance.BuildSignedTx(t, res)
 	txid := tx.TxID().String()

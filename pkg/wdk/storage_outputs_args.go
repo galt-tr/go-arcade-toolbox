@@ -1,8 +1,8 @@
 package wdk
 
 import (
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // ListOutputsArgs defines the query parameters for listing outputs

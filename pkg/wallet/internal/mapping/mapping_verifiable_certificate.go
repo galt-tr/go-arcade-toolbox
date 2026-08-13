@@ -8,7 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/go-softwarelab/common/pkg/to"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // MapVerifiableCertificateToCertificate is ported from go-wallet-toolbox (see upstream docs).

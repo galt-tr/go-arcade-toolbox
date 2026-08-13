@@ -8,12 +8,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/satoshi"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/memstore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/utxostoretest"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/memstore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/utxostoretest"
 )
 
 // testLogger returns a debug slog.Logger wired to the test log.

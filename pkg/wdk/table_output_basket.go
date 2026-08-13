@@ -3,7 +3,7 @@ package wdk
 import (
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // BasketConfiguration is a struct that defines the configuration of the output basket

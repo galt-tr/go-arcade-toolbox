@@ -4,8 +4,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/funder"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // This file defines the shared wire contract for the REST /storage/v1 remote

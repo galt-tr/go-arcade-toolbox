@@ -5,7 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // DefaultPendingSignActionsTTL defines the default time-to-live duration for pending sign action requests

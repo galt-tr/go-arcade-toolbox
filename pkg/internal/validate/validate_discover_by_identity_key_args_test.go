@@ -8,7 +8,7 @@ import (
 	"github.com/go-softwarelab/common/pkg/to"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/validate"
 )
 
 func validIdentityKey(t *testing.T) *ec.PublicKey {

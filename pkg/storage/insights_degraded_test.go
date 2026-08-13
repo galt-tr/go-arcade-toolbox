@@ -7,8 +7,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // errBalance is the failure a slow Balance surfaces once its budget is enforced.

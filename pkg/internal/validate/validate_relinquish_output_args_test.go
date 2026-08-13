@@ -6,9 +6,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/fixtures"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/fixtures"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 func TestValidRelinquishOutputArgs_Success(t *testing.T) {

@@ -18,8 +18,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // MonitoredStorage is everything the daemon needs from the storage layer. It is

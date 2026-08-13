@@ -8,7 +8,7 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	"github.com/go-softwarelab/common/pkg/seqerr"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/pending"
 )
 
 // AssembledTransaction wraps a transaction.Transaction assembled from a

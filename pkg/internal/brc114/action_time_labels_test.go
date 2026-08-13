@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/brc114"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/brc114"
 )
 
 func TestParseActionTimeLabels_NoTimeLabels(t *testing.T) {

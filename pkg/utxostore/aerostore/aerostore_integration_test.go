@@ -15,10 +15,10 @@ import (
 	as "github.com/aerospike/aerospike-client-go/v8"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/aerostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/utxostoretest"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/aerostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/utxostoretest"
 )
 
 var quietLogger = slog.New(slog.NewTextHandler(io.Discard, nil))

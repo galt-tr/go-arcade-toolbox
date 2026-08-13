@@ -10,7 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sse"
 )
 
 // SSE tuning shared by the tip and reorg streams. The transport plumbing itself

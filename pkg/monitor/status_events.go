@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/txtrace"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/txtrace"
 )
 
 // LastEventIDKey is the key_values key holding the SSE replay cursor across

@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // Migrate migrates a wallet storage database.

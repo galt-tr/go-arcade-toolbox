@@ -9,9 +9,9 @@ import (
 	"github.com/go-softwarelab/common/pkg/is"
 	"github.com/go-softwarelab/common/pkg/to"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/internal/managed"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/managed"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 var _ wdk.WalletStorage = (*WalletStorageManager)(nil)

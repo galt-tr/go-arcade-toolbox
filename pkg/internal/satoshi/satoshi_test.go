@@ -7,8 +7,8 @@ import (
 	"github.com/go-softwarelab/common/pkg/seq"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/satoshi"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 func TestAdd(t *testing.T) {

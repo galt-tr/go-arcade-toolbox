@@ -14,10 +14,10 @@ import (
 	// Registers the "pgx" database/sql driver used by the PostgreSQL engine.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqlkit"
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqltx"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqlkit"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // Engine selects the SQL dialect a [Store] speaks. One implementation drives

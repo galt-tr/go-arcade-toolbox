@@ -7,7 +7,7 @@ import (
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/brc29"
 )
 
 func TestBRC29AddressByRecipientCreation(t *testing.T) {

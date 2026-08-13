@@ -10,9 +10,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/sqlstore"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/sqlstore"
 )
 
 // TestClaimUsesPartialIndex is the regression guard for the partial-index

@@ -9,10 +9,10 @@ import (
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/assembler"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/fixtures/testusers"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/testabilities/tsgenerated"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/assembler"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/fixtures/testusers"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/testabilities/tsgenerated"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 func TestSequenceNumberDefaultsToMaxUint32(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"github.com/go-softwarelab/common/pkg/to"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // NOTE: Testabilities can modify user IDs, to match ID with database

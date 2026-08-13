@@ -11,8 +11,8 @@ import (
 	"github.com/go-softwarelab/common/pkg/to"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/fixtures/testusers"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/testabilities/testutils"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/fixtures/testusers"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/testabilities/testutils"
 )
 
 // CreateActionInputSource is ported from go-wallet-toolbox (see upstream docs).

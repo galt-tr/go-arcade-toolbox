@@ -9,7 +9,7 @@ import (
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // BytesToUTF8 converts bytes to a UTF-8 string, mimicking JavaScript's TextDecoder behavior.

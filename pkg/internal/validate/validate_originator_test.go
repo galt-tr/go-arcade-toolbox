@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/validate"
 )
 
 func TestValidateOriginator(t *testing.T) {

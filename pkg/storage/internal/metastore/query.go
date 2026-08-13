@@ -3,7 +3,7 @@ package metastore
 import (
 	"strings"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // inPlaceholders returns a comma-separated run of n '?' placeholders for an

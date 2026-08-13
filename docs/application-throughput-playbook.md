@@ -868,13 +868,13 @@ contend on the same handful of coins (`keeper.go:385-398`).
 
 ### 6.4 A note on the dedicated basket
 
-The [high-throughput guide's follow-up
-caveat](high-throughput-guide.md#follow-up-caveat-the-dedicated-fuel-basket) and
-the [benchmarks gap
-analysis](benchmarks/README.md#known-gap-a-dedicated-signable-fuel-basket-is-unreachable)
-say storage does not honour `Options.FuelShape`, so `FanOutFuel` mints ordinary
-change into `default`. **That text predates the implementation.** Storage now
-reads `FuelShape` on the create path — it sizes the fan-out outputs
+Older text in the [high-throughput
+guide](high-throughput-guide.md#the-dedicated-fuel-basket) and the [benchmarks
+gap analysis](benchmarks/README.md#closed-gap-the-dedicated-signable-fuel-basket)
+said storage does not honour `Options.FuelShape`, so `FanOutFuel` mints ordinary
+change into `default`. **That text predated the implementation and both documents
+have since been corrected.** Storage reads `FuelShape` on the create path — it
+sizes the fan-out outputs
 (`pkg/storage/create.go:97-102`), adds their value to the funding target
 (`:113-115`), resolves the fan-out's source basket (`:134`, `:455-467`) and
 emits them as shaped change into the pool or reserve basket (`:357`, `:381`).
@@ -1381,11 +1381,13 @@ Stated plainly, because you will meet them:
   building a very large pool from a single deep coin is latency-bound at
   startup — a bootstrap cost, not a throughput limit
   (`benchmarks/20260808-app-blast-end-to-end-aerospike-hybrid.md:146-150`).
-- **The library's own docs lag its code in places.** The dedicated-fuel-basket
-  caveat in the [high-throughput guide](high-throughput-guide.md#follow-up-caveat-the-dedicated-fuel-basket)
-  and the [benchmarks gap analysis](benchmarks/README.md#gap-analysis--path-to-1000-tps)
-  predate the `FuelShape` implementation in `pkg/storage/create.go`. When a doc
-  and the code disagree, read the code.
+- **Library docs can lag the code.** The dedicated-fuel-basket caveat in the
+  [high-throughput guide](high-throughput-guide.md#the-dedicated-fuel-basket) and
+  the [benchmarks gap analysis](benchmarks/README.md#closed-gap-the-dedicated-signable-fuel-basket)
+  once contradicted the `FuelShape` implementation in `pkg/storage/create.go`;
+  both have been corrected, and the dated benchmark reports still carry the
+  original wording as a record of the conditions each run was captured under.
+  When a doc and the code disagree, read the code.
 
 ## See also
 

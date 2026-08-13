@@ -19,7 +19,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // errClosed is returned by every method after Close.

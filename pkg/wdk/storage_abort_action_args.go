@@ -3,7 +3,7 @@ package wdk
 import (
 	"fmt"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // AbortActionArgs defines the arguments for aborting a wallet action.

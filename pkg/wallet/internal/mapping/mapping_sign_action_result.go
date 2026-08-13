@@ -7,8 +7,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/go-softwarelab/common/pkg/to"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/assembler"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/assembler"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // MapSignActionResultFromStorageResultsForNewTx is ported from go-wallet-toolbox (see upstream docs).

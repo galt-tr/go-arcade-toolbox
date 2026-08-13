@@ -12,8 +12,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction/template/p2pkh"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/arcade"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/headers"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/arcade"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/headers"
 )
 
 // arcadeRecord is a small builder for oracle-side fixtures.

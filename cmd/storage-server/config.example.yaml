@@ -6,7 +6,7 @@
 # file): STORAGE_HTTP_ADDRESS, STORAGE_SQLITE_PATH, STORAGE_POSTGRES_DSN,
 # STORAGE_IDENTITY_KEY, STORAGE_ARCADE_URL, STORAGE_CHAINTRACKS_URL.
 
-# BSV network: main | test | stn | teratestnet
+# BSV network: main | test | ttn | tstn
 network: test
 
 # REST server listen address.

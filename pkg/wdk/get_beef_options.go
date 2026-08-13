@@ -3,7 +3,7 @@ package wdk
 import (
 	"github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // StorageGetBeefOptions defines options to customize retrieval and filtering behavior for beef data from storage sources.

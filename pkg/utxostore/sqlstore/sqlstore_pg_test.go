@@ -10,10 +10,10 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/sqlstore"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/utxostoretest"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/sqlstore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/utxostoretest"
 )
 
 // newPostgresStore opens a migrated store on a fresh isolated schema of pg and

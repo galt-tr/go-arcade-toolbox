@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // The three PostgreSQL claim statements are the 1000-TPS hot path. They are

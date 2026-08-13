@@ -116,17 +116,22 @@ hybrid gains most from it — `ClaimExact` cuts the hybrid's `create` p50 from
    The keeper holds the operator's keys and runs **client-side**, not in the
    server monitor. See [`examples/highthroughput`](../examples/highthroughput).
 
-### Follow-up caveat: the dedicated fuel basket
+### The dedicated fuel basket
 
-The `ClaimExact` funding path is wired and benchmarked, but **provisioning a
-dedicated, wallet-signable pool basket through the public wallet API is not
-finished.** Storage does not yet honor `Options.FuelShape`, so `FanOutFuel`
-currently mints its outputs as ordinary change into the `default` basket rather
-than into a separate pool basket. The benchmarks size the pool in the `default`
-basket as a result, which is a faithful end-to-end exercise of `ClaimExact` but
-pays a per-op cost the dedicated basket would remove. Closing this — shaped change
-carrying derivation material into the pool basket — is a documented follow-up
-(see the gap analysis in [the benchmarks README](benchmarks/README.md)).
+Both halves of the fuel-pool workflow are wired: `ClaimExact` selects from the
+pool, and `FanOutFuel` provisions it. Storage honors `Options.FuelShape`
+(`pkg/storage/create.go:357-377`), minting `shape.Count` self-owned BRC-29 P2PKH
+coins of exactly `shape.Satoshis` each into `shape.Basket`. They are emitted
+through the same derivation and signing machinery as ordinary change, so they
+carry derivation material and are **wallet-signable**; the only differences are
+the exact per-output value and the destination basket, which is what makes them
+`ClaimExact`-selectable.
+
+> **Reading the 2026-08-07 benchmarks:** those runs predate this and size the
+> pool in the `default` basket, a measurement choice recorded in each report.
+> They remain a faithful end-to-end exercise of `ClaimExact`, but they pay a
+> per-op cost a dedicated pool basket removes — so treat their absolute numbers
+> as a floor for the denominated path, not a ceiling.
 
 ## Config tuning knobs
 

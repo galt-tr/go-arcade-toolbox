@@ -26,8 +26,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/transaction"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/examples/internal/demoenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/brc29"
+	"github.com/galt-tr/go-arcade-toolbox/examples/internal/demoenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/brc29"
 )
 
 // The external sender's key, and the per-payment BRC-29 derivation material the

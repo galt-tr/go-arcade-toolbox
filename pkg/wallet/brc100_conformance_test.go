@@ -9,10 +9,10 @@ import (
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/stretchr/testify/require"
 
-	brc100vectors "github.com/bsv-blockchain/go-arcade-toolbox/conformance/vectors/wallet/brc100"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/fixtures"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/testabilities"
+	brc100vectors "github.com/galt-tr/go-arcade-toolbox/conformance/vectors/wallet/brc100"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/fixtures"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/testabilities"
 )
 
 // BRC100Vector common vector shape for core coverage.

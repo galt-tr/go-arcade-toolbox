@@ -7,7 +7,7 @@ import (
 
 	"github.com/go-softwarelab/common/pkg/to"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/testhelper"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/testhelper"
 )
 
 // Test fixture constants ported from go-wallet-toolbox.

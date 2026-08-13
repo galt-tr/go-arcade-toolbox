@@ -13,7 +13,7 @@ import (
 	"github.com/aerospike/aerospike-client-go/v8/types"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/testenv"
+	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
 )
 
 // TestProbe_FilterExpressionCAS verifies the crux assumptions of the design

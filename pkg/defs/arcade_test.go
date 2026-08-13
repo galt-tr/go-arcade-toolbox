@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 func TestDefaultServicesConfigArcadeMainnet(t *testing.T) {
@@ -27,10 +27,22 @@ func TestDefaultServicesConfigArcadeTestnet(t *testing.T) {
 	cfg := defs.DefaultServicesConfig(defs.NetworkTestnet)
 
 	// then:
-	require.False(t, cfg.Arcade.Enabled)
+	require.True(t, cfg.Arcade.Enabled)
 
-	// and: URLs are empty off mainnet, so enabling without an explicit URL
-	// cannot silently hit mainnet (Validate forces an explicit URL)
+	// and: testnet resolves to its OWN public arcade host, never mainnet's — each
+	// network carries an explicit URL rather than inheriting a default.
+	require.Equal(t, defs.ArcadeTestnetURL, cfg.Arcade.URL)
+	require.Equal(t, "https://arcade-v2-testnet-us-1.bsvblockchain.tech", cfg.Arcade.EventsURL)
+	require.NotEqual(t, defs.ArcadeURL, cfg.Arcade.URL)
+}
+
+func TestDefaultServicesConfigArcadeUnknownNetwork(t *testing.T) {
+	// when: a chain nobody recognizes
+	cfg := defs.DefaultServicesConfig("mian")
+
+	// then: no endpoints at all, so a typo cannot inherit mainnet's arcade. This is
+	// the guard that used to be provided by testnet's empty URL.
+	require.False(t, cfg.Arcade.Enabled)
 	require.Empty(t, cfg.Arcade.URL)
 	require.Empty(t, cfg.Arcade.EventsURL)
 }

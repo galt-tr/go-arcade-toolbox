@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage"
 )
 
 // smokeConfig returns a self-contained SQLite config with the monitor disabled

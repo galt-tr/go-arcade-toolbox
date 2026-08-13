@@ -8,8 +8,8 @@ import (
 	"github.com/bsv-blockchain/go-sdk/script/interpreter"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/headers"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/headers"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // headersChainTracker adapts a [headers.Headers] source to go-sdk's

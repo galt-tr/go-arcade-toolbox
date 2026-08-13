@@ -6,9 +6,9 @@ import (
 	"github.com/go-softwarelab/common/pkg/to"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 func TestListOutputsArgs_Success(t *testing.T) {

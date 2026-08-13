@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqltx"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
 )
 
 func TestFromAndWith(t *testing.T) {

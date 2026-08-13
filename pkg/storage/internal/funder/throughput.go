@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/satoshi"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // maxExactClaim caps the closed-form fast-path count so the uint64→int

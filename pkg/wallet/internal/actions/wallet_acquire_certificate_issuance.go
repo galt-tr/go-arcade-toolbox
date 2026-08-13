@@ -16,10 +16,10 @@ import (
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 	"github.com/go-softwarelab/common/pkg/to"
 
-	walletcerts "github.com/bsv-blockchain/go-arcade-toolbox/pkg/certificates"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/mapping"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	walletcerts "github.com/galt-tr/go-arcade-toolbox/pkg/certificates"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/mapping"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 // PrepareIssuanceActionDataParams contains parameters for preparing the certificate issuance request

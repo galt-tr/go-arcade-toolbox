@@ -13,12 +13,11 @@
 // throughput/durability tradeoff (~575-646 TPS/node durable; 1379 TPS with
 // relaxed durability; scale-out or group-commit to exceed 1000 durably).
 //
-// FOLLOW-UP CAVEAT: a dedicated, wallet-signable fuel basket is not wired yet
-// (storage does not honor Options.FuelShape), so FanOutFuel currently mints its
-// outputs as ordinary change into the default basket rather than into a separate
-// pool basket. The denominated-pool funding path (ClaimExact) itself is wired
-// and benchmarked; provisioning that pool through the public wallet API is the
-// remaining piece. See the gap analysis in docs/benchmarks/README.md.
+// Both halves of the fuel-pool workflow are wired: FanOutFuel provisions the pool
+// and ClaimExact selects from it. Storage honors Options.FuelShape
+// (pkg/storage/create.go:357-377), minting shape.Count self-owned BRC-29 P2PKH
+// coins of exactly shape.Satoshis each into shape.Basket — wallet-signable,
+// because they carry derivation material like ordinary change.
 package main
 
 import (
@@ -26,11 +25,11 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/examples/internal/demoenv"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/fuelkeeper"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk/primitives"
+	"github.com/galt-tr/go-arcade-toolbox/examples/internal/demoenv"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/fuelkeeper"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
 )
 
 func main() {

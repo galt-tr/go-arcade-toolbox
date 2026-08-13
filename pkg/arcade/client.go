@@ -14,10 +14,10 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/go-softwarelab/common/pkg/must"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/txtrace"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sse"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/txtrace"
 )
 
 // defaultRetryAfter is used when Arcade replies 503 without a parsable

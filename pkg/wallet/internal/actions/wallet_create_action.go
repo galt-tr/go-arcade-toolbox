@@ -6,14 +6,14 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/wallet"
 
-	pkgerrors "github.com/bsv-blockchain/go-arcade-toolbox/pkg/errors"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/assembler"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/validate"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/mapping"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/party"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/wallet_opts"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	pkgerrors "github.com/galt-tr/go-arcade-toolbox/pkg/errors"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/assembler"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/validate"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/mapping"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/party"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/wallet_opts"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/pending"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // CreateAction is ported from go-wallet-toolbox (see upstream docs).

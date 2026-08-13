@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/assembler"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/assembler"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/pending"
 )
 
 func TestToAtomicBEEF_RemovesUnsignedTx(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 
 	"github.com/go-softwarelab/common/pkg/types"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // Standard structured logging keys.

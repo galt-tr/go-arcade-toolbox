@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/logging"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
 )
 
 // defaultLeaseTTL is used for a job whose TTL was not set via SetLeaseTTL.

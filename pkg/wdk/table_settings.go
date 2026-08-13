@@ -3,7 +3,7 @@ package wdk
 import (
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // TableSettings is a struct that holds the settings of the whole DB

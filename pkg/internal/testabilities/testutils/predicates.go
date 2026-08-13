@@ -1,6 +1,6 @@
 package testutils
 
-import "github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+import "github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 
 // ProvidedByYouCondition is ported from go-wallet-toolbox (see upstream docs).
 func ProvidedByYouCondition(p *wdk.StorageCreateTransactionSdkOutput) bool {

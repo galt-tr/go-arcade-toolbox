@@ -5,8 +5,8 @@ import (
 
 	"github.com/go-softwarelab/common/pkg/seq"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/internal/satoshi"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
 // Result is the outcome of a successful funding call: the coins the funder

@@ -166,7 +166,7 @@ registered today**, via a blank-import register package so a binary links the
 Aerospike client only when it opts in — no build tags:
 
 ```go
-import _ "github.com/bsv-blockchain/go-arcade-toolbox/pkg/utxostore/aerostore/register"
+import _ "github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/aerostore/register"
 // then:
 store, err := utxostore.Open(ctx, "aerospike://host:3000/namespace?set=utxos")
 ```

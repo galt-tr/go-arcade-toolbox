@@ -5,7 +5,7 @@ import (
 
 	"github.com/go-softwarelab/common/pkg/seq"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // NotDelayedProcessActionResult is ported from go-wallet-toolbox (see upstream docs).

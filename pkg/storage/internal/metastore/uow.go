@@ -3,8 +3,8 @@ package metastore
 import (
 	"context"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqlkit"
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sqltx"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqlkit"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
 )
 
 // Do runs fn inside a single transaction — the Unit of Work. It opens one

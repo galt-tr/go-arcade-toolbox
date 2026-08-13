@@ -8,9 +8,9 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/internal/sse"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/txtrace"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sse"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/txtrace"
 )
 
 const (

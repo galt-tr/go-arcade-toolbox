@@ -7,14 +7,14 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/storage/perfprovider"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/perfprovider"
 )
 
 // Config is the storage-server deployment configuration, loaded from a YAML
 // file (see config.example.yaml) with a few environment-variable overrides.
 type Config struct {
-	// Network is the BSV network: main | test | stn | teratestnet.
+	// Network is the BSV network: main | test | ttn | tstn.
 	Network string `yaml:"network"`
 	// HTTPAddress is the listen address for the REST server, e.g. ":8100".
 	HTTPAddress string `yaml:"http_address"`

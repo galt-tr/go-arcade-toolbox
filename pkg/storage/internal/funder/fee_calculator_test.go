@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/defs"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 )
 
 // TestFeeCalculatorPerBytePrecision tests that the fee calculator uses per-byte precision

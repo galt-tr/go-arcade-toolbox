@@ -10,9 +10,9 @@ import (
 	"github.com/bsv-blockchain/go-sdk/overlay/lookup"
 	sdk "github.com/bsv-blockchain/go-sdk/wallet"
 
-	wallet_settings_manager "github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/internal/wallet_settings_manager"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wallet/pending"
-	"github.com/bsv-blockchain/go-arcade-toolbox/pkg/wdk"
+	wallet_settings_manager "github.com/galt-tr/go-arcade-toolbox/pkg/wallet/internal/wallet_settings_manager"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wallet/pending"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
 // Opts is ported from go-wallet-toolbox (see upstream docs).
