@@ -1,4 +1,4 @@
-.PHONY: test test-integration test-conformance test-perf bench perf-report lint check-podman clean-containers
+.PHONY: test test-race test-integration test-conformance test-perf bench perf-report lint check-podman clean-containers
 
 # Run unit tests only (no build tags).
 # Guarded: `go test ./...` errors out on a module with zero packages, which
@@ -19,11 +19,35 @@ test-integration:
 	fi
 
 # Run conformance tests, a subset of the integration suite.
+#
+# The pattern is 'Conformance', NOT 'TestConformance'. Go's -run is an
+# unanchored regex per name segment, and the suites are called
+# TestProviderConformance_* / TestMemStoreConformance / TestAerostore_Conformance
+# — none of which contain the substring "TestConformance". This target used to
+# select exactly zero of them (verified: `-run TestConformance -v` printed no
+# RUN lines at all) while reporting ok for every package, so it looked like the
+# conformance suites were passing when they were never executed.
 test-conformance:
 	@if [ -z "$$(go list -tags integration ./... 2>/dev/null)" ]; then \
 		echo "no packages yet, skipping conformance tests"; \
 	else \
-		go test -tags integration -run 'TestConformance' ./...; \
+		go test -tags integration -run 'Conformance' ./...; \
+	fi
+
+# Run the unit tests under the race detector.
+#
+# This target did not exist, and its absence was load-bearing in the wrong
+# direction: docs/storage.md and utxostoretest/suite.go both state that the
+# conformance suites "run under -race", and nothing in the Makefile, CI or lint
+# config ever passed the flag. Every concurrency property in this module —
+# ClaimExclusivityConcurrent, contentionClaim, the reconciler's double-pass
+# guard — was therefore asserted without the detector that would catch the
+# memory races underneath them.
+test-race:
+	@if [ -z "$$(go list ./... 2>/dev/null)" ]; then \
+		echo "no packages yet, skipping race tests"; \
+	else \
+		go test -race ./...; \
 	fi
 
 # Run performance tests. Skips gracefully if test/perf doesn't exist yet.

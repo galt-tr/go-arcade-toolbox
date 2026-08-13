@@ -40,6 +40,14 @@ jobs:
       - name: Test
         run: make test
 
+      # The module's concurrency properties — utxostore claim exclusivity, the
+      # provider's concurrent CreateAction contention suite, the reconciler's
+      # double-pass guard — are the ones downstream wallets rely on for "two
+      # workers can never claim the same coin". They were being asserted without
+      # the race detector, in a repo whose own docs said otherwise.
+      - name: Race
+        run: make test-race
+
       - name: Vet
         if: steps.packages.outputs.has_packages == 'true'
         run: go vet ./...

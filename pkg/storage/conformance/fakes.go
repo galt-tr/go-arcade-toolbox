@@ -13,15 +13,23 @@ import (
 
 // FakeOracle is a minimal, controllable [arcade.TxOracle] for provider
 // conformance harnesses. The zero value accepts every broadcast
-// (arcade.StatusReceived); set BroadcastFunc to simulate a different outcome
-// (rejection, backpressure, an opaque error). Safe for concurrent use.
+// (arcade.StatusReceived) and has a verdict for nothing; set BroadcastFunc to
+// simulate a different broadcast outcome (rejection, backpressure, an opaque
+// error) and ScriptTx to give GetTx an answer. Safe for concurrent use.
 type FakeOracle struct {
 	// BroadcastFunc overrides Broadcast's response; nil accepts every
 	// broadcast.
 	BroadcastFunc func(ctx context.Context, txid string, ef []byte) (*arcade.BroadcastResult, error)
 
-	mu    sync.Mutex
-	calls int
+	// GetTxFunc overrides GetTx entirely. Prefer ScriptTx unless a test needs to
+	// simulate the oracle being unreachable, which is its own branch: "we could
+	// not ask" is not the same answer as "no such transaction".
+	GetTxFunc func(ctx context.Context, txid string) (*arcade.TxRecord, error)
+
+	mu      sync.Mutex
+	calls   int
+	getCall int
+	scripts map[string]arcade.TxRecord
 }
 
 var _ arcade.TxOracle = (*FakeOracle)(nil)
@@ -44,9 +52,65 @@ func (f *FakeOracle) Calls() int {
 	return f.calls
 }
 
-// GetTx implements [arcade.TxOracle]; the fake never has a verdict.
-func (f *FakeOracle) GetTx(context.Context, string) (*arcade.TxRecord, error) {
-	return nil, arcade.ErrTxNotFound
+// ScriptTx gives GetTx a verdict for one transaction, replacing any previous
+// one. Safe to call while the provider is running.
+//
+// Without this the fake could only ever answer ErrTxNotFound, which made the
+// exported harness unable to express the single most important thing a
+// consumer has to survive: arcade REJECTING a transaction. The reconciler's
+// whole release path keys off that verdict, so a rejection could not be tested
+// through the public seam at all.
+func (f *FakeOracle) ScriptTx(txid string, status arcade.Status, opts ...func(*arcade.TxRecord)) {
+	rec := arcade.TxRecord{TxID: txid, Status: status}
+	for _, o := range opts {
+		o(&rec)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.scripts == nil {
+		f.scripts = map[string]arcade.TxRecord{}
+	}
+	f.scripts[txid] = rec
+}
+
+// WithExtraInfo attaches arcade's reason text to a scripted record. The
+// reconciler parses this for spend conflicts, so its exact shape matters — see
+// the UTXO_SPENT forms in spend_conflict.go.
+func WithExtraInfo(info string) func(*arcade.TxRecord) {
+	return func(r *arcade.TxRecord) { r.ExtraInfo = info }
+}
+
+// WithCompeting attaches the competing txids arcade reports for a double spend.
+func WithCompeting(txids ...string) func(*arcade.TxRecord) {
+	return func(r *arcade.TxRecord) { r.CompetingTxs = txids }
+}
+
+// GetTxCalls reports how many times GetTx has been invoked so far.
+func (f *FakeOracle) GetTxCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCall
+}
+
+// GetTx implements [arcade.TxOracle]. It answers from ScriptTx, and reports
+// ErrTxNotFound for anything unscripted.
+func (f *FakeOracle) GetTx(ctx context.Context, txid string) (*arcade.TxRecord, error) {
+	f.mu.Lock()
+	f.getCall++
+	get, rec, ok := f.GetTxFunc, arcade.TxRecord{}, false
+	if f.scripts != nil {
+		rec, ok = f.scripts[txid]
+	}
+	f.mu.Unlock()
+
+	if get != nil {
+		return get(ctx, txid)
+	}
+	if !ok {
+		return nil, arcade.ErrTxNotFound
+	}
+	out := rec // copy: callers must not be able to mutate the script
+	return &out, nil
 }
 
 // StreamStatus implements [arcade.TxOracle] as a no-op.
