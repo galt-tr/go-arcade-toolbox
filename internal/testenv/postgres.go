@@ -76,6 +76,33 @@ func postgresConfigFromEnv() postgresConfig {
 	}
 }
 
+// PostgresOption customizes the container StartPostgres launches.
+type PostgresOption func(*postgresOptions)
+
+type postgresOptions struct {
+	serverArgs []string
+}
+
+// WithPostgresServerArgs appends `-c key=value` server flags to the postgres
+// command line.
+//
+// It exists for settings that CANNOT be changed after start-up: max_connections
+// is the motivating one. The image's default is 100, so any test opening a
+// larger pool exhausts it and fails with connection resets rather than with
+// whatever it was actually measuring — a perf sweep at 128 workers reads as a
+// toolbox failure when it is really the database refusing to talk. ALTER SYSTEM
+// cannot fix that from inside the test: max_connections needs a restart, not a
+// reload, so it has to be set here or not at all.
+//
+//	testenv.StartPostgres(t, testenv.WithPostgresServerArgs("max_connections=400"))
+func WithPostgresServerArgs(args ...string) PostgresOption {
+	return func(o *postgresOptions) {
+		for _, a := range args {
+			o.serverArgs = append(o.serverArgs, "-c", a)
+		}
+	}
+}
+
 // StartPostgres starts a Postgres container (see postgresImage for the
 // pinned tag; override with TESTENV_POSTGRES_IMAGE), waits until it accepts
 // connections and answers a real query, and registers its teardown in
@@ -87,9 +114,14 @@ func postgresConfigFromEnv() postgresConfig {
 // Cleanup is MANDATORY here (not merely best-effort): under rootless podman,
 // Configure disables ryuk (see package doc), so that t.Cleanup call is the
 // only thing that stops the container from outliving the test process.
-func StartPostgres(t *testing.T) *PostgresContainer {
+func StartPostgres(t *testing.T, opts ...PostgresOption) *PostgresContainer {
 	t.Helper()
 	RequireRuntime(t)
+
+	var o postgresOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 
 	cfg := postgresConfigFromEnv()
 
@@ -112,6 +144,10 @@ func StartPostgres(t *testing.T) *PostgresContainer {
 		// 60-second deadline that silently caps any longer inner timeout.
 		// See the readinessBudget doc in container.go.
 		testcontainers.WithWaitStrategyAndDeadline(readinessBudget, waitStrategy),
+		// Appended to the image's own entrypoint command, so the defaults the
+		// entrypoint sets (initdb, socket dir, …) are preserved and only these
+		// flags are added. No args means no change to the image's behavior.
+		testcontainers.WithCmdArgs(o.serverArgs...),
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

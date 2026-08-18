@@ -1,5 +1,19 @@
 # Benchmarks — write-path throughput
 
+> **2026-08-18 — the optimistic create ceiling is ~1,118 TPS, durable.** With a
+> 100,000-coin pool, one input, one output and NO change output, an instant 202
+> and no monitor daemon, PostgreSQL Mode A sustains **1,118 TPS at 384 workers**
+> with `synchronous_commit=on` — roughly double the realistic-payment figure
+> below, on a curve that turns over at 512 workers. Zero contention retries at
+> every worker count. Per-stage: `sign_process` (56.7 ms p50) costs about twice
+> `create` (29.2 ms), which contradicts the gap analysis further down naming the
+> create phase the wall. Two caveats worth reading before quoting the number:
+> PostgreSQL's default `max_connections=100` caps every run above 64 workers and
+> presents as connection errors, and a 1,000,000-coin pool measures ~5% lower
+> with double the p99. Full report:
+> [20260818-optimistic-create-ceiling.md](20260818-optimistic-create-ceiling.md).
+
+
 > **Task 28 update — the per-op `COUNT(*)` is gone; the wall is now the durable
 > commit.** `CreateAction` no longer runs the change-basket `SELECT COUNT(*)`
 > on the throughput hot path (it is skipped entirely under the fuel-pool
