@@ -6,6 +6,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqlkit"
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
@@ -60,7 +62,42 @@ type claimedRow struct {
 // claimer that is reserving it in the same atomic statement; either way the
 // coin is not orphaned, so an empty set is reported as "none" (nil), never
 // ErrContention. See the package doc, "Design notes".
+//
+// Retry mirrors [Store.withTx], and for the same reason. Claims used to be the
+// one operation in this package that ran with no lock-error retry at all: every
+// mutation goes through withTx -> [sqlkit.WithRetry], while a claim went
+// straight to the pool. A 40001/40P01/55P03 on the hot path therefore surfaced
+// raw to the funder, which retries only on [utxostore.ErrContention] — an error
+// this backend never returns (see the package doc). Mode A masked it, because
+// the metastore's own retry wraps the whole unit of work; a standalone store had
+// nothing.
+//
+// A claim is a single atomic statement, so a failed attempt committed nothing
+// and re-running it cannot double-allocate: either the UPDATE ... RETURNING
+// committed and the coin is reserved, or it did not and the coin is untouched.
+// That is what makes the retry safe here without a transaction.
+//
+// Under an ambient transaction the retry is deliberately skipped: the enclosing
+// tx is already poisoned by the lock error and only the owner can restart it.
 func (s *Store) runClaim(ctx context.Context, query string, args ...any) ([]claimedRow, error) {
+	if _, ambient := sqltx.From(ctx); ambient {
+		return s.claimOnce(ctx, query, args...)
+	}
+	var out []claimedRow
+	err := sqlkit.WithRetry(ctx, func() error {
+		var err error
+		out, err = s.claimOnce(ctx, query, args...)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// claimOnce is one attempt of a claim statement: execute and scan the RETURNING
+// set. It holds no retry of its own so [Store.runClaim] owns that policy.
+func (s *Store) claimOnce(ctx context.Context, query string, args ...any) ([]claimedRow, error) {
 	rows, err := s.execer(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -75,7 +112,10 @@ func (s *Store) runClaim(ctx context.Context, query string, args ...any) ([]clai
 		}
 		out = append(out, claimedRow{u: u, seq: seq})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ClaimSmallestSufficient implements [utxostore.Store]: the true minimum

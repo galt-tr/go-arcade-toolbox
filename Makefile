@@ -1,4 +1,4 @@
-.PHONY: test test-race test-integration test-conformance test-perf bench perf-report lint check-podman clean-containers
+.PHONY: test test-race test-integration test-integration-race test-conformance test-perf bench perf-report lint check-podman clean-containers
 
 # Run unit tests only (no build tags).
 # Guarded: `go test ./...` errors out on a module with zero packages, which
@@ -16,6 +16,32 @@ test-integration:
 		echo "no packages yet, skipping go test -tags integration"; \
 	else \
 		go test -tags integration ./...; \
+	fi
+
+# Run integration tests under the race detector.
+#
+# `test-race` closed half of this gap and left the other half open: it is
+# `go test -race ./...`, which is UNTAGGED, so it never reaches a single test
+# that touches a real backend. Every place this module actually takes a row
+# lock is behind the integration tag —
+#
+#   conformance_pg_test.go             the provider suite over PostgreSQL Mode A
+#   metastore_pg_test.go               FOR UPDATE SKIP LOCKED disjointness
+#   funder_integration_test.go         16 concurrent funders
+#   reconciler_integration_test.go     6 racing reject->release passes
+#   aerostore/race_promote_*.go        Promote vs Release, 60 iterations
+#
+# — and every one of them asserted its concurrency property with the detector
+# switched off. The in-memory suites were the only ones ever race-checked, and
+# they are the ones least likely to race.
+#
+# Kept separate from `test-integration` because -race is materially slower and
+# the non-race target stays useful for a quick local loop.
+test-integration-race:
+	@if [ -z "$$(go list -tags integration ./... 2>/dev/null)" ]; then \
+		echo "no packages yet, skipping race integration tests"; \
+	else \
+		go test -race -tags integration ./...; \
 	fi
 
 # Run conformance tests, a subset of the integration suite.

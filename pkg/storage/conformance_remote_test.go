@@ -33,6 +33,18 @@ func TestProviderConformance_RemoteHTTP(t *testing.T) {
 		conformance.WithRejectingHeadersProvider(func(t *testing.T) wdk.WalletStorageProvider {
 			return newRemoteProvider(t, conformance.RejectingHeaders())
 		}),
+		// Deliberately NO WithRejectReleaseEnv: RejectRelease and
+		// ConcurrentLifecycle skip here, and that is the correct outcome rather
+		// than an omission.
+		//
+		// Reconciliation is not a wire operation. /storage/v1 exposes 21 routes,
+		// one per WalletStorageProvider method, and the reconciler is on none of
+		// them — VerifyAndReleaseSuspects, DrainOutbox and SweepStaleReservations
+		// are driven by the monitor daemon running IN-PROCESS with the Provider,
+		// not by a remote client. A storage.Client therefore cannot satisfy the
+		// suite's reconcilable seam, and wiring an env for it would only prove
+		// that the server-side provider works — which the direct SQLite run
+		// already proves.
 	)
 }
 

@@ -210,7 +210,17 @@ running the server.
 ## Adding a backend
 
 There are two conformance suites, at two layers. Both hand your constructor a
-fresh, isolated instance per subtest and run under `-race`.
+fresh, isolated instance per subtest, run their subtests in **parallel** (each
+gets its own schema/file/set, so concurrent unrelated transactions are part of
+what is tested), and run under `-race` — including the container-backed legs, via
+`make test-integration-race`.
+
+Scale any of the concurrency subtests for a soak run with `ARCADE_STRESS`, which
+multiplies worker and round counts without changing the code under test:
+
+```console
+$ ARCADE_STRESS=20 go test -race -tags integration -run Conformance ./...
+```
 
 **A new UTXO backend** implements `utxostore.Store` and runs:
 
@@ -245,3 +255,34 @@ the flag fails loudly rather than silently under-testing itself.
 `conformance_sqlite_test.go`, `conformance_pg_test.go`, and
 `conformance_remote_test.go` (which drives the REST client end to end) are worked
 examples.
+
+**Supply `WithRejectReleaseEnv` too.** Two subtests — `RejectRelease` and
+`ConcurrentLifecycle` — cover the reject→release reconciler: that a verified
+rejection returns its inputs to the pool, that a rejection the network revises
+returns nothing, and that both hold while other workers concurrently fund from
+the same basket. They need more than the provider, because two of the three
+things they drive are not reachable through `wdk.WalletStorageProvider`:
+
+```go
+conformance.WithRejectReleaseEnv(func(t *testing.T) conformance.RejectReleaseEnv {
+	clock := newTestClock() // pass clock.Now to metastore/utxostore/storage WithClock
+	oracle := &conformance.FakeOracle{}
+	p := newMyProviderClocked(t, oracle, clock) // MIGRATED by you, not the suite
+	return conformance.RejectReleaseEnv{Provider: p, Oracle: oracle, Advance: clock.Advance}
+})
+```
+
+The oracle is needed because the subtests must script arcade's verdict for a
+txid that does not exist until signing; the clock is needed because the release
+is gated on a grace period, and the alternative is a test that sleeps for it.
+Every backend can supply both — `metastore`, `memstore`, `sqlstore` and
+`aerostore` all expose `WithClock`.
+
+Omit the option and both subtests **skip rather than fail**, on the same
+principle as `WithRejectingHeadersProvider`. That is the right answer for a
+provider that genuinely cannot reconcile — `storage.Client` cannot, because
+`/storage/v1` has no reconciler route: the monitor runs in-process with the
+`Provider`. It is the wrong answer for a real backend that just has not wired it,
+so check the skip lines rather than the summary. This property went unproven for
+four backends while the suite reported green, which is the whole reason it is now
+a suite subtest rather than one backend's test file.

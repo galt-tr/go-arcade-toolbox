@@ -35,5 +35,9 @@ jobs:
       - name: Verify Docker is available
         run: docker version
 
-      - name: Run integration tests
-        run: make test-integration
+      - name: Run integration tests (race detector)
+        # -race, not the plain target: every concurrency property this module
+        # claims — SKIP LOCKED disjointness, concurrent funding, the reconciler's
+        # exactly-once release — lives behind the integration tag, so the plain
+        # `make test-race` in ci.yml never sees any of them.
+        run: make test-integration-race

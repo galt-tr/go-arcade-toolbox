@@ -3,6 +3,7 @@ package conformance
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -13,6 +14,34 @@ import (
 type config struct {
 	approximateSelection bool
 	rejectingProvider    func(t *testing.T) wdk.WalletStorageProvider
+	rrEnv                func(t *testing.T) RejectReleaseEnv
+}
+
+// RejectReleaseEnv is everything the reject->release and concurrent-lifecycle
+// subtests need beyond the provider itself.
+//
+// Two of the three cannot be reached through [wdk.WalletStorageProvider] and
+// that is why this type exists rather than another bare constructor:
+//
+//   - Oracle, because the subtests must make arcade reject a specific
+//     transaction, and each backend builds its own fake inside its constructor.
+//   - Advance, because the release path is gated on a grace period. Without a
+//     movable clock the only alternative is a test that sleeps for the grace,
+//     and a test that sleeps is a test someone deletes.
+//
+// Every backend can supply all three: metastore, memstore, sqlstore and
+// aerostore each expose WithClock, so the clock reaches all three layers that
+// stamp time.
+type RejectReleaseEnv struct {
+	// Provider is a fresh, MIGRATED provider. Unlike the suite's plain
+	// constructor, the suite does not migrate this one — the builder owns it,
+	// because a backend may need the clock installed before migration.
+	Provider wdk.WalletStorageProvider
+	// Oracle is the fake the provider was built with, so a subtest can script
+	// the verdict arcade will give for a txid it does not know in advance.
+	Oracle *FakeOracle
+	// Advance moves the provider's clock forward across all layers.
+	Advance func(time.Duration)
 }
 
 // Option configures [RunProviderSuite].
@@ -45,6 +74,22 @@ func WithRejectingHeadersProvider(newProvider func(t *testing.T) wdk.WalletStora
 	return func(c *config) { c.rejectingProvider = newProvider }
 }
 
+// WithRejectReleaseEnv registers a builder for [RejectReleaseEnv], enabling the
+// RejectRelease and ConcurrentLifecycle subtests. Without it both skip rather
+// than fail, following the same precedent as
+// [WithRejectingHeadersProvider] — a backend is never failed for a capability
+// the suite cannot reach through the storage interface.
+//
+// Skipping is the right outcome for a genuinely-unreconcilable provider (the
+// REST Client cannot: /storage/v1 exposes no reconciler route, because the
+// monitor runs in-process with the Provider). It is the WRONG outcome for a real
+// backend that simply has not wired the option, and the skip message says so —
+// a skip nobody reads is how reject->release went unproven for four backends
+// while the suite reported green.
+func WithRejectReleaseEnv(build func(t *testing.T) RejectReleaseEnv) Option {
+	return func(c *config) { c.rrEnv = build }
+}
+
 // RunProviderSuite runs the full provider-level conformance suite against
 // providers built by newProvider. Each subtest calls newProvider exactly once
 // and gets a FRESH [storage.Provider] over an isolated metastore/utxostore
@@ -73,17 +118,21 @@ func RunProviderSuite(t *testing.T, newProvider func(t *testing.T) wdk.WalletSto
 		{"AbortRestores", s.abortRestores},
 		{"MultiUserIsolation", s.multiUserIsolation},
 		{"ListAndBalanceConsistency", s.listAndBalanceConsistency},
-
-		// TODO(M4 - RejectRelease): a verified on-chain rejection (a final,
-		// signed 4xx/definitive reject from the tx oracle) must release its
-		// reservation's still-unspent inputs and the suspectFailed known-tx
-		// must eventually be swept. storage.Provider.ProcessAction's reject
-		// path deliberately leaves rejected-tx inputs reserved today — see
-		// TestProcessAction_Reject in pkg/storage/process_test.go — because
-		// that release is the M4 reconciler's job, which does not exist yet.
-		// Wire a "RejectRelease" subtest in here once it lands.
+		{"RejectRelease", s.rejectRelease},
+		{"ConcurrentLifecycle", s.concurrentLifecycle},
 	} {
-		t.Run(tc.name, tc.fn)
+		t.Run(tc.name, func(t *testing.T) {
+			// Each subtest calls newProvider exactly once and gets a provider
+			// over its own isolated metastore/utxostore pair, so they share no
+			// state and parallelism is safe.
+			//
+			// It is also deliberate load: run serially, one shared PostgreSQL
+			// container is never asked to serve concurrent unrelated
+			// transactions, which is the condition this storage layer claims to
+			// be correct under.
+			t.Parallel()
+			tc.fn(t)
+		})
 	}
 }
 
@@ -109,6 +158,18 @@ func (s *suite) freshProviderFrom(t *testing.T, newProvider func(t *testing.T) w
 	_, err := p.Migrate(context.Background(), "conformance", "conformance-identity-key")
 	require.NoError(t, err)
 	return p
+}
+
+// freshEnv builds one [RejectReleaseEnv] for a subtest. The builder is
+// responsible for migrating, so a backend can install its clock first; the
+// suite only checks that it did.
+func (s *suite) freshEnv(t *testing.T) RejectReleaseEnv {
+	t.Helper()
+	env := s.cfg.rrEnv(t)
+	require.NotNil(t, env.Provider, "RejectReleaseEnv.Provider must be set")
+	require.NotNil(t, env.Oracle, "RejectReleaseEnv.Oracle must be set")
+	require.NotNil(t, env.Advance, "RejectReleaseEnv.Advance must be set")
+	return env
 }
 
 // newAuth provisions a fresh user on p via FindOrInsertUser and returns its

@@ -314,11 +314,28 @@ Against this repo, if you changed it:
 
 ```sh
 make test          # go test ./...
-make test-race     # go test -race ./...
+make test-race     # go test -race ./...            (UNTAGGED only)
 make lint          # golangci-lint
 go build ./examples/...
 go run ./examples/quickstart         # end-to-end, no external services
 go test ./pkg/wallet/... -run BRC100Conformance -v
+```
+
+If you touched storage, locking, or the reconciler, `make test-race` is not
+enough — it is untagged, so it never reaches a real backend. Every row lock this
+module takes is behind the integration tag:
+
+```sh
+make check-podman            # export DOCKER_HOST as it prints
+make test-integration-race   # go test -race -tags integration ./...
+```
+
+Soak the concurrency subtests when changing claim, spend or release paths.
+`ARCADE_STRESS` multiplies worker and round counts without changing the code
+under test (see `internal/stress`):
+
+```sh
+ARCADE_STRESS=20 go test -race -run 'Concurrent|Contention|Racing|Lifecycle' ./...
 ```
 
 **Check a live arcade before blaming your code:**

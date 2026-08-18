@@ -12,9 +12,10 @@ import (
 )
 
 // maxLockRetries bounds the retry loop for lock/deadlock/serialization errors on
-// the guarded (non-claim) mutations. It is single-sourced here because, in Mode
-// A, the outer transaction owner's retry governs both stores' statement chains —
-// the two must agree on how many times and how long to wait.
+// every statement path — the guarded mutations and the claims. It is
+// single-sourced here because, in Mode A, the outer transaction owner's retry
+// governs both stores' statement chains — the two must agree on how many times
+// and how long to wait.
 const maxLockRetries = 3
 
 // WithRetry runs fn, retrying up to maxLockRetries times with exponential
