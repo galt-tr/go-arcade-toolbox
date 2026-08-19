@@ -99,6 +99,11 @@ type UTXO struct {
 	// Frozen marks an explicit hold: invisible to claims, refuses Spend.
 	Frozen bool
 
+	// Pinned marks the committed pre-broadcast state: a broadcastable
+	// transaction spends this coin, so no janitor may free it. Always implies
+	// ReservedBy != "" and SpentBy == nil. See [Store.Pin].
+	Pinned bool
+
 	// CreatedAt is when the coin was minted into the store.
 	CreatedAt time.Time
 }

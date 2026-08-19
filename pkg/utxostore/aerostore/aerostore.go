@@ -26,7 +26,11 @@
 //   - invKey ("{userId}|{basket}") is present until a coin is spent (or
 //     removed); it backs Balance and per-(user, basket) scans.
 //   - resBy/resAt mark a reservation (kept as provenance after a spend);
-//     spentBy marks a recorded spend; frozen marks an explicit hold.
+//     spentBy marks a recorded spend; frozen marks an explicit hold; pinned
+//     marks the committed pre-broadcast state (a signed transaction spends this
+//     coin), which makes the reservation unsweepable — see [utxostore.Store.Pin].
+//     A pin never changes claimability: a pinned coin is reserved, so its
+//     claimKey is already gone.
 //   - bucket = floor(log2(sats)) gives 64 best-fit buckets. A denominated pool
 //     shares one bucket, so ClaimExact is a pure index hit; arbitrary amounts
 //     are served by walking buckets (smallest- or largest-first) with a bounded
@@ -74,6 +78,7 @@ const (
 	binResAt    = "resAt"
 	binSpentBy  = "spentBy"
 	binFrozen   = "frozen"
+	binPinned   = "pinned"
 	binCreated  = "createdAt"
 	binClaimKey = "claimKey"
 	binInvKey   = "invKey"
@@ -475,6 +480,9 @@ func recordToUTXO(rec *as.Record) (*utxostore.UTXO, error) {
 	}
 	if f, ok := asInt64(b[binFrozen]); ok && f != 0 {
 		u.Frozen = true
+	}
+	if p, ok := asInt64(b[binPinned]); ok && p != 0 {
+		u.Pinned = true
 	}
 	return u, nil
 }

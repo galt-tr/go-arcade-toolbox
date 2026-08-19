@@ -253,8 +253,9 @@ func collect(rows []claimedRow) []*utxostore.UTXO {
 	return out
 }
 
-// ReleaseReservation implements [utxostore.Store]: frees every unspent row held
-// by (userID, reservation). Idempotent; never touches spent rows.
+// ReleaseReservation implements [utxostore.Store]: frees every unspent,
+// UNPINNED row held by (userID, reservation). Idempotent; never touches spent
+// rows, and never frees the inputs of an in-flight send (see [Store.Pin]).
 func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservation string) (int, error) {
 	if s.isClosed() {
 		return 0, errClosed
@@ -267,7 +268,7 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 	err := s.withTx(ctx, func(x queryer) error {
 		res, err := x.ExecContext(ctx, s.rebind(
 			`UPDATE utxos SET reserved_by=NULL, reserved_at=NULL
-			 WHERE user_id=? AND reserved_by=? AND spent_by IS NULL`),
+			 WHERE user_id=? AND reserved_by=? AND spent_by IS NULL AND `+notPinned),
 			userID, reservation)
 		if err != nil {
 			return err
@@ -288,6 +289,9 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 // ReleaseOutpoints implements [utxostore.Store]: frees the listed rows iff each
 // is currently reserved by exactly this reservation and unspent. Guard
 // mismatches, unreserved/spent rows, and missing outpoints are per-item skips.
+// A matching token OVERRIDES the pin (and clears it): the callers are the
+// funder, whose rows are never pinned, and the reconciler's verified-dead
+// release, which must be able to reclaim a transaction proven never to live.
 func (s *Store) ReleaseOutpoints(ctx context.Context, reservation string, ops []utxostore.Outpoint) error {
 	if s.isClosed() {
 		return errClosed
@@ -299,7 +303,7 @@ func (s *Store) ReleaseOutpoints(ctx context.Context, reservation string, ops []
 	return s.withTx(ctx, func(x queryer) error {
 		for _, op := range ops {
 			if _, err := x.ExecContext(ctx, s.rebind(
-				`UPDATE utxos SET reserved_by=NULL, reserved_at=NULL
+				`UPDATE utxos SET reserved_by=NULL, reserved_at=NULL, pinned=`+s.boolLit(false)+`
 				 WHERE txid=? AND vout=? AND reserved_by=? AND spent_by IS NULL`),
 				op.TxID[:], op.Vout, reservation); err != nil {
 				return err
@@ -309,9 +313,98 @@ func (s *Store) ReleaseOutpoints(ctx context.Context, reservation string, ops []
 	})
 }
 
+// Pin implements [utxostore.Store]: marks every unspent row held by (userID,
+// reservation) as pinned and returns how many it NEWLY pinned. The
+// already-pinned guard in the WHERE clause is what makes the count idempotent —
+// a replay updates no rows and reports 0.
+func (s *Store) Pin(ctx context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(ctx, userID, reservation, true)
+}
+
+// Unpin implements [utxostore.Store]: clears the pin on every unspent row held
+// by (userID, reservation), leaving them RESERVED. Idempotent.
+func (s *Store) Unpin(ctx context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(ctx, userID, reservation, false)
+}
+
+// setPinned drives Pin/Unpin: one guarded UPDATE over the reservation's live
+// (unspent) membership, whose RowsAffected is the count of rows that actually
+// changed. Requiring reserved_by=? is what upholds the invariant — a pin can
+// only ever be written onto a reserved, unspent row.
+func (s *Store) setPinned(ctx context.Context, userID int64, reservation string, pinned bool) (int, error) {
+	if s.isClosed() {
+		return 0, errClosed
+	}
+	if reservation == "" {
+		return 0, errors.New("sqlstore: reservation must be non-empty")
+	}
+
+	// Guard on the CURRENT pin state so only real transitions are counted:
+	// pinning skips already-pinned rows, unpinning skips unpinned ones.
+	guard := notPinned
+	if !pinned {
+		guard = "NOT (" + guard + ")"
+	}
+
+	var changed int
+	err := s.withTx(ctx, func(x queryer) error {
+		res, err := x.ExecContext(ctx, s.rebind(
+			`UPDATE utxos SET pinned=`+s.boolLit(pinned)+`
+			 WHERE user_id=? AND reserved_by=? AND spent_by IS NULL AND `+guard),
+			userID, reservation)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = int(n)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return changed, nil
+}
+
+// staleReservationsSQL is the stale-reservation statement, bound to two
+// parameters: the staleness cutoff and the group limit, in that order.
+//
+// It is a method rather than an inlined string for the same reason the three
+// claim statements are package constants: so a test can plan the EXACT
+// production text. The stale scan's predicates and idx_utxos_reserved_at's
+// partial WHERE must stay in step — SQLite matches partial indexes by predicate
+// text — and TestStaleScanIsIndexDriven fails if they ever drift far enough to
+// cost the sweep a table scan.
+//
+// The subquery picks the oldest `limit` stale reservation groups; the outer
+// join expands each to its unspent, unpinned reserved outpoints, ordered so a
+// group's rows are contiguous and dated by their minimum reserved_at.
+func (s *Store) staleReservationsSQL() string {
+	return s.rebind(`
+		SELECT u.user_id, u.reserved_by, g.oldest, u.txid, u.vout
+		FROM utxos u
+		JOIN (
+			SELECT user_id, reserved_by, MIN(reserved_at) AS oldest, MIN(seq) AS min_seq
+			FROM utxos
+			WHERE reserved_by IS NOT NULL AND spent_by IS NULL AND ` + notPinned + `
+			GROUP BY user_id, reserved_by
+			HAVING MIN(reserved_at) < ?
+			ORDER BY oldest, min_seq
+			LIMIT ?
+		) g ON u.user_id = g.user_id AND u.reserved_by = g.reserved_by
+		WHERE u.reserved_by IS NOT NULL AND u.spent_by IS NULL AND ` + notPinnedOn("u") + `
+		ORDER BY g.oldest, g.min_seq, u.seq`)
+}
+
 // FindStaleReservations implements [utxostore.Store]: reservations (grouped by
-// user and token) of unspent reserved rows whose OLDEST reserved_at is before
-// olderThan, oldest first, up to limit reservations.
+// user and token) of unspent, UNPINNED reserved rows whose OLDEST reserved_at
+// is before olderThan, oldest first, up to limit reservations. Pinned rows are
+// excluded from both the grouping and the expansion, so a returned ref can
+// never name a coin an in-flight transaction spends; both predicates use the
+// same notPinned text the 00002 migrations declare idx_utxos_reserved_at with,
+// so the scan stays index-driven (see [Store.staleReservationsSQL]).
 func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
 	if s.isClosed() {
 		return nil, errClosed
@@ -320,25 +413,7 @@ func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, 
 		return nil, nil
 	}
 
-	// The subquery picks the oldest `limit` stale reservation groups; the outer
-	// join expands each to its unspent reserved outpoints, ordered so a group's
-	// rows are contiguous and dated by their minimum reserved_at.
-	q := s.rebind(`
-		SELECT u.user_id, u.reserved_by, g.oldest, u.txid, u.vout
-		FROM utxos u
-		JOIN (
-			SELECT user_id, reserved_by, MIN(reserved_at) AS oldest, MIN(seq) AS min_seq
-			FROM utxos
-			WHERE reserved_by IS NOT NULL AND spent_by IS NULL
-			GROUP BY user_id, reserved_by
-			HAVING MIN(reserved_at) < ?
-			ORDER BY oldest, min_seq
-			LIMIT ?
-		) g ON u.user_id = g.user_id AND u.reserved_by = g.reserved_by
-		WHERE u.reserved_by IS NOT NULL AND u.spent_by IS NULL
-		ORDER BY g.oldest, g.min_seq, u.seq`)
-
-	rows, err := s.execer(ctx).QueryContext(ctx, q, s.encTime(olderThan), limit)
+	rows, err := s.execer(ctx).QueryContext(ctx, s.staleReservationsSQL(), s.encTime(olderThan), limit)
 	if err != nil {
 		return nil, err
 	}

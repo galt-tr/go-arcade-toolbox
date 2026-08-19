@@ -81,7 +81,9 @@ func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp) 
 		return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: reservedBy.String}, nil
 	}
 
-	if _, err := x.ExecContext(ctx, s.rebind("UPDATE utxos SET spent_by=? WHERE txid=? AND vout=?"),
+	// The spend consumes the coin, so the pre-broadcast pin it may have carried
+	// has done its job and goes with it (see [utxostore.Store.Pin]).
+	if _, err := x.ExecContext(ctx, s.rebind("UPDATE utxos SET spent_by=?, pinned="+s.boolLit(false)+" WHERE txid=? AND vout=?"),
 		sp.SpendingTxID[:], sp.TxID[:], sp.Vout); err != nil {
 		return nil, err
 	}
@@ -102,7 +104,7 @@ func (s *Store) Unspend(ctx context.Context, spendingTxID chainhash.Hash, ops []
 		released = 0
 		for _, op := range ops {
 			res, err := x.ExecContext(ctx, s.rebind(
-				`UPDATE utxos SET spent_by=NULL, reserved_by=NULL, reserved_at=NULL
+				`UPDATE utxos SET spent_by=NULL, reserved_by=NULL, reserved_at=NULL, pinned=`+s.boolLit(false)+`
 				 WHERE txid=? AND vout=? AND spent_by=?`),
 				op.TxID[:], op.Vout, spendingTxID[:])
 			if err != nil {

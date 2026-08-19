@@ -101,6 +101,10 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"ClaimExclusivityConcurrent", std(s.claimExclusivityConcurrent)},
 		{"ReleaseReservation", std(s.releaseReservation)},
 		{"ReleaseOutpoints", std(s.releaseOutpoints)},
+		{"PinLifecycle", std(s.pinLifecycle)},
+		{"PinScopingAndNoOps", std(s.pinScopingAndNoOps)},
+		{"PinClearedBySpendAndUnspend", std(s.pinClearedBySpendAndUnspend)},
+		{"ReleaseOutpointsOverridesPin", std(s.releaseOutpointsOverridesPin)},
 		{"SpendLifecycle", std(s.spendLifecycle)},
 		{"SpendPerItemErrors", std(s.spendPerItemErrors)},
 		{"SpendPrecedence", std(s.spendPrecedence)},
@@ -112,6 +116,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"RemoveSpentBy", std(s.removeSpentBy)},
 		{"Balance", std(s.balance)},
 		{"FindStaleReservations", s.findStaleReservations},
+		{"FindStaleReservationsSkipsPinned", s.findStaleReservationsSkipsPinned},
 		{"StaleReservationDating", s.staleReservationDating},
 		{"Close", std(s.closeStore)},
 	} {
@@ -260,6 +265,12 @@ func (s *suite) inputValidation(t *testing.T, store utxostore.Store) {
 	err = store.ReleaseOutpoints(ctx, "", ops)
 	require.Error(t, err, "ReleaseOutpoints must reject an empty reservation")
 
+	// ...and by both pin toggles, which are scoped by the very same token.
+	_, err = store.Pin(ctx, user, "")
+	require.Error(t, err, "Pin must reject an empty reservation")
+	_, err = store.Unpin(ctx, user, "")
+	require.Error(t, err, "Unpin must reject an empty reservation")
+
 	// Spend with an empty reservation guard: per-item failure under ErrBatch.
 	sp := &utxostore.SpendOp{Outpoint: ops[0], Reservation: "", SpendingTxID: NewTxID("validate-tx")}
 	err = store.Spend(ctx, []*utxostore.SpendOp{sp})
@@ -308,6 +319,29 @@ func requireClaimed(t *testing.T, u *utxostore.UTXO, sc utxostore.Scope, reserva
 	require.False(t, u.ReservedAt.IsZero(), "reserved coin must carry ReservedAt")
 	require.Nil(t, u.SpentBy)
 	require.False(t, u.Frozen)
+	require.False(t, u.Pinned, "a freshly claimed coin is never pinned")
+}
+
+// requirePinInvariant asserts the store-wide pin invariant on one row: a pin
+// only ever exists on top of a live reservation, so pinned => reserved AND
+// unspent. The pin subtests call it after every mutation.
+func requirePinInvariant(t *testing.T, u *utxostore.UTXO) {
+	t.Helper()
+	if !u.Pinned {
+		return
+	}
+	require.NotEmpty(t, u.ReservedBy, "pinned row %s must be reserved", u.Outpoint)
+	require.Nil(t, u.SpentBy, "pinned row %s must be unspent", u.Outpoint)
+}
+
+// getPinChecked fetches op and returns it after asserting the pin invariant,
+// so every read inside the pin subtests re-proves it.
+func getPinChecked(ctx context.Context, t *testing.T, store utxostore.Store, op utxostore.Outpoint) *utxostore.UTXO {
+	t.Helper()
+	u, err := store.Get(ctx, op)
+	require.NoError(t, err)
+	requirePinInvariant(t, u)
+	return u
 }
 
 func (s *suite) claimSmallestSufficient(t *testing.T, store utxostore.Store) {
@@ -656,6 +690,237 @@ func (s *suite) releaseOutpoints(t *testing.T, store utxostore.Store) {
 	got, err = store.Get(ctx, b)
 	require.NoError(t, err)
 	require.NotNil(t, got.SpentBy)
+}
+
+// pinLifecycle walks the core pre-broadcast-pin contract: a pin is a committed
+// "a broadcastable transaction spends these coins" mark that makes the
+// reservation unsweepable. Pinned rows stay reserved (so claims still refuse
+// them) and ReleaseReservation — the janitor path — must free nothing until the
+// pin is lifted by Unpin.
+func (s *suite) pinLifecycle(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	MintTx(t, store, "pin-life", user, basket, utxostore.TierMined, 10, 10, 10)
+
+	claimed, err := store.ClaimExact(ctx, sc, "res-pin", 10, 2)
+	require.NoError(t, err)
+	require.Len(t, claimed, 2)
+	ops := []utxostore.Outpoint{claimed[0].Outpoint, claimed[1].Outpoint}
+	for _, op := range ops {
+		require.False(t, getPinChecked(ctx, t, store, op).Pinned, "a claim does not pin")
+	}
+
+	// Pin reports how many rows it newly pinned...
+	n, err := store.Pin(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	for _, op := range ops {
+		u := getPinChecked(ctx, t, store, op)
+		require.True(t, u.Pinned)
+		require.Equal(t, "res-pin", u.ReservedBy, "a pin never exists without its reservation")
+	}
+
+	// ...and is idempotent: already-pinned rows are not counted again.
+	n, err = store.Pin(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Zero(t, n, "Pin must be idempotent")
+
+	// A token that grows between pins reports only the DELTA — the funder may
+	// claim several times under one reservation, and a re-pin covering the new
+	// rows must not double-count the ones already pinned.
+	grown, err := store.ClaimExact(ctx, sc, "res-pin", 10, 1)
+	require.NoError(t, err)
+	require.Len(t, grown, 1)
+	ops = append(ops, grown[0].Outpoint)
+	n, err = store.Pin(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "Pin must count only the rows it newly pinned")
+	for _, op := range ops {
+		require.True(t, getPinChecked(ctx, t, store, op).Pinned)
+	}
+
+	// THE POINT: the janitor path frees nothing while the pin is held.
+	n, err = store.ReleaseReservation(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Zero(t, n, "ReleaseReservation must never free a pinned row")
+	for _, op := range ops {
+		u := getPinChecked(ctx, t, store, op)
+		require.Equal(t, "res-pin", u.ReservedBy, "a refused release leaves the reservation intact")
+		require.True(t, u.Pinned)
+	}
+
+	// Pinned rows are reserved, so they were already invisible to claims.
+	poached, err := store.ClaimExact(ctx, sc, "res-poach", 10, 3)
+	require.NoError(t, err)
+	require.Empty(t, poached, "pinned (hence reserved) coins are not claimable")
+
+	// Unpin leaves the rows RESERVED: release is a separate step, so a crash
+	// between the two leaves coins merely reserved, never double-spendable.
+	n, err = store.Unpin(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	for _, op := range ops {
+		u := getPinChecked(ctx, t, store, op)
+		require.False(t, u.Pinned)
+		require.Equal(t, "res-pin", u.ReservedBy, "Unpin must not release the reservation")
+	}
+	n, err = store.Unpin(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Zero(t, n, "Unpin must be idempotent")
+
+	// Now the release goes through.
+	n, err = store.ReleaseReservation(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	for _, op := range ops {
+		require.Empty(t, getPinChecked(ctx, t, store, op).ReservedBy)
+	}
+}
+
+// pinScopingAndNoOps covers the cases where a pin must do NOTHING: a token the
+// store never saw, a token whose rows are all spent, and a token owned by
+// another user. Each returns a zero count and leaves state untouched, so a
+// caller replaying a pin after a crash cannot reach across those boundaries.
+func (s *suite) pinScopingAndNoOps(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	MintTx(t, store, "pin-scope", user, basket, utxostore.TierMined, 20, 30)
+
+	// Unknown reservation: zero-count no-op on both sides.
+	n, err := store.Pin(ctx, user, "never-existed")
+	require.NoError(t, err)
+	require.Zero(t, n)
+	n, err = store.Unpin(ctx, user, "never-existed")
+	require.NoError(t, err)
+	require.Zero(t, n)
+
+	// A fully spent reservation pins nothing: its rows have left the live pool
+	// and their token survives only as provenance.
+	spentClaim, err := store.ClaimExact(ctx, sc, "res-spent", 20, 1)
+	require.NoError(t, err)
+	require.Len(t, spentClaim, 1)
+	sp := &utxostore.SpendOp{Outpoint: spentClaim[0].Outpoint, Reservation: "res-spent", SpendingTxID: NewTxID("pin-scope-spender")}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	n, err = store.Pin(ctx, user, "res-spent")
+	require.NoError(t, err)
+	require.Zero(t, n, "a fully spent reservation has nothing to pin")
+	require.False(t, getPinChecked(ctx, t, store, spentClaim[0].Outpoint).Pinned)
+
+	// Wrong user pins nothing: the token is scoped by owner, as on release.
+	owned, err := store.ClaimExact(ctx, sc, "res-owner", 30, 1)
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+	n, err = store.Pin(ctx, user+1, "res-owner")
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.False(t, getPinChecked(ctx, t, store, owned[0].Outpoint).Pinned)
+
+	// ...and neither does the wrong user's UNPIN, once the owner has pinned.
+	n, err = store.Pin(ctx, user, "res-owner")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	n, err = store.Unpin(ctx, user+1, "res-owner")
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.True(t, getPinChecked(ctx, t, store, owned[0].Outpoint).Pinned,
+		"another user's Unpin must not lift this owner's pin")
+}
+
+// pinClearedBySpendAndUnspend pins that the transaction's own lifecycle clears
+// the pin: the spend it was protecting consumes it, and the unspend that
+// reverses that spend returns a fully clean, claimable row.
+func (s *suite) pinClearedBySpendAndUnspend(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	MintTx(t, store, "pin-spend", user, basket, utxostore.TierMined, 100)
+
+	claimed, err := store.ClaimExact(ctx, sc, "res-p", 100, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	op := claimed[0].Outpoint
+
+	n, err := store.Pin(ctx, user, "res-p")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	// A pin never blocks the spend it exists to protect.
+	spender := NewTxID("pin-spend-spender")
+	sp := &utxostore.SpendOp{Outpoint: op, Reservation: "res-p", SpendingTxID: spender}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, sp.Err)
+
+	u := getPinChecked(ctx, t, store, op)
+	require.NotNil(t, u.SpentBy)
+	require.Equal(t, spender, *u.SpentBy)
+	require.False(t, u.Pinned, "Spend clears the pin: the coin is consumed, not in flight")
+
+	// Unspend reverses the spend and returns the row to the claimable pool
+	// with no residue: no spend, no reservation, no pin.
+	released, err := store.Unspend(ctx, spender, []utxostore.Outpoint{op})
+	require.NoError(t, err)
+	require.Equal(t, 1, released)
+	u = getPinChecked(ctx, t, store, op)
+	require.Nil(t, u.SpentBy)
+	require.Empty(t, u.ReservedBy)
+	require.False(t, u.Pinned, "Unspend clears the pin along with the reservation")
+
+	reclaimed, err := store.ClaimExact(ctx, sc, "res-q", 100, 1)
+	require.NoError(t, err)
+	require.Len(t, reclaimed, 1)
+	require.Equal(t, op, reclaimed[0].Outpoint)
+	require.False(t, reclaimed[0].Pinned)
+}
+
+// releaseOutpointsOverridesPin pins the one release path a pin does NOT block.
+// ReleaseOutpoints is token-guarded — its callers are the funder (whose rows
+// are never pinned) and the reconciler's verified-dead release, which must be
+// able to reclaim the inputs of a transaction proven never to broadcast — so a
+// matching token clears the pin along with the reservation. A wrong token is
+// still a skip.
+func (s *suite) releaseOutpointsOverridesPin(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	MintTx(t, store, "pin-relops", user, basket, utxostore.TierMined, 10, 20)
+
+	a, err := store.ClaimExact(ctx, sc, "res-a", 10, 1)
+	require.NoError(t, err)
+	require.Len(t, a, 1)
+	b, err := store.ClaimExact(ctx, sc, "res-b", 20, 1)
+	require.NoError(t, err)
+	require.Len(t, b, 1)
+	opA, opB := a[0].Outpoint, b[0].Outpoint
+
+	for _, token := range []string{"res-a", "res-b"} {
+		n, perr := store.Pin(ctx, user, token)
+		require.NoError(t, perr)
+		require.Equal(t, 1, n)
+	}
+
+	// Wrong token: a skip, exactly as for an unpinned row.
+	require.NoError(t, store.ReleaseOutpoints(ctx, "res-wrong", []utxostore.Outpoint{opA}))
+	u := getPinChecked(ctx, t, store, opA)
+	require.True(t, u.Pinned, "a guard mismatch must not lift the pin")
+	require.Equal(t, "res-a", u.ReservedBy)
+
+	// Matching token: frees the row AND clears the pin.
+	require.NoError(t, store.ReleaseOutpoints(ctx, "res-a", []utxostore.Outpoint{opA}))
+	u = getPinChecked(ctx, t, store, opA)
+	require.Empty(t, u.ReservedBy)
+	require.False(t, u.Pinned, "a token-guarded release overrides the pin")
+
+	reclaimed, err := store.ClaimExact(ctx, sc, "res-c", 10, 1)
+	require.NoError(t, err)
+	require.Len(t, reclaimed, 1)
+	require.Equal(t, opA, reclaimed[0].Outpoint)
+
+	// The other reservation is untouched.
+	u = getPinChecked(ctx, t, store, opB)
+	require.True(t, u.Pinned)
+	require.Equal(t, "res-b", u.ReservedBy)
 }
 
 func (s *suite) spendLifecycle(t *testing.T, store utxostore.Store) {
@@ -1286,6 +1551,50 @@ func (s *suite) findStaleReservations(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
 	require.Equal(t, "res-c", refs[0].Reservation)
+}
+
+// findStaleReservationsSkipsPinned is the sweep half of the pin contract: the
+// stale-reservation reaper must not even SEE a pinned reservation, so it can
+// never hand the inputs of an in-flight send to a release.
+func (s *suite) findStaleReservationsSkipsPinned(t *testing.T) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	store, advance := s.clockedStore(t)
+
+	MintTx(t, store, "pin-stale", user, basket, utxostore.TierMined, 10, 20)
+
+	pinned, err := store.ClaimExact(ctx, sc, "res-pinned", 10, 1)
+	require.NoError(t, err)
+	require.Len(t, pinned, 1)
+	advance(time.Minute)
+	plain, err := store.ClaimExact(ctx, sc, "res-plain", 20, 1)
+	require.NoError(t, err)
+	require.Len(t, plain, 1)
+
+	n, err := store.Pin(ctx, user, "res-pinned")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	// Both reservations are stale by age; only the unpinned one is sweepable.
+	future := plain[0].ReservedAt.Add(time.Hour)
+	refs, err := store.FindStaleReservations(ctx, future, 10)
+	require.NoError(t, err)
+	require.Len(t, refs, 1, "a pinned reservation is not stale work")
+	require.Equal(t, "res-plain", refs[0].Reservation)
+	require.ElementsMatch(t, []utxostore.Outpoint{plain[0].Outpoint}, refs[0].Outpoints,
+		"no pinned outpoint may appear in a stale ref")
+	held := getPinChecked(ctx, t, store, pinned[0].Outpoint)
+	require.True(t, held.Pinned, "the skipped reservation is still pinned and reserved")
+	require.Equal(t, "res-pinned", held.ReservedBy)
+
+	// Unpinning hands the reservation back to the sweep.
+	n, err = store.Unpin(ctx, user, "res-pinned")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	refs, err = store.FindStaleReservations(ctx, future, 10)
+	require.NoError(t, err)
+	require.Len(t, refs, 2, "an unpinned stale reservation is visible again")
 }
 
 // staleReservationDating pins that a reservation is dated by its OLDEST row:

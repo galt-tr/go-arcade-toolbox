@@ -39,12 +39,12 @@ var errClosed = errors.New("sqlstore: store is closed")
 // utxoCols is the canonical column projection scanned by scanUTXO, including
 // the trailing seq used only for deterministic claim ordering.
 const utxoCols = "txid, vout, user_id, basket, tier, satoshis, input_size, " +
-	"reserved_by, reserved_at, spent_by, frozen, created_at, seq"
+	"reserved_by, reserved_at, spent_by, frozen, pinned, created_at, seq"
 
 // utxoColsU is utxoCols qualified with the "u" alias for RETURNING clauses in
 // the PostgreSQL claim statements (UPDATE ... FROM candidate c).
 const utxoColsU = "u.txid, u.vout, u.user_id, u.basket, u.tier, u.satoshis, u.input_size, " +
-	"u.reserved_by, u.reserved_at, u.spent_by, u.frozen, u.created_at, u.seq"
+	"u.reserved_by, u.reserved_at, u.spent_by, u.frozen, u.pinned, u.created_at, u.seq"
 
 // Store is a SQL-backed [utxostore.Store] over PostgreSQL or SQLite. Create it
 // with [New], [OpenPostgres], [OpenSQLite], or [Open]. It is safe for
@@ -304,6 +304,36 @@ func (s *Store) forUpdate() string {
 	return ""
 }
 
+// notPinned is the "row is not pinned" predicate. It needs no dialect switch:
+// SQLite has no boolean type, but NOT over an INTEGER 0/1 evaluates correctly
+// (NOT 0 = 1, NOT 1 = 0), the same ruling [Store.Balance] already makes for
+// "NOT frozen". Keeping it ONE constant is load-bearing rather than tidy —
+// SQLite matches a partial index by comparing predicate text, so this is
+// verbatim the clause idx_utxos_reserved_at is declared with in the 00002
+// migrations, and the plan test pins that the stale scan never degrades to a
+// table scan because the two drifted apart.
+const notPinned = "NOT pinned"
+
+// notPinnedOn is [notPinned] for a column carrying a table alias ("u" → "NOT
+// u.pinned"), used by the self-joined stale scan.
+func notPinnedOn(alias string) string { return "NOT " + alias + ".pinned" }
+
+// boolLit renders a boolean LITERAL for the engine (PostgreSQL TRUE/FALSE,
+// SQLite 1/0), for the SET clauses that carry the value inline rather than as a
+// bound parameter — so adding one does not renumber a statement's placeholders.
+func (s *Store) boolLit(b bool) string {
+	if s.engine == EnginePostgres {
+		if b {
+			return "TRUE"
+		}
+		return "FALSE"
+	}
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
 // encTime encodes t for a bound parameter: a UTC time.Time for PostgreSQL
 // TIMESTAMPTZ, or Unix microseconds for SQLite's INTEGER columns.
 func (s *Store) encTime(t time.Time) any {
@@ -369,10 +399,11 @@ func (s *Store) scanUTXO(sc rowScanner) (*utxostore.UTXO, int64, error) {
 		reservedAt tsScan
 		createdAt  tsScan
 		frozen     boolScan
+		pinned     boolScan
 	)
 	dest := []any{
 		&txid, &u.Vout, &u.UserID, &u.Basket, &u.Tier, &u.Satoshis, &u.InputSize,
-		&reservedBy, s.tsDest(&reservedAt), &spentBy, s.boolDest(&frozen),
+		&reservedBy, s.tsDest(&reservedAt), &spentBy, s.boolDest(&frozen), s.boolDest(&pinned),
 		s.tsDest(&createdAt), &seq,
 	}
 	if err := sc.Scan(dest...); err != nil {
@@ -384,6 +415,7 @@ func (s *Store) scanUTXO(sc rowScanner) (*utxostore.UTXO, int64, error) {
 	u.ReservedAt = s.tsTime(reservedAt)
 	u.CreatedAt = s.tsTime(createdAt)
 	u.Frozen = s.boolGet(frozen)
+	u.Pinned = s.boolGet(pinned)
 	if len(spentBy) > 0 {
 		h, err := decodeHash(spentBy)
 		if err != nil {

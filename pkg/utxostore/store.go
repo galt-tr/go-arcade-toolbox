@@ -23,10 +23,13 @@ import (
 //  4. Idempotency: Mint (same data = no-op success), Spend (same spender =
 //     success), Unspend (guard mismatch = skip), Release (already free =
 //     skip), Remove (missing = no-op), Promote (already there = counts as
-//     unchanged). Every op a crash-recovery outbox replays is idempotent by
-//     construction.
+//     unchanged), Pin/Unpin (already in that state = uncounted skip). Every op
+//     a crash-recovery outbox replays is idempotent by construction.
 //  5. Frozen rows are invisible to claims and refuse Spend ([FrozenError]),
 //     but Release, Unspend, and Promote still apply to them.
+//  6. Pinned rows are reserved rows that no janitor may free: they are
+//     invisible to FindStaleReservations and untouched by ReleaseReservation.
+//     pinned = TRUE implies reserved and unspent, always. See [Store.Pin].
 type Store interface {
 	// Health reports the store's health: an HTTP-convention status code
 	// (200 healthy, 503 unavailable), a human-readable message, and an error
@@ -83,10 +86,11 @@ type Store interface {
 	// is NOT an error. count <= 0 returns (nil, nil).
 	ClaimExact(ctx context.Context, s Scope, reservation string, denomination uint64, count int) ([]*UTXO, error)
 
-	// ReleaseReservation frees every unspent row held by (userID,
+	// ReleaseReservation frees every unspent, UNPINNED row held by (userID,
 	// reservation) and returns how many it freed. Idempotent: an unknown or
 	// already-released reservation returns 0, nil. Spent rows are never
-	// touched — their reservation is provenance.
+	// touched — their reservation is provenance — and neither are pinned rows,
+	// which a signed transaction is already spending (see [Store.Pin]).
 	ReleaseReservation(ctx context.Context, userID int64, reservation string) (int, error)
 
 	// ReleaseOutpoints frees the given rows if — and only if — each is
@@ -95,6 +99,30 @@ type Store interface {
 	// per-item SKIPS, not errors (idempotency: a stale release replays
 	// harmlessly).
 	ReleaseOutpoints(ctx context.Context, reservation string, ops []Outpoint) error
+
+	// --- pre-broadcast pin ---
+	// A pin is the committed "a broadcastable transaction spends these coins"
+	// state. Pinned rows are still reserved (a pin never exists without a
+	// reservation) and refuse claims exactly as reserved rows do; what a pin
+	// changes is the RELEASE side: ReleaseReservation and FindStaleReservations
+	// skip pinned rows entirely, so no janitor can free the inputs of an
+	// in-flight send. Only the transaction's own lifecycle clears a pin:
+	// Spend, Unspend, ReleaseOutpoints (the funder's own rollback or the
+	// reconciler's verified-dead release), Unpin (an abort that has already
+	// fenced the raw tx), or row deletion.
+
+	// Pin marks every unspent row reserved by (userID, reservation) as pinned
+	// and returns how many rows it newly pinned. Idempotent: already-pinned
+	// rows are left as-is and not counted. An unknown or fully-spent
+	// reservation returns 0, nil. reservation must be non-empty.
+	Pin(ctx context.Context, userID int64, reservation string) (int, error)
+
+	// Unpin clears the pin on every unspent row reserved by (userID,
+	// reservation), leaving the rows RESERVED — release is a separate step, so
+	// a crash between Unpin and ReleaseReservation leaves coins merely
+	// reserved (reclaimed by the stale sweep), never double-spendable.
+	// Idempotent. Returns how many rows it unpinned.
+	Unpin(ctx context.Context, userID int64, reservation string) (int, error)
 
 	// --- spend lifecycle ---
 
@@ -169,10 +197,12 @@ type Store interface {
 	Balance(ctx context.Context, userID int64, basket string) (Balance, error)
 
 	// FindStaleReservations returns up to limit reservations (grouped refs of
-	// unspent reserved rows) whose oldest reservation time is before
-	// olderThan, for the stale-reservation reaper. SHOULD return oldest
-	// first; approximate backends may relax ordering. limit <= 0 returns
-	// (nil, nil).
+	// unspent, UNPINNED reserved rows) whose oldest reservation time is before
+	// olderThan, for the stale-reservation reaper. Pinned rows are invisible
+	// here — neither as a reason a reservation is reported nor as a member of
+	// a reported ref's Outpoints — so a reaper can never free the inputs of an
+	// in-flight send (see [Store.Pin]). SHOULD return oldest first; approximate
+	// backends may relax ordering. limit <= 0 returns (nil, nil).
 	FindStaleReservations(ctx context.Context, olderThan time.Time, limit int) ([]ReservationRef, error)
 
 	// Close releases the store's resources. Idempotent. After Close, all

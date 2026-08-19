@@ -28,8 +28,9 @@
 //   - CLAIMS use FOR UPDATE SKIP LOCKED (PostgreSQL): any suitable coin is
 //     acceptable, so a claimer skips rows a peer is mid-reserving rather than
 //     forming a lock convoy behind them.
-//   - Spend, Unspend, Promote, Remove, RemoveByMintTx, Freeze and the releases
-//     operate on FIXED outpoints with nothing to skip to, so they use plain
+//   - Spend, Unspend, Promote, Remove, RemoveByMintTx, Freeze, the releases and
+//     the pin toggles have nothing to skip to (they name a fixed outpoint, or a
+//     reservation's whole membership), so they use plain
 //     guarded statements that WAIT on the row lock, wrapped in a bounded
 //     lock-error retry (isLockError classifies PostgreSQL 40001/40P01/55P03 and
 //     SQLite BUSY/LOCKED; backoff 100ms << attempt, up to three retries).
@@ -101,6 +102,22 @@
 //     migrations and a custom version-table name for Mode A; the library import
 //     pulls in no database drivers of its own (only the CLI does), so the
 //     dependency cost is small.
+//
+//   - The pin and the indexes. The pinned column is deliberately absent from
+//     idx_utxos_claim: a pinned row is reserved, so that index's partial WHERE
+//     (reserved_by IS NULL …) already excludes it and the hot path's plan is
+//     untouched — claim_explain_test.go still EXPLAINs the byte-identical claim
+//     statements. idx_utxos_reserved_at, which exists for the sweep, DOES fold
+//     the pin into its predicate: pinned rows never enter it, and its WHERE
+//     stays a superset match for the sweep's own terms. One predicate text
+//     serves both engines ([notPinned] — "NOT pinned" is correct over SQLite's
+//     INTEGER 0/1, exactly as "NOT frozen" already is in Balance), and that
+//     single spelling is what keeps SQLite's literal partial-index matching
+//     working. TestStaleScanIsIndexDriven pins both halves: the production
+//     stale statement never table-scans, and the index still matches the pin
+//     predicate. Note the planner currently satisfies the grouped stale scan
+//     from idx_utxos_reserved instead, because staleness is a HAVING over
+//     MIN(reserved_at) rather than a WHERE range on it.
 //
 // The in-memory reference implementation is [memstore]; the conformance suite
 // is [utxostoretest]. This package satisfies both.

@@ -50,10 +50,12 @@ func (s *Store) spendOne(sp *utxostore.SpendOp) error {
 	// Two attempts: the guard-failure classification can, under a concurrent
 	// release+re-reserve, observe a state that is spendable again; retry once.
 	for attempt := 0; attempt < 2; attempt++ {
+		// The spend consumes the coin, so any pre-broadcast pin goes with it.
 		_, aerr := s.client.Operate(
 			wp, key,
 			as.PutOp(as.NewBin(binSpentBy, sp.SpendingTxID[:])),
 			removeBinOp(binInvKey),
+			removeBinOp(binPinned),
 		)
 		if aerr == nil {
 			return nil // spent
@@ -161,6 +163,7 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 			removeBinOp(binSpentBy),
 			removeBinOp(binResBy),
 			removeBinOp(binResAt),
+			removeBinOp(binPinned),
 			as.PutOp(as.NewBin(binInvKey, invKeyFor(u.UserID, u.Basket))),
 			restoreClaimKeyOp(as.ExpBinExists(binFrozen), u),
 		)

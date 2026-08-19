@@ -23,6 +23,14 @@ const (
 	casBudget = 8
 )
 
+// Pin handling for [Store.releaseRow], named so the call sites read as intent
+// rather than as a bare bool: the janitor path keeps pins (and skips pinned
+// rows), the token-guarded path overrides and clears them.
+const (
+	keepPins     = false
+	overridePins = true
+)
+
 // validateClaim rejects underspecified claim inputs (programmer errors).
 func validateClaim(sc utxostore.Scope, reservation string) error {
 	switch {
@@ -301,9 +309,11 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	return claimed, nil
 }
 
-// ReleaseReservation implements [utxostore.Store]: frees every unspent row held
-// by (userID, reservation) and returns the count freed. Idempotent; spent rows
-// are never touched (their reservation is provenance).
+// ReleaseReservation implements [utxostore.Store]: frees every unspent,
+// UNPINNED row held by (userID, reservation) and returns the count freed.
+// Idempotent; spent rows are never touched (their reservation is provenance),
+// and pinned rows are never touched (a signed transaction spends them — see
+// [Store.Pin]).
 func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation string) (int, error) {
 	if s.closed.Load() {
 		return 0, errClosed
@@ -312,7 +322,9 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 		return 0, errors.New("aerostore: reservation must be non-empty")
 	}
 
-	// Probe the resBy index; restrict to this user and to unspent rows.
+	// Probe the resBy index; restrict to this user and to unspent, unpinned
+	// rows. The pin guard is re-applied per record in releaseRow, so a row
+	// pinned between this query and the CAS is still refused.
 	stmt := as.NewStatement(s.namespace, s.set)
 	if err := stmt.SetFilter(as.NewEqualFilter(binResBy, reservation)); err != nil {
 		return 0, fmt.Errorf("aerostore: set release filter: %w", err)
@@ -321,6 +333,7 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 	qp.FilterExpression = as.ExpAnd(
 		as.ExpEq(as.ExpIntBin(binUserID), as.ExpIntVal(userID)),
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
+		as.ExpNot(as.ExpBinExists(binPinned)),
 	)
 	rs, err := s.client.Query(qp, stmt)
 	if err != nil {
@@ -341,7 +354,7 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 
 	released := 0
 	for _, u := range rows {
-		ok, rerr := s.releaseRow(u, reservation)
+		ok, rerr := s.releaseRow(u, reservation, keepPins)
 		if rerr != nil {
 			return released, rerr
 		}
@@ -352,9 +365,143 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 	return released, nil
 }
 
+// Pin implements [utxostore.Store]: marks every unspent row held by (userID,
+// reservation) as pinned, returning how many it NEWLY pinned. The pin is
+// presence-encoded in the pinned bin and written by a guarded per-record CAS
+// (reserved by this token, unspent, not already pinned), so a replay pins
+// nothing and reports 0.
+//
+// Unlike the SQL backends this is NOT one atomic multi-record transaction —
+// Aerospike has none — so a crash mid-Pin leaves the token PARTLY pinned, and
+// the stragglers are exactly as exposed as they were before Pin existed:
+// FindStaleReservations still reports them and ReleaseReservation still frees
+// them. Two things BOUND that window; neither closes it.
+//
+//   - The caller re-runs Pin, idempotently, until it succeeds before it
+//     broadcasts. The exposure is therefore the client's retry gap, not the
+//     broadcast round trip the pin exists to cover.
+//   - The provider fences the transaction row before releasing anything —
+//     today through the resendable check in SweepStaleReservations, which is
+//     being hardened onto the pin itself in a later task.
+//
+// A deployment that needs this atomic rather than bounded wants a SQL backend,
+// where one UPDATE pins the whole membership or none of it.
+func (s *Store) Pin(_ context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(userID, reservation, true)
+}
+
+// Unpin implements [utxostore.Store]: removes the pinned bin from every unspent
+// row held by (userID, reservation), leaving them RESERVED. Idempotent.
+func (s *Store) Unpin(_ context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(userID, reservation, false)
+}
+
+// setPinned drives Pin/Unpin: a resBy index probe for the reservation's live
+// membership, then one guarded CAS per record. Claimability is deliberately
+// untouched — a pinned coin is reserved, so its claimKey is already absent and
+// the claim cache has nothing to learn (no noteClaimable call here).
+func (s *Store) setPinned(userID int64, reservation string, pinned bool) (int, error) {
+	if s.closed.Load() {
+		return 0, errClosed
+	}
+	if reservation == "" {
+		return 0, errors.New("aerostore: reservation must be non-empty")
+	}
+
+	verb := pinVerb(pinned)
+	stmt := as.NewStatement(s.namespace, s.set)
+	if err := stmt.SetFilter(as.NewEqualFilter(binResBy, reservation)); err != nil {
+		return 0, fmt.Errorf("aerostore: set %s filter: %w", verb, err)
+	}
+	qp := as.NewQueryPolicy()
+	// Only rows already in the target's opposite state are worth visiting; the
+	// same guard is re-applied per record, so the count stays exact under a race.
+	pinState := as.ExpBinExists(binPinned)
+	if pinned {
+		pinState = as.ExpNot(pinState)
+	}
+	qp.FilterExpression = as.ExpAnd(
+		as.ExpEq(as.ExpIntBin(binUserID), as.ExpIntVal(userID)),
+		as.ExpNot(as.ExpBinExists(binSpentBy)),
+		pinState,
+	)
+	rs, err := s.client.Query(qp, stmt)
+	if err != nil {
+		return 0, fmt.Errorf("aerostore: %s query: %w", verb, err)
+	}
+
+	var ops []utxostore.Outpoint
+	for res := range rs.Results() {
+		if res.Err != nil {
+			return 0, fmt.Errorf("aerostore: %s query result: %w", verb, res.Err)
+		}
+		u, cerr := recordToUTXO(res.Record)
+		if cerr != nil {
+			return 0, cerr
+		}
+		ops = append(ops, u.Outpoint)
+	}
+
+	changed := 0
+	for _, op := range ops {
+		ok, perr := s.setPinnedRow(op, reservation, pinned)
+		if perr != nil {
+			return changed, perr
+		}
+		if ok {
+			changed++
+		}
+	}
+	return changed, nil
+}
+
+// pinVerb names the direction of a setPinned call, so an Unpin failure does not
+// report itself as a pin failure.
+func pinVerb(pinned bool) string {
+	if pinned {
+		return "pin"
+	}
+	return "unpin"
+}
+
+// setPinnedRow is the single-record CAS behind Pin/Unpin: guarded by "reserved
+// by exactly this token, unspent, and not already in the target pin state", it
+// writes or removes the pinned bin. A false guard (FILTERED_OUT) or a vanished
+// record is an idempotent skip that does not count.
+func (s *Store) setPinnedRow(op utxostore.Outpoint, reservation string, pinned bool) (bool, error) {
+	key, err := s.keyFor(op)
+	if err != nil {
+		return false, err
+	}
+
+	pinState := as.ExpBinExists(binPinned)
+	pinOp := removeBinOp(binPinned)
+	if pinned {
+		pinState = as.ExpNot(pinState)
+		pinOp = as.PutOp(as.NewBin(binPinned, 1))
+	}
+	wp := as.NewWritePolicy(0, 0)
+	wp.RecordExistsAction = as.UPDATE_ONLY
+	wp.FilterExpression = as.ExpAnd(
+		as.ExpEq(as.ExpStringBin(binResBy), as.ExpStringVal(reservation)),
+		as.ExpNot(as.ExpBinExists(binSpentBy)),
+		pinState,
+	)
+
+	if _, aerr := s.client.Operate(wp, key, pinOp); aerr != nil {
+		if aerr.Matches(types.FILTERED_OUT) || aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
+			return false, nil // already in the target state, or no longer ours
+		}
+		return false, fmt.Errorf("aerostore: %s %s: %w", pinVerb(pinned), op, aerr)
+	}
+	return true, nil
+}
+
 // ReleaseOutpoints implements [utxostore.Store]: frees each listed row iff it is
 // currently reserved by exactly this reservation and unspent. Guard mismatches,
-// spent rows and missing outpoints are per-item skips.
+// spent rows and missing outpoints are per-item skips. A matching token
+// OVERRIDES the pin and clears it — the callers are the funder (whose rows are
+// never pinned) and the reconciler's verified-dead release.
 func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []utxostore.Outpoint) error {
 	if s.closed.Load() {
 		return errClosed
@@ -377,7 +524,7 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 		if u.ReservedBy != reservation || u.SpentBy != nil {
 			continue // skip: stale or foreign release intent
 		}
-		if _, rerr := s.releaseRow(u, reservation); rerr != nil {
+		if _, rerr := s.releaseRow(u, reservation, overridePins); rerr != nil {
 			return rerr
 		}
 	}
@@ -390,24 +537,36 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 // derived server-side from the live tier bin, so a Promote that raced the
 // caller's snapshot read cannot leave a stale-tier key. Returns false when the
 // guard no longer holds (FILTERED_OUT) — an idempotent skip.
-func (s *Store) releaseRow(u *utxostore.UTXO, reservation string) (bool, error) {
+//
+// overridePin splits the two release paths; call it with [keepPins] or
+// [overridePins] rather than a bare bool. keepPins is the janitor path
+// (ReleaseReservation): the guard then also demands an unpinned row, so a
+// pinned one FILTERED_OUTs and is skipped, and no sweep can free the inputs of
+// an in-flight send. overridePins is the token-guarded path (ReleaseOutpoints —
+// the funder's own rollback and the reconciler's verified-dead release): it
+// overrides the pin and clears it in the same atomic Operate as the release.
+func (s *Store) releaseRow(u *utxostore.UTXO, reservation string, overridePin bool) (bool, error) {
 	key, err := s.keyFor(u.Outpoint)
 	if err != nil {
 		return false, err
 	}
-	wp := as.NewWritePolicy(0, 0)
-	wp.RecordExistsAction = as.UPDATE_ONLY
-	wp.FilterExpression = as.ExpAnd(
+	guards := []*as.Expression{
 		as.ExpEq(as.ExpStringBin(binResBy), as.ExpStringVal(reservation)),
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
-	)
+	}
+	ops := []*as.Operation{removeBinOp(binResBy), removeBinOp(binResAt)}
+	if overridePin {
+		ops = append(ops, removeBinOp(binPinned))
+	} else {
+		guards = append(guards, as.ExpNot(as.ExpBinExists(binPinned)))
+	}
+	ops = append(ops, restoreClaimKeyOp(as.ExpBinExists(binFrozen), u))
+
+	wp := as.NewWritePolicy(0, 0)
+	wp.RecordExistsAction = as.UPDATE_ONLY
+	wp.FilterExpression = as.ExpAnd(guards...)
 	s.fireRestoreRaceHook()
-	_, aerr := s.client.Operate(
-		wp, key,
-		removeBinOp(binResBy),
-		removeBinOp(binResAt),
-		restoreClaimKeyOp(as.ExpBinExists(binFrozen), u),
-	)
+	_, aerr := s.client.Operate(wp, key, ops...)
 	if aerr != nil {
 		if aerr.Matches(types.FILTERED_OUT) || aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
 			return false, nil // guard no longer holds: skip

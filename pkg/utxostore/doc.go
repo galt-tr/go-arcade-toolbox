@@ -70,9 +70,30 @@
 // single index walk on every backend. [Store.Promote] moves coins between
 // tiers in both directions: up as evidence arrives, down on reorg.
 //
+// # Pre-broadcast pin
+//
+// A plain reservation is a SOFT hold: the stale-reservation reaper frees one
+// that has aged out. That is right while the wallet is still choosing coins,
+// and wrong the moment it has SIGNED a transaction spending them — freeing
+// those inputs lets a later funding run hand the same coins to a second
+// transaction, and the two race on-chain as a double spend.
+//
+// [Store.Pin] closes that window. It sets a COMMITTED bit, written in the same
+// transaction that stores the signed raw tx, which turns the reservation into a
+// hard hold: pinned rows are reserved rows no janitor may free.
+// [Store.ReleaseReservation] skips them and [Store.FindStaleReservations]
+// cannot see them, so only the transaction's own lifecycle ends a pin —
+// [Store.Spend], [Store.Unspend], a token-guarded [Store.ReleaseOutpoints] (the
+// funder's own rollback and the reconciler's verified-dead release),
+// [Store.Unpin], or row deletion.
+//
+// The invariant every provider upholds: Pinned implies ReservedBy != "" AND
+// SpentBy == nil. Claims are unaffected — a pinned coin is reserved, so it was
+// already invisible to them — which is why pinning costs the hot path nothing.
+//
 // # Atomicity contracts
 //
-// These five rules are the core of the interface; the conformance suite
+// These six rules are the core of the interface; the conformance suite
 // enforces them and every provider must honor them:
 //
 //  1. Every method is atomic PER ITEM, never across items. Batch methods may
@@ -93,11 +114,15 @@
 //     Release: already free = skip.
 //     Remove: missing = no-op.
 //     Promote: already at the target tier = counts as unchanged.
+//     Pin/Unpin: already in that state = uncounted skip.
 //  5. Frozen rows are invisible to claims and refuse Spend ([FrozenError]),
 //     but Release, Unspend, and Promote still apply to them. Precedence: an
 //     already-recorded spend wins over the freeze — a same-spender Spend
 //     replay on a since-frozen row is an idempotent success, and a competing
 //     spender gets [SpentError], not [FrozenError].
+//  6. Pinned rows are reserved rows no janitor may free: ReleaseReservation
+//     leaves them alone and FindStaleReservations never reports them (see the
+//     pre-broadcast pin above). Pinned always implies reserved and unspent.
 //
 // # Design notes
 //
@@ -131,6 +156,15 @@
 //     and not frozen; Reserved when reserved and unspent (frozen or not).
 //     Frozen unreserved rows appear in neither bucket — a freeze removes
 //     value from the spendable balance by design.
+//   - The pin is scoped by (userID, reservation) like ReleaseReservation, not
+//     by outpoint: the caller fences or unfences a send with the token it
+//     already holds. The one release path that OVERRIDES a pin is
+//     ReleaseOutpoints, which is token-guarded — its callers are the funder's
+//     own rollback (whose rows are never pinned) and the reconciler's
+//     verified-dead release, the two parties entitled to declare a transaction
+//     dead. Unpin, by contrast, only lifts the pin: it leaves the rows
+//     reserved, so a crash between Unpin and the release degrades to a stale
+//     reservation the reaper handles, never to a free coin.
 //   - FindStaleReservations dates a reservation by its OLDEST row (the
 //     funder may claim several times under one token) and should return
 //     oldest-first; approximate backends may relax the ordering (the

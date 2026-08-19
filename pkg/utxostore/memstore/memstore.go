@@ -314,8 +314,15 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	return claimed, nil
 }
 
-// ReleaseReservation implements [utxostore.Store]: frees every unspent row
-// held by (userID, reservation). Idempotent; never touches spent rows.
+// heldBy reports whether the row belongs to the live (unspent) membership of
+// (userID, reservation): the set the janitor release, Pin, and Unpin all act on.
+func heldBy(r *row, userID int64, reservation string) bool {
+	return r.utxo.UserID == userID && r.utxo.ReservedBy == reservation && r.utxo.SpentBy == nil
+}
+
+// ReleaseReservation implements [utxostore.Store]: frees every unspent,
+// UNPINNED row held by (userID, reservation). Idempotent; never touches spent
+// rows, and never frees the inputs of an in-flight send (see [Store.Pin]).
 func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -328,7 +335,7 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 
 	released := 0
 	for _, r := range s.rows {
-		if r.utxo.UserID == userID && r.utxo.ReservedBy == reservation && r.utxo.SpentBy == nil {
+		if heldBy(r, userID, reservation) && !r.utxo.Pinned {
 			r.utxo.ReservedBy = ""
 			r.utxo.ReservedAt = time.Time{}
 			released++
@@ -337,8 +344,44 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 	return released, nil
 }
 
+// Pin implements [utxostore.Store]: marks every unspent row held by (userID,
+// reservation) as pinned, returning how many it NEWLY pinned. Idempotent.
+func (s *Store) Pin(_ context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(userID, reservation, true)
+}
+
+// Unpin implements [utxostore.Store]: clears the pin on every unspent row held
+// by (userID, reservation), leaving them reserved. Idempotent.
+func (s *Store) Unpin(_ context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(userID, reservation, false)
+}
+
+// setPinned drives Pin/Unpin: it flips the pin on the reservation's live
+// membership and counts only the rows that actually changed.
+func (s *Store) setPinned(userID int64, reservation string, pinned bool) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, errClosed
+	}
+	if reservation == "" {
+		return 0, errors.New("memstore: reservation must be non-empty")
+	}
+
+	changed := 0
+	for _, r := range s.rows {
+		if !heldBy(r, userID, reservation) || r.utxo.Pinned == pinned {
+			continue
+		}
+		r.utxo.Pinned = pinned
+		changed++
+	}
+	return changed, nil
+}
+
 // ReleaseOutpoints implements [utxostore.Store]: guard mismatches, spent rows
-// and missing outpoints are per-item skips, not errors.
+// and missing outpoints are per-item skips, not errors. A matching token
+// overrides the pin — this is the verified-dead release path.
 func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []utxostore.Outpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -356,6 +399,7 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 		}
 		r.utxo.ReservedBy = ""
 		r.utxo.ReservedAt = time.Time{}
+		r.utxo.Pinned = false
 	}
 	return nil
 }
@@ -407,6 +451,7 @@ func (s *Store) spendOne(sp *utxostore.SpendOp) error {
 
 	spentBy := sp.SpendingTxID
 	r.utxo.SpentBy = &spentBy
+	r.utxo.Pinned = false // the send it protected has landed; the coin is consumed
 	return nil
 }
 
@@ -428,6 +473,7 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 		r.utxo.SpentBy = nil
 		r.utxo.ReservedBy = ""
 		r.utxo.ReservedAt = time.Time{}
+		r.utxo.Pinned = false
 		released++
 	}
 	return released, nil
@@ -599,7 +645,9 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 }
 
 // FindStaleReservations implements [utxostore.Store]: reservations of
-// unspent rows whose oldest ReservedAt is before olderThan, oldest first.
+// unspent, unpinned rows whose oldest ReservedAt is before olderThan, oldest
+// first. Pinned rows are excluded entirely — the reaper must never see the
+// inputs of an in-flight send.
 func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -622,8 +670,8 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 
 	for _, r := range s.rows {
 		u := &r.utxo
-		if u.ReservedBy == "" || u.SpentBy != nil {
-			continue
+		if u.ReservedBy == "" || u.SpentBy != nil || u.Pinned {
+			continue // pinned rows are in flight, never stale work
 		}
 		k := key{userID: u.UserID, token: u.ReservedBy}
 		g, ok := groups[k]
