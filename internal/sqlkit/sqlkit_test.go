@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"errors"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/require"
 	sqlitedrv "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -111,6 +113,11 @@ func TestBoolCodec(t *testing.T) {
 	}
 }
 
+// TestSQLiteDSNPragmas pins the DSN string shape: _txlock=immediate plus the
+// four pragmas in the driver-portable _pragma=name(value) form. See
+// TestSQLiteDSNAppliedPragmas below for the runtime counterpart that proves
+// these values are actually honored by the driver, not just present in the
+// string.
 func TestSQLiteDSNPragmas(t *testing.T) {
 	dsn := SQLiteDSN("/data/wallet.db")
 	base, rawQuery, ok := splitDSN(dsn)
@@ -118,22 +125,60 @@ func TestSQLiteDSNPragmas(t *testing.T) {
 		t.Fatalf("SQLiteDSN base path mangled: %q", dsn)
 	}
 	q, err := url.ParseQuery(rawQuery)
-	if err != nil {
-		t.Fatalf("query parse: %v", err)
+	require.NoError(t, err)
+
+	require.Equal(t, "immediate", q.Get("_txlock"))
+	require.ElementsMatch(t, []string{
+		"busy_timeout(5000)",
+		"journal_mode(WAL)",
+		"foreign_keys(ON)",
+		"synchronous(NORMAL)",
+	}, q["_pragma"], "SQLiteDSN must set all four pragmas via the portable _pragma=name(value) form")
+
+	for _, k := range []string{"_journal_mode", "_busy_timeout", "_foreign_keys", "_synchronous"} {
+		require.NotContains(t, q, k, "mattn shorthand %s must not reappear; modernc <=v1.54.0 drops it", k)
 	}
-	want := map[string]string{
-		"_journal_mode": "WAL",
-		"_busy_timeout": "5000",
-		"_foreign_keys": "on",
-		"_txlock":       "immediate",
+}
+
+// TestSQLiteDSNAppliedPragmas opens a real file-backed SQLite DB through
+// SQLiteDSN and asserts the pragmas the driver actually applied, not just
+// the DSN string. This is the test that would have caught the audit finding
+// (P1-5): the DSN previously used mattn-go-sqlite3-style shorthand keys
+// (_journal_mode=WAL, _busy_timeout=5000, _foreign_keys=on) which
+// modernc.org/sqlite <= v1.54.0 silently DROPPED — no parse error, just a
+// connection opened with journal_mode=delete, busy_timeout=0, and
+// foreign_keys=off. This module pins v1.55.0, which happens to also parse
+// those shorthand keys, so this test PASSES against the pre-hardening DSN
+// too — that's expected, this is a hardening change, not a fix for
+// currently-observed breakage. Its job is to pin the APPLIED pragmas so a
+// future driver version change can never silently revert them again.
+//
+// _txlock=immediate is deliberately not covered here: it configures the
+// driver's BEGIN mode, not a SQLite pragma, so there is no PRAGMA to read
+// back and confirm it took effect.
+func TestSQLiteDSNAppliedPragmas(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.db") // WAL does not apply to :memory:
+
+	db, err := sql.Open("sqlite", SQLiteDSN(path))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	cases := []struct {
+		pragma string
+		want   string
+	}{
+		{"journal_mode", "wal"},
+		{"busy_timeout", "5000"},
+		{"foreign_keys", "1"},
+		{"synchronous", "1"}, // NORMAL
 	}
-	for k, v := range want {
-		if q.Get(k) != v {
-			t.Errorf("SQLite pragma %s = %q want %q", k, q.Get(k), v)
-		}
-	}
-	if got := q.Get("_pragma"); got != "synchronous(NORMAL)" {
-		t.Errorf("SQLite _pragma = %q want synchronous(NORMAL)", got)
+	for _, c := range cases {
+		t.Run(c.pragma, func(t *testing.T) {
+			var got string
+			require.NoError(t, db.QueryRow("PRAGMA "+c.pragma).Scan(&got))
+			require.Equal(t, c.want, got, "PRAGMA %s applied value", c.pragma)
+		})
 	}
 }
 
