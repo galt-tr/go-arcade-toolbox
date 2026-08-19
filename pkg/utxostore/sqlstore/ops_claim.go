@@ -80,8 +80,8 @@ type claimedRow struct {
 // one operation in this package that ran with no lock-error retry at all: every
 // mutation goes through withTx -> [sqlkit.WithRetry], while a claim went
 // straight to the pool. A 40001/40P01/55P03 on the hot path therefore surfaced
-// raw to the funder, which retries only on [utxostore.ErrContention] — an error
-// this backend never returns (see the package doc). Mode A masked it, because
+// raw to the funder, which retries only on [utxostore.ErrContention], and a raw
+// driver lock error is not that (see the package doc). Mode A masked it, because
 // the metastore's own retry wraps the whole unit of work; a standalone store had
 // nothing.
 //

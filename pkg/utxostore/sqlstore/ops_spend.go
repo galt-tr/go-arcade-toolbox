@@ -17,6 +17,11 @@ import (
 // BEFORE the freeze, so a same-spender replay on a since-frozen row succeeds.
 // With force it records a spend the network has already accepted, skipping the
 // reservation and freeze guards (see [utxostore.Store.Spend]).
+//
+// Refusals are per item under [utxostore.ErrBatch] — or, in EITHER mode,
+// [utxostore.ErrContention] when a row keeps flipping between spendable and
+// held, which is transient: re-drive the spend. Fact-mode callers recording an
+// accepted broadcast must tolerate it rather than read it as a refused coin.
 func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp, force bool) error {
 	if s.isClosed() {
 		return errClosed
@@ -46,55 +51,110 @@ func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp, force bo
 	return nil
 }
 
+// spendOne records one spend, write first. The guarded UPDATE re-asserts every
+// precondition in its own WHERE, so the happy path is a SINGLE statement and no
+// row can slip between a check and the write — there is no check to slip away
+// from. Only a write that matched nothing pays for a classifying read.
 func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp, force bool) (itemErr, fatal error) {
 	if sp.Reservation == "" {
 		return fmt.Errorf("sqlstore: spend %s: reservation must be non-empty", sp.Outpoint), nil
 	}
 
+	for range guardAttempts {
+		n, err := s.spendUpdate(ctx, x, sp, force)
+		if err != nil {
+			return nil, err
+		}
+		if n == 1 {
+			return nil, nil
+		}
+		classified, retry, cerr := s.classifySpendFailure(ctx, x, sp, force)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if !retry {
+			return classified, nil
+		}
+	}
+	// The row kept looking spendable between the guarded UPDATE and the read
+	// that followed it, which is contention, not a refusal: some peer is
+	// releasing and re-reserving (or unspending) this coin right now. Say so,
+	// rather than inventing a verdict — no refusal would be true of the row, and
+	// treating the coin as refused abandons it. This producer has no outer retry
+	// owner (see [utxostore.ErrContention]): the caller re-drives the spend, and
+	// a fact-mode caller recording an accepted broadcast must tolerate it.
+	return fmt.Errorf("sqlstore: spend %s: %w", sp.Outpoint, utxostore.ErrContention), nil
+}
+
+// spendUpdate is the guard-carrying write, and the only statement a successful
+// spend runs. Guarded mode re-asserts the reservation token, the absence of a
+// recorded spend and the absence of a freeze; fact mode (force) keeps only
+// "spent_by IS NULL", because the spend is already on the network — neither a
+// freeze nor a stale reservation can un-happen it, but two spend facts still
+// cannot both hold. On PostgreSQL the UPDATE itself serializes on the row lock
+// it takes, so dropping the old SELECT ... FOR UPDATE gives up no exclusion.
+//
+// The spend consumes the coin, so the pre-broadcast pin it may have carried has
+// done its job and goes with it (see [utxostore.Store.Pin]).
+func (s *Store) spendUpdate(ctx context.Context, x queryer, sp *utxostore.SpendOp, force bool) (int64, error) {
+	q := "UPDATE utxos SET spent_by=?, pinned=" + s.boolLit(false) +
+		" WHERE txid=? AND vout=? AND spent_by IS NULL"
+	args := []any{sp.SpendingTxID[:], sp.TxID[:], sp.Vout}
+	if !force {
+		q += " AND reserved_by=? AND " + notFrozen
+		args = append(args, sp.Reservation)
+	}
+	res, err := x.ExecContext(ctx, s.rebind(q), args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// classifySpendFailure turns a guarded UPDATE that matched nothing into the
+// per-item verdict. retry is true when the row looks spendable again, meaning a
+// concurrent release-and-re-reserve (or, in fact mode, an Unspend) raced the
+// write; the caller re-drives it. The read is deliberately plain: the UPDATE
+// matched no row, so it holds no lock worth extending, and any answer this read
+// gives is confirmed by the next attempt's guarded write anyway.
+//
+// Precedence matches the interface: a recorded spend wins over a freeze, and
+// the spent_by arbiter runs in BOTH modes — two spend facts cannot both hold.
+// The freeze and reservation refusals exist only under a guard. The aerostore
+// twin of this classifier makes the identical rulings; the two must stay in
+// step, and the conformance suite pins them.
+func (s *Store) classifySpendFailure(ctx context.Context, x queryer, sp *utxostore.SpendOp, force bool) (itemErr error, retry bool, fatal error) {
 	var (
 		spentBy    []byte
 		frozen     boolScan
 		reservedBy sql.NullString
 	)
-	q := s.rebind("SELECT spent_by, frozen, reserved_by FROM utxos WHERE txid=? AND vout=?" + s.forUpdate())
+	q := s.rebind("SELECT spent_by, frozen, reserved_by FROM utxos WHERE txid=? AND vout=?")
 	err := x.QueryRowContext(ctx, q, sp.TxID[:], sp.Vout).Scan(&spentBy, s.boolDest(&frozen), &reservedBy)
 	if errors.Is(err, sql.ErrNoRows) {
-		return &utxostore.NotFoundError{Op: sp.Outpoint}, nil
+		return &utxostore.NotFoundError{Op: sp.Outpoint}, false, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// Precedence: recorded spend wins over freeze. The spent_by arbiter runs in
-	// BOTH modes — two spend facts cannot both hold.
-	if len(spentBy) > 0 {
+	switch {
+	case len(spentBy) > 0:
 		w, herr := decodeHash(spentBy)
 		if herr != nil {
-			return nil, herr
+			return nil, false, herr
 		}
 		if *w == sp.SpendingTxID {
-			return nil, nil // idempotent same-spender replay
+			return nil, false, nil // idempotent same-spender replay
 		}
-		return &utxostore.SpentError{Op: sp.Outpoint, Winner: *w}, nil
+		return &utxostore.SpentError{Op: sp.Outpoint, Winner: *w}, false, nil
+	case !force && s.boolGet(frozen):
+		return &utxostore.FrozenError{Op: sp.Outpoint}, false, nil
+	case !force && reservedBy.String != sp.Reservation:
+		return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: reservedBy.String}, false, nil
+	default:
+		return nil, true, nil
 	}
-	// Fact mode skips exactly these two guards: the spend is already on the
-	// network, so neither a freeze nor a stale reservation can un-happen it.
-	if !force {
-		if s.boolGet(frozen) {
-			return &utxostore.FrozenError{Op: sp.Outpoint}, nil
-		}
-		if reservedBy.String != sp.Reservation {
-			return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: reservedBy.String}, nil
-		}
-	}
-
-	// The spend consumes the coin, so the pre-broadcast pin it may have carried
-	// has done its job and goes with it (see [utxostore.Store.Pin]).
-	if _, err := x.ExecContext(ctx, s.rebind("UPDATE utxos SET spent_by=?, pinned="+s.boolLit(false)+" WHERE txid=? AND vout=?"),
-		sp.SpendingTxID[:], sp.TxID[:], sp.Vout); err != nil {
-		return nil, err
-	}
-	return nil, nil
 }
 
 // Unspend implements [utxostore.Store]: for each op whose row is spent by
@@ -191,7 +251,8 @@ func (s *Store) RemoveSpentBy(ctx context.Context, spendingTxID chainhash.Hash) 
 // RemoveByMintTx implements [utxostore.Store]: removes phantom coins of an
 // invalidated mint transaction and classifies the survivors. Every op must be
 // an output of mintTxID; a mismatch fails the whole call with a plain error and
-// removes nothing.
+// removes nothing. It fails with [utxostore.ErrContention] when a coin keeps
+// flipping between removable and held, which is transient: retry the call.
 func (s *Store) RemoveByMintTx(ctx context.Context, mintTxID chainhash.Hash, ops []utxostore.Outpoint) (utxostore.RemoveByMintReport, error) {
 	var report utxostore.RemoveByMintReport
 	if s.isClosed() {
@@ -210,25 +271,18 @@ func (s *Store) RemoveByMintTx(ctx context.Context, mintTxID chainhash.Hash, ops
 		seenSpenders := make(map[chainhash.Hash]bool)
 
 		for _, op := range ops {
-			var (
-				spentBy    []byte
-				reservedBy sql.NullString
-				reservedAt tsScan
-				userID     int64
-			)
-			q := s.rebind("SELECT spent_by, reserved_by, reserved_at, user_id FROM utxos WHERE txid=? AND vout=?" + s.forUpdate())
-			err := x.QueryRowContext(ctx, q, op.TxID[:], op.Vout).
-				Scan(&spentBy, &reservedBy, s.tsDest(&reservedAt), &userID)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue // already gone
-			}
+			row, verdict, err := s.resolveMintRow(ctx, x, op)
 			if err != nil {
 				return err
 			}
-
-			switch {
-			case len(spentBy) > 0:
-				w, herr := decodeHash(spentBy)
+			switch verdict {
+			case mintGone:
+				// Nothing to report: the row was already removed, here or by a
+				// peer running the same invalidation.
+			case mintRemoved:
+				report.Removed = append(report.Removed, op)
+			case mintSpent:
+				w, herr := decodeHash(row.spentBy)
 				if herr != nil {
 					return herr
 				}
@@ -236,28 +290,21 @@ func (s *Store) RemoveByMintTx(ctx context.Context, mintTxID chainhash.Hash, ops
 					seenSpenders[*w] = true
 					report.AlreadySpentBy = append(report.AlreadySpentBy, *w)
 				}
-			case reservedBy.String != "":
-				ref, ok := reservedRefs[reservedBy.String]
+			case mintReserved:
+				ref, ok := reservedRefs[row.reservedBy.String]
 				if !ok {
 					ref = &utxostore.ReservationRef{
-						Reservation: reservedBy.String,
-						UserID:      userID,
-						ReservedAt:  s.tsTime(reservedAt),
+						Reservation: row.reservedBy.String,
+						UserID:      row.userID,
+						ReservedAt:  s.tsTime(row.reservedAt),
 					}
-					reservedRefs[reservedBy.String] = ref
-					refOrder = append(refOrder, reservedBy.String)
+					reservedRefs[row.reservedBy.String] = ref
+					refOrder = append(refOrder, row.reservedBy.String)
 				}
-				if at := s.tsTime(reservedAt); at.Before(ref.ReservedAt) {
+				if at := s.tsTime(row.reservedAt); at.Before(ref.ReservedAt) {
 					ref.ReservedAt = at
 				}
 				ref.Outpoints = append(ref.Outpoints, op)
-			default:
-				// Unreserved and unspent: remove, even when frozen — a frozen
-				// phantom coin is strictly worse than no row.
-				if _, err := x.ExecContext(ctx, s.rebind("DELETE FROM utxos WHERE txid=? AND vout=?"), op.TxID[:], op.Vout); err != nil {
-					return err
-				}
-				report.Removed = append(report.Removed, op)
 			}
 		}
 
@@ -270,6 +317,78 @@ func (s *Store) RemoveByMintTx(ctx context.Context, mintTxID chainhash.Hash, ops
 		return utxostore.RemoveByMintReport{}, err
 	}
 	return report, nil
+}
+
+// mintVerdict is what one [Store.RemoveByMintTx] outpoint resolved to.
+type mintVerdict int
+
+const (
+	mintGone     mintVerdict = iota // no row: already removed, nothing to report
+	mintRemoved                     // a phantom coin this call deleted
+	mintSpent                       // a descendant already spent it
+	mintReserved                    // a descendant already holds it
+)
+
+// mintRow is the classification projection [Store.RemoveByMintTx] reads.
+type mintRow struct {
+	spentBy    []byte
+	reservedBy sql.NullString
+	reservedAt tsScan
+	userID     int64
+}
+
+// resolveMintRow classifies one outpoint of an invalidated mint and, when it is
+// an unreserved unspent phantom, deletes it. Unlike the other guarded mutations
+// this one genuinely needs the read — the report carries the holder's identity
+// and reservation timestamp — but the DELETE still re-asserts the two
+// predicates that decision rested on, so a descendant that reserves or spends
+// the row between the read and the write WINS the race instead of losing its
+// coin, and the re-read then classifies it as a survivor. Only the removal
+// verdict is write-confirmed; mintSpent and mintReserved are snapshot reads,
+// true as of the read and no later. The freeze is deliberately not a guard: a
+// frozen phantom coin is strictly worse than no row.
+//
+// Exhausting [guardAttempts] means the row kept flipping between phantom and
+// held, so it belongs in NO report slot — it was neither removed nor is it
+// reliably a survivor. Reporting it as gone would silently drop a coin that
+// still exists, so this escalates to [utxostore.ErrContention] and fails the
+// whole call, exactly as the aerostore twin does.
+func (s *Store) resolveMintRow(ctx context.Context, x queryer, op utxostore.Outpoint) (mintRow, mintVerdict, error) {
+	for range guardAttempts {
+		var row mintRow
+		q := s.rebind("SELECT spent_by, reserved_by, reserved_at, user_id FROM utxos WHERE txid=? AND vout=?")
+		err := x.QueryRowContext(ctx, q, op.TxID[:], op.Vout).
+			Scan(&row.spentBy, &row.reservedBy, s.tsDest(&row.reservedAt), &row.userID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return mintRow{}, mintGone, nil
+		}
+		if err != nil {
+			return mintRow{}, mintGone, err
+		}
+		// Precedence matches every other classifier here: spent wins over
+		// reserved (the aerostore twin rules the same way).
+		switch {
+		case len(row.spentBy) > 0:
+			return row, mintSpent, nil
+		case row.reservedBy.String != "":
+			return row, mintReserved, nil
+		}
+
+		res, err := x.ExecContext(ctx, s.rebind(
+			"DELETE FROM utxos WHERE txid=? AND vout=? AND reserved_by IS NULL AND spent_by IS NULL"),
+			op.TxID[:], op.Vout)
+		if err != nil {
+			return mintRow{}, mintGone, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return mintRow{}, mintGone, err
+		}
+		if n == 1 {
+			return row, mintRemoved, nil
+		}
+	}
+	return mintRow{}, mintGone, fmt.Errorf("sqlstore: remove-by-mint-tx %s: %w", op, utxostore.ErrContention)
 }
 
 // Freeze implements [utxostore.Store]: missing outpoints are per-item

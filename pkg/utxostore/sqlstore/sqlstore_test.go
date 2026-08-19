@@ -2,6 +2,7 @@ package sqlstore_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqlkit"
 	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore/sqlstore"
@@ -194,4 +196,131 @@ func TestForeignTransactionNotEnlisted(t *testing.T) {
 	got, err = storeA.Get(ctx, op)
 	require.NoError(t, err)
 	require.Equal(t, uint64(250), got.Satoshis)
+}
+
+// openRawSQLite opens a migration-free SQLite handle on a temp file with the
+// store's DSN but NO pool posture, so each caller chooses its own.
+func openRawSQLite(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", sqlkit.SQLiteDSN(filepath.Join(t.TempDir(), "shared.db")))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// TestNewRejectsUnpinnedSQLitePool pins the Mode A construction guard. Every
+// guarded mutation now carries its predicates in the WHERE, but SQLite's write
+// serialization still rests on the single writer connection [OpenSQLite]
+// installs — and [New] cannot install it, because the pool belongs to the
+// caller (typically the metastore, which is sharing the same handle). So it
+// VALIDATES instead of mutating: resizing somebody else's pool behind their
+// back is the worse of the two surprises.
+func TestNewRejectsUnpinnedSQLitePool(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unpinned is refused", func(t *testing.T) {
+		db := openRawSQLite(t) // database/sql default: unlimited connections
+		_, err := sqlstore.New(ctx, db, sqlstore.EngineSQLite)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "SetMaxOpenConns(1)",
+			"the error must name the fix, not just the symptom")
+	})
+
+	t.Run("oversized pool is refused", func(t *testing.T) {
+		db := openRawSQLite(t)
+		db.SetMaxOpenConns(4)
+		_, err := sqlstore.New(ctx, db, sqlstore.EngineSQLite)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "MaxOpenConnections=4")
+	})
+
+	t.Run("pinned is accepted", func(t *testing.T) {
+		db := openRawSQLite(t)
+		db.SetMaxOpenConns(1)
+		s, err := sqlstore.New(ctx, db, sqlstore.EngineSQLite)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = s.Close(ctx) })
+
+		// Fully usable: migrations ran against the shared handle.
+		op := utxostoretest.NewOutpoint("pinned-shared", 0)
+		mint := utxostoretest.NewMint(op, 1, "default", utxostore.TierMined, 400)
+		require.NoError(t, s.Mint(ctx, []*utxostore.Mint{mint}))
+		require.NoError(t, mint.Err)
+	})
+
+	t.Run("OpenSQLite pins its own pool", func(t *testing.T) {
+		s := newSQLiteStore(t)
+		require.Equal(t, 1, s.DB().Stats().MaxOpenConnections)
+	})
+}
+
+// TestSpendGuardsAreInTheWhere exercises the UPDATE-first spend path (audit
+// P1-7): the guarded UPDATE re-asserts the reservation token, so a spend under
+// the wrong token matches nothing and the taxonomy is produced by the follow-up
+// classification read rather than by a pre-flight SELECT. Both halves of that
+// n==0 branch are covered — the refusal AND the idempotent same-spender replay,
+// which is the one n==0 outcome that must still be a success.
+func TestSpendGuardsAreInTheWhere(t *testing.T) {
+	ctx := context.Background()
+	store := newSQLiteStore(t)
+	sc := utxostore.Scope{UserID: 1, Basket: "default", Tier: utxostore.TierMined}
+
+	utxostoretest.MintTx(t, store, "guard-where", 1, "default", utxostore.TierMined, 100)
+	claimed, err := store.ClaimExact(ctx, sc, "res-B", 100, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	op := claimed[0].Outpoint
+
+	// Held by B, spent under A: the reserved_by conjunct rejects the UPDATE and
+	// the classifier names the real holder.
+	thief := &utxostore.SpendOp{Outpoint: op, Reservation: "res-A", SpendingTxID: utxostoretest.NewTxID("thief")}
+	err = store.Spend(ctx, []*utxostore.SpendOp{thief}, false)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	var resErr *utxostore.ReservedError
+	require.ErrorAs(t, thief.Err, &resErr)
+	require.Equal(t, "res-B", resErr.HeldBy)
+
+	got, err := store.Get(ctx, op)
+	require.NoError(t, err)
+	require.Nil(t, got.SpentBy, "a rejected guard must leave the row unspent")
+
+	// The holder spends it, then replays: the replay's UPDATE matches nothing
+	// (spent_by IS NULL is false now), and the classifier turns that into the
+	// idempotent success rather than an error.
+	winner := utxostoretest.NewTxID("guard-where-winner")
+	sp := &utxostore.SpendOp{Outpoint: op, Reservation: "res-B", SpendingTxID: winner}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
+	require.NoError(t, sp.Err)
+
+	replay := &utxostore.SpendOp{Outpoint: op, Reservation: "res-B", SpendingTxID: winner}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{replay}, false))
+	require.NoError(t, replay.Err)
+}
+
+// TestRemoveGuardsAreInTheWhere is the DELETE-first twin: a reserved row is
+// refused by the guarded DELETE and classified afterwards, and a missing row
+// stays a silent no-op even though nothing was read first.
+func TestRemoveGuardsAreInTheWhere(t *testing.T) {
+	ctx := context.Background()
+	store := newSQLiteStore(t)
+	sc := utxostore.Scope{UserID: 1, Basket: "default", Tier: utxostore.TierMined}
+
+	ops := utxostoretest.MintTx(t, store, "remove-where", 1, "default", utxostore.TierMined, 100, 200)
+	claimed, err := store.ClaimExact(ctx, sc, "res-hold", 100, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	missing := utxostoretest.NewOutpoint("remove-where-missing", 7)
+	err = store.Remove(ctx, []utxostore.Outpoint{claimed[0].Outpoint, ops[1], missing}, false)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	var resErr *utxostore.ReservedError
+	require.ErrorAs(t, err, &resErr)
+	require.Equal(t, "res-hold", resErr.HeldBy)
+
+	// The unreserved sibling was still removed, and the missing row contributed
+	// no error at all.
+	_, err = store.Get(ctx, ops[1])
+	require.ErrorIs(t, err, &utxostore.NotFoundError{})
+	_, err = store.Get(ctx, claimed[0].Outpoint)
+	require.NoError(t, err, "the refused row survives")
 }

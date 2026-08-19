@@ -68,10 +68,15 @@ type Config struct {
 	AeroNamespace string
 	AeroSet       string
 
-	// MaxDBConns caps the shared SQL connection pool (Postgres/SQLite). It is a
-	// primary throughput knob for the SQL backends: too low and workers queue
-	// on connections, too high and Postgres context-switches. 0 leaves the
-	// driver default.
+	// MaxDBConns caps the shared PostgreSQL connection pool. It is a primary
+	// throughput knob there: too low and workers queue on connections, too high
+	// and Postgres context-switches. 0 leaves the driver default.
+	//
+	// It is IGNORED on SQLite, whose pool stays pinned to the single writer
+	// connection its constructor installs. SQLite serializes writes, so a wider
+	// pool buys no parallelism it can use — it only converts that serialization
+	// into SQLITE_BUSY, and both metastore.New and sqlstore.New refuse a shared
+	// SQLite handle that is not pinned.
 	MaxDBConns int
 
 	// Network and StorageName flow through to the provider settings.
@@ -156,9 +161,15 @@ func newSQL(
 	}
 
 	// Share one SQL connection pool between the metastore and the sqlstore
-	// utxostore (Mode A). The pool size gates write concurrency directly.
+	// utxostore (Mode A). The pool size gates write concurrency directly — on
+	// PostgreSQL. SQLite stays pinned to the single writer connection its
+	// constructor installed however MaxDBConns is set: widening it does not buy
+	// write parallelism SQLite can use, it only manufactures SQLITE_BUSY, and
+	// sqlstore.New now refuses a shared SQLite handle that is not pinned. Gate
+	// on the store's own dialect rather than this call's sqlite flag, so the
+	// posture cannot drift from the handle actually in hand.
 	db := meta.DB()
-	if cfg.MaxDBConns > 0 {
+	if cfg.MaxDBConns > 0 && meta.Engine() != metastore.EngineSQLite {
 		db.SetMaxOpenConns(cfg.MaxDBConns)
 		db.SetMaxIdleConns(cfg.MaxDBConns)
 	}

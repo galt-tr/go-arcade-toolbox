@@ -38,13 +38,41 @@
 // Both paths carry that retry. Claims went without one for a while, which read
 // as a deliberate asymmetry and was not: SKIP LOCKED removes the common reason a
 // claim would block, but it does not make 40001/40P01/55P03 impossible, and the
-// funder above only retries [utxostore.ErrContention] — which this backend never
-// returns. The result was a lock error on the hottest path failing the call
-// outright while the same error on a cold path was retried three times. Retrying
+// funder above only retries [utxostore.ErrContention], and a raw driver lock
+// error is not that. The result was a lock error on the hottest path failing the
+// call outright while the same error on a cold path was retried three times. Retrying
 // a claim is safe without a transaction because the statement is atomic: a
 // failed attempt committed nothing, so re-running it cannot double-allocate.
 // Under an ambient (Mode A) transaction the retry is skipped and the enclosing
 // unit of work owns recovery.
+//
+// # Guarded mutations
+//
+// Every conditional mutation writes FIRST and carries its preconditions in its
+// own WHERE — Spend re-asserts the reservation token, the unrecorded spend and
+// the absence of a freeze; Remove re-asserts unreserved/unspent/unfrozen;
+// RemoveByMintTx's delete re-asserts unreserved/unspent. They used to SELECT
+// (FOR UPDATE), branch in Go, then write an UNGUARDED statement, which was safe
+// only because of the lock the read had taken: correct on PostgreSQL, and on
+// SQLite correct only through the single writer connection — which [New] could
+// not install on a pool it does not own. That gap (audit P1-7) is closed from
+// both ends: the guards make the write self-defending on any engine, and the
+// constructors now VALIDATE the SQLite pin instead of assuming it.
+//
+// The inversion also removes a round trip from the accept path: the common
+// outcome — one row updated — is now a single statement, and only a write that
+// matched nothing pays for a classifying read. That read is deliberately plain
+// (no FOR UPDATE): the write matched no row, so it holds no lock worth
+// extending, and its answer is confirmed by the next attempt's guarded write
+// anyway. Because a classification can race, each guarded mutation runs a
+// two-attempt loop (guardAttempts) whose second pass exists for one outcome
+// only — the row looked eligible again, meaning a peer released and re-reserved
+// it mid-flight. See the ErrContention note below for what happens after that.
+//
+// [Store.classifyForReserve] is the one read that keeps FOR UPDATE: its
+// all-or-nothing multi-outpoint hold acquires row locks in a canonical order
+// and must keep them for the life of the transaction, so its decision cannot be
+// folded into a single write's WHERE.
 //
 // # Mode A: shared database
 //
@@ -61,17 +89,34 @@
 //
 // Decisions the plan left to this package, made explicitly:
 //
-//   - ErrContention vs (nil, nil). This is a LOCK-based provider, so per the
-//     [utxostore] error taxonomy it NEVER returns [utxostore.ErrContention]. An
-//     empty claim result is always reported as "nothing available" (nil). This
-//     is correct even under SKIP LOCKED contention: the candidate SELECT and
-//     the reserving UPDATE are the SAME statement, so any row a claimer skips
-//     because it is locked is, by construction, being reserved by the peer that
-//     holds its lock in that peer's own atomic statement — the coin is never
-//     orphaned. A claimer that momentarily sees an empty pool therefore loses
-//     no coin by concluding "none": every skipped coin is claimed by someone.
-//     The conformance suite's concurrent-exclusivity subtest confirms every
-//     coin is claimed exactly once with no ErrContention path taken.
+//   - ErrContention vs (nil, nil) on a claim. An empty claim result is not by
+//     itself evidence of contention: the candidate SELECT and the reserving
+//     UPDATE are the SAME statement, so any row a claimer skips under SKIP
+//     LOCKED is being reserved by the peer holding its lock — the coin is never
+//     orphaned, and no retry by this claimer would find it. Whether an empty
+//     result is reported as [utxostore.ErrContention] is therefore a question
+//     about what else the store knows, not about the claim statement's
+//     semantics. Today it knows nothing more, so it reports "none" (nil); the
+//     conformance suite's concurrent-exclusivity subtest confirms every coin is
+//     claimed exactly once along that path.
+//
+//     The guarded mutations have their own ErrContention exit, from an
+//     unrelated cause: Spend (both modes) and Remove report it per item when a
+//     row survives guardAttempts of "guarded write matched nothing, follow-up
+//     read says it is eligible again", and RemoveByMintTx fails the whole call
+//     on the same condition. That is a peer cycling this exact coin — transient
+//     by definition, and to be re-driven rather than recorded as a refusal. It
+//     is unreachable under a correctly pinned SQLite handle (one writer, no
+//     interleaving) and vanishingly rare on PostgreSQL, where the guarded write
+//     already serializes on the row lock.
+//
+//   - SQLite's single writer is validated, not assumed. [OpenSQLite] pins
+//     SetMaxOpenConns(1) on the pool it opens. [New] is handed a pool it does
+//     not own, so it REFUSES a SQLite handle that is not already pinned rather
+//     than resizing a caller's pool behind their back — the same handle is
+//     typically the metastore's, which makes the identical check. Widening a
+//     SQLite pool buys no write parallelism SQLite can use; it only converts
+//     serialization into SQLITE_BUSY.
 //
 //   - SQLite seq. The primary key is composite (txid, vout), so seq cannot be
 //     an INTEGER-PRIMARY-KEY rowid alias. PostgreSQL uses a GENERATED IDENTITY

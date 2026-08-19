@@ -125,10 +125,12 @@
 //
 // Beyond these two, a fact-mode item can still fail for reasons that are not
 // row state: an empty op.Reservation (a programmer error) and transient
-// backend errors — an optimistic backend may report [ErrContention], which is
-// retryable, not skippable and not a double spend. A caller that skips
-// everything except [SpentError] would silently drop those, which is why the
-// skip list is [NotFoundError] alone and not "everything but SpentError".
+// backend errors — a backend may report [ErrContention] when a row would not
+// hold still across its bounded retries, regardless of the store's concurrency
+// style, and that is retryable, not skippable and not a double spend. A caller
+// that skips everything except [SpentError] would silently drop those, which is
+// why the skip list is [NotFoundError] alone and not "everything but
+// SpentError".
 //
 // # Reserving coins the caller named
 //

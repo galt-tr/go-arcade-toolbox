@@ -99,6 +99,11 @@ func WithConnPool(maxOpen, maxIdle int, connMaxIdle, connMaxLife time.Duration) 
 // constructor — the utxostore and metastore share one *sql.DB and enlist in a
 // caller-owned transaction via internal/sqltx. engine must name the dialect db
 // actually speaks.
+//
+// A SQLite db must already be pinned to a single connection
+// (db.SetMaxOpenConns(1)) — the posture [OpenSQLite] and metastore.OpenSQLite
+// install on the pools they own. New validates it and refuses otherwise: the
+// pool is the caller's to size, so the alternative is silently reshaping it.
 func New(ctx context.Context, db *sql.DB, engine Engine, opts ...Option) (*Store, error) {
 	return newStore(ctx, db, engine, false, opts...)
 }
@@ -167,13 +172,24 @@ func newStore(ctx context.Context, db *sql.DB, engine Engine, ownsDB bool, opts 
 	default:
 		return nil, fmt.Errorf("sqlstore: unknown engine %q", engine)
 	}
+	// A SQLite pool this store did NOT open must already be pinned to a single
+	// connection. Validate rather than mutate: the handle belongs to the caller
+	// (in Mode A, to the metastore sharing it), and quietly reshaping somebody
+	// else's pool is a worse surprise than refusing to start. See the "single
+	// writer" note in the package doc for what rests on the pin.
+	if engine == EngineSQLite && !ownsDB {
+		if n := db.Stats().MaxOpenConnections; n != 1 {
+			return nil, fmt.Errorf("sqlstore: a shared SQLite handle must be pinned to one connection "+
+				"(db.SetMaxOpenConns(1)); got MaxOpenConnections=%d", n)
+		}
+	}
 	s := &Store{db: db, engine: engine, ownsDB: ownsDB, now: time.Now}
 	for _, opt := range opts {
 		opt(s)
 	}
 	// The store owns a PostgreSQL pool: size it before migrating (which uses
-	// the pool). SQLite pins SetMaxOpenConns(1) in OpenSQLite and New leaves
-	// the caller's shared pool untouched.
+	// the pool). SQLite pins SetMaxOpenConns(1) in OpenSQLite; a shared SQLite
+	// pool was validated above and is left exactly as the caller sized it.
 	if ownsDB && engine == EnginePostgres {
 		s.pool.ApplyTo(db, defaultPool)
 	}
@@ -293,16 +309,30 @@ func (s *Store) rebind(q string) string {
 	return sqlkit.Rebind(s.engine, q)
 }
 
-// forUpdate is the row-lock clause appended to the guarded read-modify-write
-// SELECTs. PostgreSQL waits on the fixed outpoint's lock (no SKIP LOCKED —
-// there is nothing to skip to); SQLite's single writer connection already
-// serializes, so it needs no clause.
+// forUpdate is the row-lock clause for a SELECT whose decision cannot be folded
+// into the following write's WHERE. PostgreSQL waits on the fixed outpoint's
+// lock (no SKIP LOCKED — there is nothing to skip to); SQLite's single writer
+// connection already serializes, so it needs no clause.
+//
+// Exactly one caller is left: [Store.classifyForReserve], where an all-or-
+// nothing multi-outpoint hold acquires its row locks in a canonical order and
+// must keep them for the life of the transaction. Every other mutation carries
+// its predicates in the write itself (see the "Guarded mutations" note in the
+// package doc), so it has no read to protect.
 func (s *Store) forUpdate() string {
 	if s.engine == EnginePostgres {
 		return " FOR UPDATE"
 	}
 	return ""
 }
+
+// guardAttempts caps a guarded mutation's write→classify→retry loop. The retry
+// exists for exactly one outcome: the guarded write matched nothing, yet the
+// follow-up read finds the row eligible again — a concurrent release, unspend
+// or re-reservation landed between the two statements. One extra attempt
+// settles that flip; a second failure with the row still looking eligible is
+// live contention rather than a lost race, and is reported as such.
+const guardAttempts = 2
 
 // notPinned is the "row is not pinned" predicate. It needs no dialect switch:
 // SQLite has no boolean type, but NOT over an INTEGER 0/1 evaluates correctly
@@ -317,6 +347,12 @@ const notPinned = "NOT pinned"
 // notPinnedOn is [notPinned] for a column carrying a table alias ("u" → "NOT
 // u.pinned"), used by the self-joined stale scan.
 func notPinnedOn(alias string) string { return "NOT " + alias + ".pinned" }
+
+// notFrozen is the "row is not frozen" predicate carried by the guarded
+// mutations. Like [notPinned] it needs no dialect switch: NOT over SQLite's
+// INTEGER 0/1 evaluates correctly, the same ruling [Store.Balance] and the
+// claim statements already make.
+const notFrozen = "NOT frozen"
 
 // boolLit renders a boolean LITERAL for the engine (PostgreSQL TRUE/FALSE,
 // SQLite 1/0), for the SET clauses that carry the value inline rather than as a

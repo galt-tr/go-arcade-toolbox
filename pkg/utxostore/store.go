@@ -204,9 +204,10 @@ type Store interface {
 	//
 	// Beyond those two, a fact-mode item can still fail for reasons that are
 	// not row state: an empty op.Reservation (a programmer error) and
-	// transient backend errors — an optimistic backend may report
-	// [ErrContention], which is retryable, not skippable and not a double
-	// spend.
+	// transient backend errors — a backend may report [ErrContention] when a
+	// row would not hold still across its bounded retries, regardless of the
+	// store's concurrency style. That is retryable, not skippable and not a
+	// double spend.
 	//
 	// Precedence (both modes): an already-recorded spend wins over a freeze —
 	// the spent-state check comes BEFORE the frozen check, so a same-spender

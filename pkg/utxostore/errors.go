@@ -16,22 +16,50 @@ var (
 	ErrBatch = errors.New("utxostore: one or more batch items failed — inspect per-item Err")
 
 	// ErrContention is the transient "could not settle under concurrency"
-	// sentinel of optimistic providers, raised whenever a bounded CAS budget
-	// runs out: a claim whose candidate set was exhausted by concurrent
-	// claimers, a fact-mode Spend that never converged, or a guarded delete
-	// (Remove, RemoveByMintTx) on a row that kept flipping between removable
-	// and held, so that neither a removal nor a refusal would be true of it.
-	// Lock-based providers (SQL, memstore) never return it.
+	// sentinel: a bounded budget for pinning down one row's state ran out with
+	// NEITHER outcome true of it, so the store reports the ambiguity instead of
+	// guessing. It names a CAUSE, not a backend and not an operation — read it
+	// as "ask me again", never as a verdict on the coin.
 	//
-	// Retrying may succeed, but only the claim path has an owner that does so:
-	// the funder retries claims inside its bounded budget. The delete and
-	// fact-mode-spend producers have NO outer retry owner today. Their callers
-	// either tolerate the error — an un-forced Remove reports it per item under
-	// [ErrBatch], so a caller filtering on ErrBatch reads it as one more
-	// refusal — or propagate it and rely on their own re-drive; e.g. the
+	// Do not infer the producer set from a store's concurrency style. Optimistic
+	// and lock-based backends alike raise it, because both can lose a write to a
+	// peer and then fail to classify the loss. Two causes exist today:
+	//
+	//   - A candidate set consumed by peers. Coins existed, but racing claimers
+	//     took every one, so an empty answer would understate the pool. Who can
+	//     tell that apart from a genuinely empty pool varies: a store may see it
+	//     within one claim statement, or a caller may only establish it after
+	//     its own bounded retries. Where the funder is the retrier it absorbs
+	//     the error inside its budget; where it is the reporter it hands
+	//     ErrContention on, and nothing above it retries.
+	//
+	//   - A row that would not hold still. A guarded write — a CAS in aerostore,
+	//     a guard-carrying UPDATE/DELETE in sqlstore — matched nothing, yet the
+	//     classifying read that followed found the row eligible again: a peer is
+	//     releasing and re-taking this exact coin right now. After a bounded
+	//     number of passes neither a success nor a typed refusal would be true.
+	//
+	//     Which operations reach that exit differs by backend, so read the
+	//     method's own doc rather than assuming parity. Both backends raise it
+	//     from the guarded deletes (Remove, RemoveByMintTx). sqlstore raises it
+	//     from Spend in BOTH modes. aerostore raises it from fact-mode Spend
+	//     only: its guarded-mode exhaustion reports [ReservedError] naming the
+	//     current holder instead, because under a guard a token mismatch is a
+	//     refusal it can state. A caller recording an already-accepted broadcast
+	//     must tolerate the fact-mode error rather than read it as a refused
+	//     coin.
+	//
+	// Neither the delete nor the spend producer has an outer retry owner. Their
+	// callers either tolerate the error — an un-forced Remove reports it per
+	// item under [ErrBatch], so a caller filtering on ErrBatch reads it as one
+	// more refusal — or propagate it and rely on their own re-drive; e.g. the
 	// reconciler's next tick, an abort returning to the user, or a rejected
 	// ProcessAction whose enclosing metastore transaction rolls back with it,
 	// undoing that pass's failed-status marking so a later pass redoes both.
+	//
+	// The memstore reference implementation never raises it, because one mutex
+	// spans its whole check-and-write and leaves no window for a peer to race
+	// into. That is a property of that implementation alone.
 	ErrContention = errors.New("utxostore: contention — candidates exhausted, retry")
 )
 

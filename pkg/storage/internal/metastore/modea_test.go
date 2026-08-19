@@ -2,11 +2,14 @@ package metastore_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqlkit"
 	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/metastore"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
@@ -128,4 +131,43 @@ func TestModeB_ForeignTransactionNotReused(t *testing.T) {
 	_, found, err = meta.Transactions().FindByReference(ctx, uid, "modeb-commit")
 	require.NoError(t, err)
 	require.True(t, found, "write survives the foreign transaction's rollback")
+}
+
+// TestNewRejectsUnpinnedSQLitePool is the metastore half of the Mode A
+// construction guard (audit P1-7). [metastore.OpenSQLite] pins the pool to one
+// connection because SQLite serializes writes; [metastore.New] is handed a pool
+// it does not own and so can only INSIST on that posture. Validating beats
+// silently resizing: the handle is typically the one the utxostore is about to
+// share, and a constructor that reshapes a caller's pool is a worse surprise
+// than one that refuses to start.
+func TestNewRejectsUnpinnedSQLitePool(t *testing.T) {
+	ctx := context.Background()
+
+	openRaw := func(t *testing.T) *sql.DB {
+		t.Helper()
+		db, err := sql.Open("sqlite", sqlkit.SQLiteDSN(filepath.Join(t.TempDir(), "shared-meta.db")))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+
+	t.Run("unpinned is refused", func(t *testing.T) {
+		_, err := metastore.New(ctx, openRaw(t), metastore.EngineSQLite)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "SetMaxOpenConns(1)",
+			"the error must name the fix, not just the symptom")
+	})
+
+	t.Run("pinned is accepted", func(t *testing.T) {
+		db := openRaw(t)
+		db.SetMaxOpenConns(1)
+		s, err := metastore.New(ctx, db, metastore.EngineSQLite)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = s.Close(ctx) })
+		require.NotZero(t, mustUser(ctx, t, s, "shared-pinned-user"), "migrations ran on the shared handle")
+	})
+
+	t.Run("OpenSQLite pins its own pool", func(t *testing.T) {
+		require.Equal(t, 1, newSQLiteMeta(t).DB().Stats().MaxOpenConnections)
+	})
 }
