@@ -5,6 +5,13 @@
 // as the fake for funder unit tests. It is fully thread-safe; every method is
 // a single critical section, which trivially satisfies the per-item atomicity
 // and single-round-trip claim contracts.
+//
+// That single critical section is also why none of the delete paths (Remove,
+// RemoveByMintTx, RemoveSpentBy) needs the compare-and-set guard an optimistic
+// backend's does — see the delete-time filters aerostore added for audit
+// finding P1-1. Each classifies a row and deletes it while holding s.mu, so no
+// concurrent reserve, spend or freeze can land in between and no delete can
+// destroy a row that stopped being removable.
 package memstore
 
 import (
@@ -152,7 +159,9 @@ func (s *Store) Get(_ context.Context, op utxostore.Outpoint) (*utxostore.UTXO, 
 }
 
 // Remove implements [utxostore.Store]. Missing rows are no-ops; without
-// force, reserved/spent/frozen rows are refused per item.
+// force, reserved/spent/frozen rows are refused per item. Classification and
+// delete share one critical section, so the sequence needs no compare-and-set
+// guard; see the package doc.
 func (s *Store) Remove(_ context.Context, ops []utxostore.Outpoint, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

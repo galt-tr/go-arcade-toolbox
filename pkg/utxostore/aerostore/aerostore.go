@@ -113,6 +113,25 @@ type Store struct {
 	// production leaves it nil so the check is a single predictable branch.
 	restoreRaceHook func()
 
+	// removeRaceHook, when non-nil, is invoked by the guarded delete paths
+	// (Remove, RemoveByMintTx, RemoveSpentBy) immediately BEFORE each guarded
+	// delete. It is a TEST-ONLY seam for deterministically landing a concurrent
+	// reserve/spend/unspend inside the caller's snapshot→delete window (audit
+	// P1-1); production leaves it nil so the check is a single predictable
+	// branch.
+	//
+	// The seam cannot reach the [utxostore.ErrContention] branches of those
+	// paths: it fires on the caller's own goroutine, so the transition it lands
+	// is still in place when the loop re-reads, and the re-read always classifies
+	// the row as held. Exhausting the budget needs the state to flip BACK and be
+	// taken again inside the same window, which no seam can stage and which real
+	// churn hits far too rarely to test (the concurrent remove/claim test drives
+	// that churn and reports how often it got there — measured runs saw a first
+	// guard loss roughly once per thousand attempts and a second one never). So
+	// those branches are defensive: unreachable by construction here, and safe
+	// by the same invariant the guard itself enforces.
+	removeRaceHook func()
+
 	closeOnce sync.Once
 	closed    atomic.Bool
 }
@@ -423,11 +442,22 @@ func (s *Store) keyFor(op utxostore.Outpoint) (*as.Key, error) {
 	return k, nil
 }
 
-// deleteWritePolicy returns a write policy for deletes, honoring the resolved
-// durable-delete setting.
-func (s *Store) deleteWritePolicy() *as.WritePolicy {
+// deletePolicy returns the write policy for record deletes, honoring the
+// resolved durable-delete setting. filter == nil keeps an unguarded delete (the
+// force paths, where the caller has explicitly asserted authority over the row);
+// a non-nil filter re-asserts the state the caller classified from its snapshot,
+// so a concurrent reserve/spend/freeze landing between that snapshot and the
+// delete FILTERs the delete out instead of destroying a live row — which would
+// silently remove an input of an in-flight broadcast (audit P1-1).
+//
+// A FilterExpression rather than a GenerationPolicy: generation counts ANY
+// concurrent write, so a benign one (a Promote tier bump, say) would abort a
+// legitimate remove, whereas the filter names exactly the states that must veto
+// it.
+func (s *Store) deletePolicy(filter *as.Expression) *as.WritePolicy {
 	wp := as.NewWritePolicy(0, 0)
 	wp.DurableDelete = s.durableDeletes
+	wp.FilterExpression = filter
 	return wp
 }
 
@@ -511,6 +541,14 @@ func asString(v any) string {
 
 // --- shared op helpers ------------------------------------------------------
 
+// casAttempts is the per-outpoint budget shared by every snapshot → classify →
+// guarded-CAS loop (spendOne, removeOne, removeMintTxOp). One retry covers the
+// realistic case — a transition landed inside the window and the re-read now
+// sees it — plus the case where it landed and then undid itself. Past that the
+// row is reported as contended rather than acted on with a stale
+// classification, which keeps worst-case latency bounded under contention.
+const casAttempts = 2
+
 // getRecord fetches the record for op. found is false (with nil error) when the
 // outpoint is absent.
 func (s *Store) getRecord(op utxostore.Outpoint) (rec *as.Record, found bool, err error) {
@@ -526,6 +564,60 @@ func (s *Store) getRecord(op utxostore.Outpoint) (rec *as.Record, found bool, er
 		return nil, false, fmt.Errorf("aerostore: get %s: %w", op, aerr)
 	}
 	return r, true, nil
+}
+
+// deleteResult is what one guarded delete did. The three real cases are
+// distinct because the callers report them differently: only deleteRemoved may
+// be counted as a removal, deleteGuardLost must be re-read and re-classified,
+// and deleteAbsent is a row somebody else already took care of. The zero value
+// is none of them, so a result that was never assigned cannot pass for an
+// outcome.
+type deleteResult int
+
+const (
+	deleteInvalid   deleteResult = iota // zero value: no outcome; accompanies an error
+	deleteRemoved                       // the record existed and is now deleted
+	deleteGuardLost                     // FILTERED_OUT: the row changed state and survives
+	deleteAbsent                        // there was no record to delete
+)
+
+// deleteRecordGuarded deletes op's record under filter (nil = unguarded; see
+// [Store.deletePolicy]). A guarded delete fires the test-only remove-race seam
+// first, so a test can land a concurrent transition inside exactly the window
+// the guard exists to close.
+//
+// The driver reports the two non-delete outcomes asymmetrically: unlike Operate,
+// which fails a missing record with KEY_NOT_FOUND, Delete maps that case to
+// existed=false with a NIL error — hence deleteAbsent comes from the returned
+// flag while deleteGuardLost comes from a FILTERED_OUT error, and there is no
+// KEY_NOT_FOUND branch here.
+func (s *Store) deleteRecordGuarded(op utxostore.Outpoint, filter *as.Expression) (deleteResult, error) {
+	key, kerr := s.keyFor(op)
+	if kerr != nil {
+		return deleteInvalid, kerr
+	}
+	if filter != nil {
+		s.fireRemoveRaceHook() // guarded deletes only: force races nothing
+	}
+	existed, derr := s.client.Delete(s.deletePolicy(filter), key)
+	if derr != nil {
+		if derr.Matches(types.FILTERED_OUT) {
+			return deleteGuardLost, nil // the row is no longer removable
+		}
+		return deleteInvalid, fmt.Errorf("aerostore: delete %s: %w", op, derr)
+	}
+	if !existed {
+		return deleteAbsent, nil
+	}
+	return deleteRemoved, nil
+}
+
+// fireRemoveRaceHook invokes the test-only remove-race seam if one is set.
+// See the removeRaceHook field.
+func (s *Store) fireRemoveRaceHook() {
+	if s.removeRaceHook != nil {
+		s.removeRaceHook()
+	}
 }
 
 // noteClaimable tells the claim cache (when enabled) that a coin has been made

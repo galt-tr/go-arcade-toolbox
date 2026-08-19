@@ -81,9 +81,9 @@ func (s *Store) spendOne(sp *utxostore.SpendOp, force bool) error {
 		ops = append(ops, removeBinOp(binClaimKey))
 	}
 
-	// Two attempts: the guard-failure classification can, under a concurrent
+	// casAttempts: the guard-failure classification can, under a concurrent
 	// release+re-reserve, observe a state that is spendable again; retry once.
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < casAttempts; attempt++ {
 		_, aerr := s.client.Operate(wp, key, ops...)
 		if aerr == nil {
 			return nil // spent
@@ -219,16 +219,23 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 // RemoveSpentBy implements [utxostore.Store]: deletes every row spent by
 // spendingTxID, a now-terminal (mined) tx whose inputs are permanently
 // consumed. There is no secondary index on spentBy, so this runs a filtered set
-// scan and durably deletes each match; a spentBy SI would optimize it if
-// aerostore ever became a mined-heavy hot path, but mined-apply is not a hot
-// path. Idempotent; returns the number of rows removed.
+// scan and durably deletes each match under a delete-time guard re-asserting
+// that same spentBy; a spentBy SI would optimize it if aerostore ever became a
+// mined-heavy hot path, but mined-apply is not a hot path. Idempotent; returns
+// the number of rows removed.
 func (s *Store) RemoveSpentBy(_ context.Context, spendingTxID chainhash.Hash) (int, error) {
 	if s.closed.Load() {
 		return 0, errClosed
 	}
+	// The same predicate serves twice: as the scan's filter, and then as each
+	// delete's guard, so a row that a concurrent Unspend (or a re-spend by
+	// another transaction) took over between the scan and the delete is filtered
+	// out instead of being destroyed (audit P1-1).
+	spentByTx := as.ExpEq(as.ExpBlobBin(binSpentBy), as.ExpBlobVal(spendingTxID[:]))
+
 	stmt := as.NewStatement(s.namespace, s.set)
 	qp := as.NewQueryPolicy()
-	qp.FilterExpression = as.ExpEq(as.ExpBlobBin(binSpentBy), as.ExpBlobVal(spendingTxID[:]))
+	qp.FilterExpression = spentByTx
 	rs, err := s.client.Query(qp, stmt)
 	if err != nil {
 		return 0, fmt.Errorf("aerostore: remove-spent-by query: %w", err)
@@ -246,10 +253,17 @@ func (s *Store) RemoveSpentBy(_ context.Context, spendingTxID chainhash.Hash) (i
 	}
 	removed := 0
 	for _, op := range ops {
-		if derr := s.deleteRecord(op); derr != nil {
+		res, derr := s.deleteRecordGuarded(op, spentByTx)
+		if derr != nil {
 			return removed, derr
 		}
-		removed++
+		// Only a row this call actually deleted counts: a guard loss means a
+		// concurrent Unspend reclaimed it (it is alive and must be left alone),
+		// and an absent row was removed by someone else between the scan and
+		// here — neither is a removal by us.
+		if res == deleteRemoved {
+			removed++
+		}
 	}
 	return removed, nil
 }

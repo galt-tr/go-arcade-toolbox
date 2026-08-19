@@ -15,10 +15,23 @@ var (
 	// slot (Remove, Freeze, Unfreeze, ReserveOutpoints).
 	ErrBatch = errors.New("utxostore: one or more batch items failed — inspect per-item Err")
 
-	// ErrContention is returned by optimistic providers when their CAS
-	// candidate set is exhausted by concurrent claimers. It is transient:
-	// the funder performs the outer retry. Lock-based providers (SQL,
-	// memstore) never return it.
+	// ErrContention is the transient "could not settle under concurrency"
+	// sentinel of optimistic providers, raised whenever a bounded CAS budget
+	// runs out: a claim whose candidate set was exhausted by concurrent
+	// claimers, a fact-mode Spend that never converged, or a guarded delete
+	// (Remove, RemoveByMintTx) on a row that kept flipping between removable
+	// and held, so that neither a removal nor a refusal would be true of it.
+	// Lock-based providers (SQL, memstore) never return it.
+	//
+	// Retrying may succeed, but only the claim path has an owner that does so:
+	// the funder retries claims inside its bounded budget. The delete and
+	// fact-mode-spend producers have NO outer retry owner today. Their callers
+	// either tolerate the error — an un-forced Remove reports it per item under
+	// [ErrBatch], so a caller filtering on ErrBatch reads it as one more
+	// refusal — or propagate it and rely on their own re-drive; e.g. the
+	// reconciler's next tick, an abort returning to the user, or a rejected
+	// ProcessAction whose enclosing metastore transaction rolls back with it,
+	// undoing that pass's failed-status marking so a later pass redoes both.
 	ErrContention = errors.New("utxostore: contention — candidates exhausted, retry")
 )
 
