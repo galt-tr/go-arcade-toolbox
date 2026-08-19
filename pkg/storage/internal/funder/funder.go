@@ -28,6 +28,12 @@ const (
 	// backoff bounds for the jittered wait between contention retries.
 	minBackoff = 25 * time.Millisecond
 	maxBackoff = 100 * time.Millisecond
+
+	// releaseTimeout bounds the detached compensating release: generous for the
+	// single indexed UPDATE it issues, short enough that a shutdown is never
+	// held up waiting on it. Twin of storage.releaseTimeout, which bounds the
+	// same compensation on the Mode B CreateAction path.
+	releaseTimeout = 5 * time.Second
 )
 
 // Funder selects and reserves coins from a [utxostore.Store] to cover a funding
@@ -343,7 +349,11 @@ func (f *Funder) drainBatch(ctx context.Context, args FundArgs, collector *utxoC
 	}
 
 	// Release the unconsumed remainder so those coins re-enter the claimable
-	// pool for the next round's smallest-sufficient claim.
+	// pool for the next round's smallest-sufficient claim. This one stays on the
+	// REQUEST context, unlike Fund's terminal compensating release: it is
+	// mid-flow, so its failure propagates to Fund, whose detached release then
+	// frees the whole token — detaching it here would only mask cancellation on
+	// the success path.
 	if consumed < len(batch) {
 		if err := f.releaseOutpoints(ctx, args.Reservation, batch[consumed:]); err != nil {
 			return allocated, err
@@ -354,10 +364,32 @@ func (f *Funder) drainBatch(ctx context.Context, args FundArgs, collector *utxoC
 
 // release frees every row held under (userID, reservation); best-effort, errors
 // are logged, not propagated (the primary outcome is already decided).
+//
+// It runs on a context DETACHED from the caller's cancellation, bounded by
+// releaseTimeout. This is compensation for a fund attempt that already failed,
+// and it has to run even when the request that started it is gone: a canceled
+// context fails a SQL store at BeginTx before a single row is touched, so every
+// coin this attempt reserved would stay held until the stale-reservation sweep
+// (15 minutes) frees it. That is the whole orphaned-reservation window this
+// detach closes, and it is exactly the case a client hang-up or an expired
+// request deadline produces.
+//
+// [context.WithoutCancel] preserves context VALUES, which is what makes the
+// detach safe in Mode A: the ambient transaction the metastore threads through
+// the context is still found, so the release enlists in the caller's
+// transaction rather than opening a second one. If that transaction was itself
+// doomed by the cancellation the release fails with sql.ErrTxDone and the
+// rollback frees the rows anyway — harmless either way. The detach materially
+// matters in Mode B and standalone use, where the release runs on its own
+// pooled connection. Precedent: the cursor flush in
+// pkg/monitor/status_events.go.
 func (f *Funder) release(ctx context.Context, userID int64, reservation string) {
-	if _, err := f.store.ReleaseReservation(ctx, userID, reservation); err != nil {
-		f.logger.WarnContext(ctx, "failed to release reservation",
-			logging.Reference(reservation), logging.Error(err))
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if _, err := f.store.ReleaseReservation(rctx, userID, reservation); err != nil {
+		f.logger.WarnContext(rctx, "failed to release reservation",
+			logging.Reference(reservation), logging.Error(err),
+			slog.Bool("requestCtxCanceled", ctx.Err() != nil))
 	}
 }
 

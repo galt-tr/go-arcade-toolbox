@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-sdk/script"
@@ -23,6 +24,12 @@ const (
 	referenceLength       = 12
 	derivationPrefixBytes = 16
 	derivationSuffixBytes = 16
+
+	// releaseTimeout bounds the detached whole-token release that compensates a
+	// failed Mode B persist: generous for one indexed UPDATE, short enough that
+	// a shutdown is never held up waiting on it. Twin of funder.releaseTimeout,
+	// which bounds the same compensation on the funding path.
+	releaseTimeout = 5 * time.Second
 )
 
 // outputPlan is the provider's internal description of one output while
@@ -186,9 +193,17 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		return nil, mapFundError(err)
 	}
 	if err := p.meta.Do(ctx, func(ctx context.Context) error { return persist(ctx, fundRes) }); err != nil {
-		if _, rerr := p.utxo.ReleaseReservation(ctx, int64(userID), reference); rerr != nil {
-			p.logger.WarnContext(ctx, "failed to release reservation after create failure",
-				"reference", reference, "error", rerr)
+		// Compensate on a context DETACHED from the request's cancellation: a
+		// canceled request is one of the likeliest reasons the persist just
+		// failed, and a canceled context fails the release at BeginTx without
+		// touching a row — leaving every coin this action reserved held until
+		// the stale-reservation sweep. WithoutCancel keeps context values, so
+		// nothing else about the call changes.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		defer cancel()
+		if _, rerr := p.utxo.ReleaseReservation(rctx, int64(userID), reference); rerr != nil {
+			p.logger.WarnContext(rctx, "failed to release reservation after create failure",
+				"reference", reference, "error", rerr, "requestCtxCanceled", ctx.Err() != nil)
 		}
 		return nil, fmt.Errorf("storage: persist create action: %w", err)
 	}

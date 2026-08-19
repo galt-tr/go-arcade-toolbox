@@ -164,6 +164,41 @@ func (r *recordingStore) ClaimExact(ctx context.Context, s utxostore.Scope, rese
 	return r.Store.ClaimExact(ctx, s, reservation, denomination, count)
 }
 
+// releaseObservation is what a compensating ReleaseReservation saw when it ran:
+// the error state of the context it was handed, and whether that context
+// carried a deadline.
+type releaseObservation struct {
+	ctxErr      error
+	hasDeadline bool
+}
+
+// releaseSpy wraps a Store and records the context state observed at
+// ReleaseReservation call time, so a test can assert Fund's terminal
+// compensating release runs on a LIVE, deadline-bounded context even when the
+// request context that entered Fund is already canceled.
+type releaseSpy struct {
+	utxostore.Store
+	mu    sync.Mutex
+	calls []releaseObservation
+}
+
+func newReleaseSpy(inner utxostore.Store) *releaseSpy { return &releaseSpy{Store: inner} }
+
+func (r *releaseSpy) ReleaseReservation(ctx context.Context, userID int64, reservation string) (int, error) {
+	_, hasDeadline := ctx.Deadline()
+	r.mu.Lock()
+	r.calls = append(r.calls, releaseObservation{ctxErr: ctx.Err(), hasDeadline: hasDeadline})
+	r.mu.Unlock()
+	return r.Store.ReleaseReservation(ctx, userID, reservation)
+}
+
+// releases returns a copy of every ReleaseReservation observation so far.
+func (r *releaseSpy) releases() []releaseObservation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]releaseObservation(nil), r.calls...)
+}
+
 // contentionStore fails the first failCount claim calls with
 // utxostore.ErrContention before delegating, simulating an optimistic backend
 // whose CAS candidate set is exhausted by concurrent claimers.
