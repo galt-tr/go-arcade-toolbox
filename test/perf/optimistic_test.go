@@ -218,3 +218,163 @@ func envString(key, def string) string {
 	}
 	return def
 }
+
+// TestPerf_PostgresGroupCommit sweeps PostgreSQL's group-commit and WAL settings
+// against the optimistic shape, holding everything else at the configuration
+// that produced the measured peak.
+//
+// Why this test exists: a transaction costs THREE durable commits — one closing
+// CreateAction (create.go), and two inside ProcessAction (processNewTx, then
+// applyAcceptedBroadcast after the broadcast returns). At ~13 ms per durable
+// commit that is roughly 44% of the 87.8 ms end-to-end median, and `LWLock:WALInsert`
+// was already measured at 57.4% of active backends at pool saturation. Group
+// commit attacks exactly that: commit_delay holds a committing transaction
+// briefly so concurrent commits share one fsync.
+//
+// It is the one lever named repeatedly across the docs as the path to 1000+ TPS
+// durably and never once tried — no code, no test, no result. It is also
+// config-only and costs no durability, which is why it is measured before any
+// of the invasive alternatives.
+//
+//	go test -tags perf -run TestPerf_PostgresGroupCommit -timeout 90m ./test/perf/...
+//
+// Each configuration needs its own container: these are server GUCs, and
+// commit_delay/wal_buffers cannot be changed on a running server the way a
+// session setting can. Budget ~2.5 minutes per configuration, most of it seeding.
+func TestPerf_PostgresGroupCommit(t *testing.T) {
+	pool := envInt("PERF_POOL", 100_000)
+	workers := envInt("PERF_WORKERS", 384)
+	duration := envDuration("PERF_DURATION", 30*time.Second)
+	warmup := envDuration("PERF_WARMUP", 8*time.Second)
+
+	// Held identical to the 20260818 optimistic run so the baseline row is
+	// directly comparable to its 1,096-1,140 TPS band. Changing the pool size or
+	// the window here would make the whole sweep uncomparable to that report.
+	configs := []struct {
+		name string
+		args []string
+	}{
+		{"baseline", nil},
+		{"commit_delay=50", []string{"commit_delay=50"}},
+		{"commit_delay=100", []string{"commit_delay=100"}},
+		{"commit_delay=200", []string{"commit_delay=200"}},
+		{"commit_delay=500", []string{"commit_delay=500"}},
+		{"commit_delay=1000", []string{"commit_delay=1000"}},
+		// commit_delay only engages once commit_siblings other transactions are
+		// active. At 384 workers the default 5 should always be met; lowering it
+		// tests that assumption rather than trusting it.
+		{"commit_delay=200,siblings=2", []string{"commit_delay=200", "commit_siblings=2"}},
+		// WAL capacity, independent of the delay.
+		{"wal_buffers=64MB", []string{"wal_buffers=64MB"}},
+		{"max_wal_size=32GB", []string{"max_wal_size=32GB"}},
+	}
+	if only := os.Getenv("PERF_GC_CONFIGS"); only != "" {
+		want := map[string]bool{}
+		for _, f := range strings.Fields(only) {
+			want[f] = true
+		}
+		var kept []struct {
+			name string
+			args []string
+		}
+		for _, c := range configs {
+			if want[c.name] {
+				kept = append(kept, c)
+			}
+		}
+		require.NotEmpty(t, kept, "PERF_GC_CONFIGS matched no configuration")
+		configs = kept
+	}
+
+	type row struct {
+		name string
+		tps  float64
+		p50  float64
+		p99  float64
+	}
+	var rows []row
+
+	for _, c := range configs {
+		t.Run(c.name, func(t *testing.T) {
+			args := append([]string{"max_connections=600"}, c.args...)
+			pg := testenv.StartPostgres(t, testenv.WithPostgresServerArgs(args...))
+
+			cfg := perf.DefaultConfig(perfprovider.BackendPostgres)
+			cfg.PostgresDSN = pg.IsolatedSchemaDSN(t)
+			cfg.Mode = perf.ModeSignAndProcess
+			cfg.Workers = workers
+			cfg.TargetTPS = 0
+			cfg.Duration = duration
+			cfg.Warmup = warmup
+			cfg.PoolSize = pool
+			cfg.Denomination = perf.OptimisticDenomination
+			cfg.PaymentSats = perf.OptimisticPaymentSats
+			cfg.Throughput = true
+			cfg.RunMonitor = false
+			cfg.Mine = false
+			cfg.MaxDBConns = envInt("PERF_MAX_DB_CONNS", workers+16)
+
+			// Group commit is only interesting because it keeps durability. A
+			// sweep that silently relaxed it would just reproduce the known 3.5x
+			// and prove nothing about commit_delay.
+			requireDurableCommit(t, cfg.PostgresDSN)
+			// And the flag has to have actually applied — a mistyped GUC would
+			// otherwise produce a full sweep of identical baselines.
+			logServerSettings(t, cfg.PostgresDSN, c.args)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+			defer cancel()
+
+			res, err := perf.Run(ctx, cfg, nil)
+			require.NoError(t, err)
+			require.Zero(t, res.Contention.ContentionFails,
+				"%d ops failed on funding — the pool drained inside the window",
+				res.Contention.ContentionFails)
+			// commit_delay changes flush timing, not locking. Contention appearing
+			// here would mean something other than the intended variable moved.
+			require.Zero(t, res.Contention.ContentionRetries,
+				"%d contention retries under %s: group commit should not affect locking",
+				res.Contention.ContentionRetries, c.name)
+
+			e2e := res.Phases["e2e"]
+			rows = append(rows, row{c.name, res.Throughput.SustainedTPS, e2e.P50Ms, e2e.P99Ms})
+
+			out := filepath.Join(repoRoot(t), "perf-results",
+				fmt.Sprintf("groupcommit-%s.json", strings.NewReplacer("=", "", ",", "-").Replace(c.name)))
+			require.NoError(t, perf.WriteJSON(res, out))
+			t.Logf("%-28s sustained=%.1f TPS  p50=%.1fms  p99=%.1fms",
+				c.name, res.Throughput.SustainedTPS, e2e.P50Ms, e2e.P99Ms)
+		})
+	}
+
+	t.Log("")
+	t.Logf("GROUP-COMMIT SWEEP — PostgreSQL Mode A, durable, %d workers, pool=%d", workers, pool)
+	t.Logf("%-28s %12s %10s %10s", "config", "TPS", "p50 ms", "p99 ms")
+	for _, r := range rows {
+		t.Logf("%-28s %12.1f %10.1f %10.1f", r.name, r.tps, r.p50, r.p99)
+	}
+	t.Log("Baseline variance at 384 workers is ~4% (1140.0 vs 1096.2 measured 2026-08-18);")
+	t.Log("treat anything inside that band as unchanged until it is re-run.")
+}
+
+// logServerSettings reports the GUCs this run actually got, so a typo in a
+// server flag shows up as a logged default rather than as a sweep of
+// indistinguishable results.
+func logServerSettings(t *testing.T, dsn string, args []string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	for _, name := range []string{"commit_delay", "commit_siblings", "wal_buffers", "max_wal_size"} {
+		var v string
+		if err := db.QueryRow("SHOW " + name).Scan(&v); err != nil {
+			t.Logf("SHOW %s: %v", name, err)
+			continue
+		}
+		t.Logf("  %-16s = %s", name, v)
+	}
+	if len(args) > 0 {
+		t.Logf("  requested: %s", strings.Join(args, " "))
+	}
+}

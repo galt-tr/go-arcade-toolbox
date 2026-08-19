@@ -327,6 +327,25 @@ alone. Report: [64w relaxed durability](20260807-postgres-signandprocess-through
 
 ## Gap analysis — path to 1000+ TPS
 
+> **SUPERSEDED (2026-08-18). Kept for the record; do not plan from it.** This
+> section was written against the Task-27 numbers (~175–210 TPS) and its ranking
+> no longer holds:
+>
+> - **1000 TPS is reached**, durably: ~1,118 TPS at 384 workers on the optimistic
+>   shape, and the curve turns over at 512 — see
+>   [20260818-optimistic-create-ceiling.md](20260818-optimistic-create-ceiling.md).
+> - **Item 1 below is refuted.** `create` is the *cheaper* half: 29.2 ms against
+>   `sign_process` at 56.7 ms. A transaction costs **three** durable commits — one
+>   in `CreateAction` and **two** in `ProcessAction`, separated by the broadcast —
+>   which is exactly that 2:1 ratio, and ~44% of the end-to-end median.
+> - **Items 2, 3 and 5 are done.** Dedicated fuel basket, `COUNT(*)` kill, worker
+>   and connection-pool sweeps (exhausted at 512), `n=1` denomination sizing.
+> - **Item 4 is refuted.** Delayed broadcast does not save a commit: `queueDelayed`
+>   is its own autocommit, and the deferred work is re-done per transaction later.
+>
+> What is actually left: amortizing the flush (group commit), reducing the three
+> commits, and shortening each commit's round trips.
+
 Task 27 wired the fuel-pool `ClaimExact` route and it works, but **neither path
 reaches 1000 TPS on this box** — the ceiling is ~175–210 TPS single-call. With
 claim contention removed, the bottleneck has moved off the claim and onto the

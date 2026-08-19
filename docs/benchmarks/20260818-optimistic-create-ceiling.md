@@ -71,10 +71,31 @@ At 32 workers, low enough that these read as service times rather than queue:
 The same split at 384 workers is create 126.2 / sign_process 204.4 / e2e 349.4 —
 same ratio, inflated by queue.
 
-**`sign_process` costs about twice `create`.** There are two durable commits per
-transaction, one closing each call, plus real secp256k1 signing between them.
-This contradicts the 2026-08-07 gap analysis, which named the create phase the
-wall; on this shape it is the cheaper half.
+**`sign_process` costs about twice `create`, because a transaction costs THREE
+durable commits, not two.** Traced 2026-08-18 after this run:
+
+| # | Site | What commits |
+|---|---|---|
+| 1 | `pkg/storage/create.go:169` | funding claim + all metadata (Mode A: one transaction) |
+| 2 | `pkg/storage/process.go:143` (`processNewTx`) | txid, status, `known_txs` **with `raw_tx`**, change mint |
+| 3 | `pkg/storage/process.go:384` (`applyAcceptedBroadcast`) | status -> unproven, reserved -> spent |
+
+`ProcessAction` commits **twice**, separated by the broadcast — which is exactly
+the observed 2:1 ratio. At ~13 ms per durable commit that is ~39 ms of the
+87.8 ms end-to-end median: **roughly 44% of a transaction is fsync.**
+
+This also contradicts the 2026-08-07 gap analysis, which named the create phase
+the wall; on this shape it is the cheaper half.
+
+Commit 2 is a durability barrier, not redundancy: `FindResendable`
+(`internal/metastore/monitor.go:264`) requires `raw_tx IS NOT NULL`, and commit 2
+is what writes it. Merging it into commit 3 — the obvious way to drop from three
+fsyncs to two — would leave a crash between broadcast and commit with a live
+on-chain transaction and no local record: not resendable, reservation swept, coin
+released. That is the double spend the toolbox exists to prevent, so the merge is
+not available. Reducing the count safely means batching commit 3 across
+concurrent requests (it fails closed: a lost commit 3 leaves inputs reserved),
+or amortizing the flush with group commit.
 
 ## Pool size: 1,000,000 coins
 
