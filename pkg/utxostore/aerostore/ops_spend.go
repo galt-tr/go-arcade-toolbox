@@ -209,8 +209,11 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 			}
 			return released, fmt.Errorf("aerostore: unspend %s: %w", op, aerr)
 		}
-		// The coin is claimable again (unless frozen); re-probe its bucket.
-		s.noteClaimable(u.UserID, u.Basket, u.Tier, u.Satoshis)
+		// The coin is claimable again (unless frozen); re-probe its bucket. The
+		// tier came from the snapshot above, but the restored key's tier came
+		// from the live bin, so mark every tier (see
+		// [Store.noteClaimableAllTiers]).
+		s.noteClaimableAllTiers(u.UserID, u.Basket, u.Satoshis)
 		released++
 	}
 	return released, nil
@@ -223,7 +226,13 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 // that same spentBy; a spentBy SI would optimize it if aerostore ever became a
 // mined-heavy hot path, but mined-apply is not a hot path. Idempotent; returns
 // the number of rows removed.
-func (s *Store) RemoveSpentBy(_ context.Context, spendingTxID chainhash.Hash) (int, error) {
+//
+// Both halves honor ctx. The scan is a FULL SET scan — the most expensive walk
+// in the package — so a caller's expired budget must be able to stop it, and the
+// delete loop is checked per row for the same reason. Stopping early returns the
+// rows removed so far alongside the error; the call is idempotent, so a later
+// one finishes the job.
+func (s *Store) RemoveSpentBy(ctx context.Context, spendingTxID chainhash.Hash) (int, error) {
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -236,23 +245,22 @@ func (s *Store) RemoveSpentBy(_ context.Context, spendingTxID chainhash.Hash) (i
 	stmt := as.NewStatement(s.namespace, s.set)
 	qp := as.NewQueryPolicy()
 	qp.FilterExpression = spentByTx
-	rs, err := s.client.Query(qp, stmt)
-	if err != nil {
-		return 0, fmt.Errorf("aerostore: remove-spent-by query: %w", err)
-	}
 	var ops []utxostore.Outpoint
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return 0, fmt.Errorf("aerostore: remove-spent-by result: %w", res.Err)
-		}
-		u, cerr := recordToUTXO(res.Record)
+	if err := s.streamQuery(ctx, qp, stmt, func(rec *as.Record) error {
+		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
-			return 0, cerr
+			return cerr
 		}
 		ops = append(ops, u.Outpoint)
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("aerostore: remove-spent-by query: %w", err)
 	}
 	removed := 0
 	for _, op := range ops {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
 		res, derr := s.deleteRecordGuarded(op, spentByTx)
 		if derr != nil {
 			return removed, derr

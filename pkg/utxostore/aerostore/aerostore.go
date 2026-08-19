@@ -140,14 +140,16 @@ type Store struct {
 type Option func(*config)
 
 type config struct {
-	now            func() time.Time
-	logger         *slog.Logger
-	set            string
-	user           string
-	password       string
-	durableDeletes *bool // nil = auto-detect from server edition
-	indexTimeout   time.Duration
-	claimCacheSize int // ClaimExact candidate-cache refill batch; <=0 disables
+	now                func() time.Time
+	logger             *slog.Logger
+	set                string
+	user               string
+	password           string
+	durableDeletes     *bool // nil = auto-detect from server edition
+	indexTimeout       time.Duration
+	claimCacheSize     int           // claim candidate-cache refill batch; <=0 disables the cache
+	claimCacheBuckets  int           // LRU cap on cached buckets; <=0 unbounded
+	claimCacheEmptyTTL time.Duration // how long an empty probe suppresses the next one; <=0 never
 }
 
 // defaultClaimCacheSize is the ClaimExact candidate-cache refill batch: one
@@ -156,6 +158,22 @@ type config struct {
 // per-claim index-query rate (and its single-node routing-lock contention) low
 // while bounding queued memory to O(refill) records per live denomination.
 const defaultClaimCacheSize = 512
+
+// defaultClaimCacheBuckets caps how many claimKey snapshots the cache keeps,
+// least-recently-used first. claimKey embeds the user id, so an uncapped map is
+// unbounded in the number of wallets a process has ever served: 1024 buckets is
+// a few hundred wallets' worth of live (basket, tier, value-bucket)
+// combinations, which covers a hot working set while capping the worst case at
+// O(1024 × refill) cached records. Exceeding it costs a re-probe, never an error.
+const defaultClaimCacheBuckets = 1024
+
+// defaultClaimCacheEmptyTTL bounds how long the cache may answer "this bucket is
+// empty" from a previous probe. It is the cross-process staleness bound, not a
+// tuning knob — see the emptyTTL discussion on [claimCache]. One second keeps a
+// funded-by-another-replica wallet unclaimable for at most a second (it used to
+// be until restart) while still collapsing a busy funder's repeated walks over
+// genuinely empty tiers to one probe per bucket per second.
+const defaultClaimCacheEmptyTTL = time.Second
 
 // WithClock overrides the store's clock (used for ReservedAt and CreatedAt).
 // Intended for tests that need deterministic timestamps.
@@ -186,16 +204,37 @@ func WithDurableDeletes(on bool) Option { return func(c *config) { c.durableDele
 // [defaultClaimCacheSize].
 func WithClaimCache(n int) Option { return func(c *config) { c.claimCacheSize = n } }
 
+// WithClaimCacheBuckets caps how many claimKey snapshots the claim cache keeps,
+// evicting least-recently-used. n <= 0 removes the cap (unbounded growth, one
+// entry per (user, basket, tier, value-bucket) the process has claimed from).
+// Defaults to [defaultClaimCacheBuckets].
+func WithClaimCacheBuckets(n int) Option { return func(c *config) { c.claimCacheBuckets = n } }
+
+// WithClaimCacheEmptyTTL bounds how long the claim cache may skip a bucket's
+// index probe after one came back empty. d <= 0 disables that suppression
+// entirely: every claim on an empty bucket probes, which costs queries but
+// removes all cross-process staleness. Defaults to
+// [defaultClaimCacheEmptyTTL].
+//
+// The bound matters in a multi-process deployment: the cache's event-driven
+// invalidation only sees writes made by ITS process, so this is the window in
+// which a coin another replica made claimable can stay invisible here.
+func WithClaimCacheEmptyTTL(d time.Duration) Option {
+	return func(c *config) { c.claimCacheEmptyTTL = d }
+}
+
 // New connects to the Aerospike cluster at host:port serving namespace, runs
 // the fund-safety and edition checks, ensures the secondary indexes exist, and
 // returns a ready store. It fails if the namespace's default-ttl is not 0.
 func New(ctx context.Context, host string, port int, namespace string, opts ...Option) (*Store, error) {
 	cfg := config{
-		now:            time.Now,
-		logger:         slog.Default(),
-		set:            DefaultSet,
-		indexTimeout:   30 * time.Second,
-		claimCacheSize: defaultClaimCacheSize,
+		now:                time.Now,
+		logger:             slog.Default(),
+		set:                DefaultSet,
+		indexTimeout:       30 * time.Second,
+		claimCacheSize:     defaultClaimCacheSize,
+		claimCacheBuckets:  defaultClaimCacheBuckets,
+		claimCacheEmptyTTL: defaultClaimCacheEmptyTTL,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -221,8 +260,13 @@ func New(ctx context.Context, host string, port int, namespace string, opts ...O
 		logger:    cfg.logger.With("component", "aerostore"),
 	}
 	if cfg.claimCacheSize > 0 {
-		s.claimCache = newClaimCache(cfg.claimCacheSize)
+		// The cache reads the SAME clock the store stamps records with, so a
+		// test that freezes or advances time controls the negative cache's TTL
+		// exactly as it controls reservation ages.
+		s.claimCache = newClaimCache(cfg.claimCacheSize, cfg.claimCacheBuckets, cfg.claimCacheEmptyTTL, cfg.now)
 	}
+
+	s.warnOnDynamicClientConfig(as.AEROSPIKE_CLIENT_CONFIG_URL)
 
 	if err := s.checkFundSafety(ctx); err != nil {
 		client.Close()
@@ -285,6 +329,35 @@ func validateDefaultTTL(namespace, raw string) error {
 		return fmt.Errorf("aerostore: REFUSING TO START: namespace %q has default-ttl=%s (must be 0 so UTXO rows never silently expire)", namespace, ttl)
 	}
 	return nil
+}
+
+// warnOnDynamicClientConfig complains, loudly and once at startup, when the
+// aerospike client is loading a DYNAMIC configuration — the one mechanism
+// outside this package that can change a write policy after this package built
+// it.
+//
+// It matters here for a single field. The claim-reserve CAS must never be
+// auto-retried (see [reservePolicy]: the write falsifies its own guard, so a
+// retried in-doubt reserve reads its own success as a lost race and strands a
+// phantom reservation). The client's own default makes that true, and nothing in
+// this package changes it — but a dynamic config carrying max_retries is applied
+// to a COPY of every write policy at command time, so it would re-enable retries
+// on a CAS whose correctness assumes they are off, invisibly to this code and to
+// any test of it.
+//
+// A warning rather than a refusal: the file may well be there for timeouts or
+// replica policy, and the failure it risks is a coin held by an abandoned token
+// until the stale-reservation sweep reclaims it — bad, self-healing, and nothing
+// like the silent fund loss [Store.checkFundSafety] refuses to start over.
+//
+// The URL is a parameter (the client reads it into an exported package variable
+// at init) so the rule is testable without touching the process environment.
+func (s *Store) warnOnDynamicClientConfig(configURL string) {
+	if strings.TrimSpace(configURL) == "" { // the client's own emptiness test
+		return
+	}
+	s.logger.Warn("aerospike client dynamic configuration is active (AEROSPIKE_CLIENT_CONFIG_URL); if it sets max_retries for writes it re-enables auto-retry on the claim-reserve CAS, which is NOT idempotent — a retried in-doubt reserve reports no coin while the server holds it reserved, until the stale-reservation sweep frees it",
+		"configURL", configURL)
 }
 
 // resolveDurableDeletes decides whether deletes carry a tombstone. Explicit
@@ -620,16 +693,54 @@ func (s *Store) fireRemoveRaceHook() {
 	}
 }
 
+// allTiers is every tier a coin can occupy, in ascending order. It exists so
+// the paths that must consider all of them — the server-side claimKey restore
+// ladder and [Store.noteClaimableAllTiers] — enumerate the same set, and adding
+// a tier is one edit rather than a hunt.
+func allTiers() []utxostore.Tier {
+	return []utxostore.Tier{utxostore.TierSending, utxostore.TierUnproven, utxostore.TierMined}
+}
+
 // noteClaimable tells the claim cache (when enabled) that a coin has been made
 // claimable in the (userID, basket, tier, value-bucket) it names, so a bucket
 // last seen empty is re-probed on the next claim. A no-op when the cache is
 // disabled. Callers invoke it AFTER the backing write commits so the coin is
 // already visible to a probe.
+//
+// Only callers that KNOW the tier the coin landed in may use this: Mint (it
+// wrote the tier) and Promote (it wrote the tier). Every restore path must use
+// [Store.noteClaimableAllTiers] instead.
 func (s *Store) noteClaimable(userID int64, basket string, tier utxostore.Tier, sats uint64) {
 	if s.claimCache == nil {
 		return
 	}
 	s.claimCache.markClaimable(claimKeyFor(userID, basket, tier, bucketOf(sats)))
+}
+
+// noteClaimableAllTiers is [Store.noteClaimable] for the restore paths (release,
+// unspend, unfreeze), which do NOT know which tier's bucket the coin became
+// claimable in.
+//
+// They cannot know: [restoreClaimKeyOp] deliberately derives the restored key's
+// tier server-side from the record's LIVE tier bin, so a Promote that landed
+// between the caller's snapshot read and the restore write moves the coin to a
+// different bucket than the snapshot says. Marking the snapshot's tier then
+// invalidated the wrong bucket and left the coin stranded behind the new
+// bucket's empty-probe suppression — claimable on the server, unclaimable
+// through this process, until something else disturbed that bucket (audit
+// P2-6c).
+//
+// Marking all three is three map operations and no I/O, and a spurious mark
+// costs at most one extra probe of a bucket that turns out to be empty. That is
+// the right trade against a coin that no claim can see.
+func (s *Store) noteClaimableAllTiers(userID int64, basket string, sats uint64) {
+	if s.claimCache == nil {
+		return
+	}
+	bucket := bucketOf(sats)
+	for _, t := range allTiers() {
+		s.claimCache.markClaimable(claimKeyFor(userID, basket, t, bucket))
+	}
 }
 
 // restoreClaimKeyOp returns an operation that RESTORES the claimKey bin (making
@@ -659,7 +770,7 @@ func restoreClaimKeyOp(skipWhen *as.Expression, u *utxostore.UTXO) *as.Operation
 	// (write nothing) when skipWhen holds; otherwise select the claimKey string
 	// whose embedded tier matches the record's LIVE tier bin.
 	pairs := []*as.Expression{skipWhen, as.ExpUnknown()}
-	for _, t := range []utxostore.Tier{utxostore.TierSending, utxostore.TierUnproven, utxostore.TierMined} {
+	for _, t := range allTiers() {
 		pairs = append(pairs,
 			as.ExpEq(as.ExpIntBin(binTier), as.ExpIntVal(int64(t))),
 			as.ExpStringVal(claimKeyFor(u.UserID, u.Basket, t, bucket)),

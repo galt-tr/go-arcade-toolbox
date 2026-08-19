@@ -259,8 +259,10 @@ func (s *Store) Unfreeze(_ context.Context, ops []utxostore.Outpoint) error {
 		)
 		switch {
 		case aerr == nil:
-			// The coin may now be claimable again; re-probe its bucket.
-			s.noteClaimable(u.UserID, u.Basket, u.Tier, u.Satoshis)
+			// The coin may now be claimable again; re-probe its bucket. As in
+			// the other restore paths the live tier may have moved under the
+			// snapshot, so mark every tier (see [Store.noteClaimableAllTiers]).
+			s.noteClaimableAllTiers(u.UserID, u.Basket, u.Satoshis)
 		case aerr.Matches(types.KEY_NOT_FOUND_ERROR):
 			itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
 		default:

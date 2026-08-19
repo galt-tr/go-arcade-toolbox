@@ -53,8 +53,13 @@ type candidate struct {
 }
 
 // probe runs a claimKey secondary-index query with an optional server-side
-// value filter and returns up to maxRecords claimable candidates.
-func (s *Store) probe(claimKey string, valueFilter *as.Expression, maxRecords int64) ([]candidate, error) {
+// value filter and returns up to maxRecords claimable candidates. It satisfies
+// the [prober] seam the claim cache probes through.
+//
+// The walk honors ctx (see [Store.streamQuery]): a claim is on the payment hot
+// path, so a caller whose budget has expired must stop paying for index reads
+// rather than finish a query nobody is waiting for.
+func (s *Store) probe(ctx context.Context, claimKey string, valueFilter *as.Expression, maxRecords int64) ([]candidate, error) {
 	stmt := as.NewStatement(s.namespace, s.set)
 	if err := stmt.SetFilter(as.NewEqualFilter(binClaimKey, claimKey)); err != nil {
 		return nil, fmt.Errorf("aerostore: set claim filter: %w", err)
@@ -64,19 +69,46 @@ func (s *Store) probe(claimKey string, valueFilter *as.Expression, maxRecords in
 	if valueFilter != nil {
 		qp.FilterExpression = valueFilter
 	}
-	rs, err := s.client.Query(qp, stmt)
-	if err != nil {
+	var out []candidate
+	if err := s.streamQuery(ctx, qp, stmt, func(rec *as.Record) error {
+		sats, _ := asInt64(rec.Bins[binSats])
+		out = append(out, candidate{rec: rec, sats: uint64(sats)}) //nolint:gosec // satoshis are non-negative
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("aerostore: claim query: %w", err)
 	}
-	var out []candidate
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return nil, fmt.Errorf("aerostore: claim query result: %w", res.Err)
-		}
-		sats, _ := asInt64(res.Record.Bins[binSats])
-		out = append(out, candidate{rec: res.Record, sats: uint64(sats)}) //nolint:gosec // satoshis are non-negative
-	}
 	return out, nil
+}
+
+// sampleSize is how many rows a value-filtered probe asks for when the caller
+// wants `want`: never fewer than [claimSample], so best-fit stays a best-of-N
+// sample rather than "whatever the index happened to return first".
+func sampleSize(want int) int64 {
+	if want < claimSample {
+		return claimSample
+	}
+	return int64(want)
+}
+
+// preferredMatches keeps the candidates satisfying pred, orders them by prefer
+// (nil = any order), and trims to want. The pred pass is defensive — a
+// value-filtered probe already applied the equivalent expression server-side —
+// but pred is the authority on what the caller asked for, and it costs one
+// comparison per sampled row.
+func preferredMatches(cands []candidate, pred func(uint64) bool, prefer func(a, b uint64) bool, want int) []candidate {
+	out := cands[:0:0]
+	for _, c := range cands {
+		if pred(c.sats) {
+			out = append(out, c)
+		}
+	}
+	if prefer != nil {
+		sort.Slice(out, func(i, j int) bool { return prefer(out[i].sats, out[j].sats) })
+	}
+	if len(out) > want {
+		out = out[:want]
+	}
+	return out
 }
 
 // reserve performs the single-record CAS that marks a candidate reserved: it
@@ -90,12 +122,8 @@ func (s *Store) probe(claimKey string, valueFilter *as.Expression, maxRecords in
 // (nil, false) on a lost race (FILTERED_OUT, or KEY_NOT_FOUND if the record was
 // durably deleted), and a non-nil error only for a genuine backend failure.
 func (s *Store) reserve(c candidate, claimKey, reservation string, nowMs int64) (*utxostore.UTXO, bool, error) {
-	wp := as.NewWritePolicy(0, 0)
-	wp.RecordExistsAction = as.UPDATE_ONLY
-	wp.FilterExpression = as.ExpEq(as.ExpStringBin(binClaimKey), as.ExpStringVal(claimKey))
-
 	_, aerr := s.client.Operate(
-		wp, c.rec.Key,
+		reservePolicy(claimKey), c.rec.Key,
 		as.PutOp(as.NewBin(binResBy, reservation)),
 		as.PutOp(as.NewBin(binResAt, nowMs)),
 		removeBinOp(binClaimKey),
@@ -115,12 +143,50 @@ func (s *Store) reserve(c candidate, claimKey, reservation string, nowMs int64) 
 	return u, true, nil
 }
 
+// reservePolicy is the write policy behind the claim-reserve CAS: UPDATE_ONLY
+// (never resurrect a deleted coin) guarded on the row still carrying EXACTLY the
+// claimKey it was probed under.
+//
+// # This CAS MUST NOT be auto-retried
+//
+// It is not idempotent from the client's point of view. The very write it
+// performs — removing claimKey — falsifies its own guard, so a retry of a
+// request that actually SUCCEEDED but whose reply was lost comes back
+// FILTERED_OUT, which [Store.reserve] reads as "lost the race". The coin is then
+// reserved on the server by a token the caller believes it never got: a phantom
+// reservation, freed only by the stale-reservation sweep (audit P2-7).
+//
+// Nothing retries it today, and this constructor is where that stays true:
+// [as.NewWritePolicy] explicitly sets MaxRetries = 0 for exactly this reason
+// ("writes may not be idempotent"), and the store configures no dynamic config
+// provider, which is the one other thing that can raise a write's retry count at
+// command time (WritePolicy.patchDynamic honors Dynamic.Write.MaxRetries).
+// TestReservePolicy_NoRetries pins both halves of that claim.
+//
+// If retries ever DO become desirable here, raising MaxRetries alone is not the
+// fix. The reserve would need a per-call nonce: stamp resBy with a value unique
+// to this attempt (or carry an attempt id in a bin), widen the guard to
+// "claimKey == expected OR resBy == this attempt's nonce", and treat the second
+// arm as a WIN rather than a loss — that makes the retry observe its own
+// completed work instead of mistaking it for somebody else's. Deliberately not
+// implemented: unreachable code guarding an unreachable path is a liability, and
+// the guard above is only correct because nothing retries.
+func reservePolicy(claimKey string) *as.WritePolicy {
+	wp := as.NewWritePolicy(0, 0)
+	wp.RecordExistsAction = as.UPDATE_ONLY
+	wp.FilterExpression = as.ExpEq(as.ExpStringBin(binClaimKey), as.ExpStringVal(claimKey))
+	return wp
+}
+
 // ClaimSmallestSufficient implements [utxostore.Store]. It walks best-fit
 // buckets upward from bucket(minSats), reserving an approximately-smallest
 // sufficient coin. Returns (nil, nil) only when no sufficient claimable coin
 // exists; if candidates were seen but all lost to concurrent claimers it
 // returns [utxostore.ErrContention] (never a false negative).
-func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, reservation string, minSats uint64) (*utxostore.UTXO, error) {
+//
+// The bucket walk honors ctx: it spans up to 64 buckets, each of which can cost
+// an index probe, so a caller whose budget expired mid-walk stops there.
+func (s *Store) ClaimSmallestSufficient(ctx context.Context, sc utxostore.Scope, reservation string, minSats uint64) (*utxostore.UTXO, error) {
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -132,9 +198,12 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 	smallest := func(a, b uint64) bool { return a < b }
 	losses := 0
 	for b := bucketOf(minSats); b < bucketCount; b++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b)
 		for {
-			cands, err := s.claimCands(claimKey, as.ExpGreaterEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(minSats))), sufficient, smallest, 1) //nolint:gosec // satoshi amounts are < 2^63
+			cands, err := s.claimCands(ctx, claimKey, as.ExpGreaterEq(as.ExpIntBin(binSats), as.ExpIntVal(int64(minSats))), sufficient, smallest, 1) //nolint:gosec // satoshi amounts are < 2^63
 			if err != nil {
 				return nil, err
 			}
@@ -163,37 +232,28 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 
 // claimCands returns up to want claimable candidates for claimKey that satisfy
 // pred, preferring by prefer (nil = any order). It draws from the amortized
-// claim cache when enabled — one whole-bucket probe feeds many claims — and
-// falls back to a direct value-filtered index probe (sorted by prefer) when the
-// cache is disabled. Either way the caller must still win the reserve CAS: the
-// candidates are only hints.
-func (s *Store) claimCands(claimKey string, valueFilter *as.Expression, pred func(uint64) bool, prefer func(a, b uint64) bool, want int) ([]candidate, error) {
+// claim cache when enabled — one whole-bucket probe feeds many claims, with
+// valueFilter reserved for the cache's narrow fallback probe — and issues a
+// direct value-filtered index probe when the cache is disabled. Either way the
+// caller must still win the reserve CAS: the candidates are only hints.
+func (s *Store) claimCands(ctx context.Context, claimKey string, valueFilter *as.Expression, pred func(uint64) bool, prefer func(a, b uint64) bool, want int) ([]candidate, error) {
 	if s.claimCache != nil {
-		return s.claimCache.take(s, claimKey, pred, prefer, want)
+		return s.claimCache.take(ctx, s.probe, claimKey, valueFilter, pred, prefer, want)
 	}
 	// Cache disabled: sample at least claimSample rows so best-fit stays a
 	// best-of-sample, then return the preferred `want`.
-	sample := int64(want)
-	if sample < claimSample {
-		sample = claimSample
-	}
-	cands, err := s.probe(claimKey, valueFilter, sample)
+	cands, err := s.probe(ctx, claimKey, valueFilter, sampleSize(want))
 	if err != nil {
 		return nil, err
 	}
-	if prefer != nil {
-		sort.Slice(cands, func(i, j int) bool { return prefer(cands[i].sats, cands[j].sats) })
-	}
-	if len(cands) > want {
-		cands = cands[:want]
-	}
-	return cands, nil
+	return preferredMatches(cands, pred, prefer, want), nil
 }
 
 // ClaimLargestInsufficient implements [utxostore.Store]. It walks buckets
 // downward from bucket(capSats-1), reserving up to limit approximately-largest
-// coins strictly below capSats. A short result is not an error.
-func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, reservation string, capSats uint64, limit int) ([]*utxostore.UTXO, error) {
+// coins strictly below capSats. A short result is not an error. The walk honors
+// ctx, for the same reason [Store.ClaimSmallestSufficient]'s does.
+func (s *Store) ClaimLargestInsufficient(ctx context.Context, sc utxostore.Scope, reservation string, capSats uint64, limit int) ([]*utxostore.UTXO, error) {
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -212,9 +272,12 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 		if len(claimed) >= limit {
 			break
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		claimKey := claimKeyFor(sc.UserID, sc.Basket, sc.Tier, b)
 		for len(claimed) < limit {
-			cands, err := s.claimCands(claimKey, as.ExpLess(as.ExpIntBin(binSats), as.ExpIntVal(int64(capSats))), insufficient, largest, limit-len(claimed)) //nolint:gosec // satoshi amounts are < 2^63
+			cands, err := s.claimCands(ctx, claimKey, as.ExpLess(as.ExpIntBin(binSats), as.ExpIntVal(int64(capSats))), insufficient, largest, limit-len(claimed)) //nolint:gosec // satoshi amounts are < 2^63
 			if err != nil {
 				return nil, err
 			}
@@ -254,8 +317,8 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 // shares one bucket, so candidates come from that bucket filtered to sats ==
 // denomination — served from the amortized claim cache (one whole-bucket probe
 // per batch) when enabled, or a direct index probe otherwise. A result shorter
-// than count is pool underflow, not an error.
-func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation string, denomination uint64, count int) ([]*utxostore.UTXO, error) {
+// than count is pool underflow, not an error. Honors ctx per drain iteration.
+func (s *Store) ClaimExact(ctx context.Context, sc utxostore.Scope, reservation string, denomination uint64, count int) ([]*utxostore.UTXO, error) {
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -273,9 +336,12 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	claimed := make([]*utxostore.UTXO, 0, count)
 	losses := 0
 	for len(claimed) < count {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Exact matches are interchangeable, so no preference ordering — the
 		// cache serves any denomination coin, amortizing the index probe.
-		cands, err := s.claimCands(claimKey, valueFilter, exact, nil, count-len(claimed))
+		cands, err := s.claimCands(ctx, claimKey, valueFilter, exact, nil, count-len(claimed))
 		if err != nil {
 			return nil, err
 		}
@@ -545,7 +611,13 @@ func (s *Store) undoReserveOutpoints(won []*utxostore.UTXO, reservation string) 
 // Idempotent; spent rows are never touched (their reservation is provenance),
 // and pinned rows are never touched (a signed transaction spends them — see
 // [Store.Pin]).
-func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation string) (int, error) {
+//
+// Both halves honor ctx — the membership scan and the per-row release loop — so
+// a canceled sweep stops instead of walking an index and issuing writes for a
+// caller that has gone away. Stopping early is safe: releasing is idempotent and
+// per row, so the count returned with the error is exactly what was freed, and a
+// later call finishes the rest.
+func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservation string) (int, error) {
 	if s.closed.Load() {
 		return 0, errClosed
 	}
@@ -566,25 +638,24 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
 		as.ExpNot(as.ExpBinExists(binPinned)),
 	)
-	rs, err := s.client.Query(qp, stmt)
-	if err != nil {
-		return 0, fmt.Errorf("aerostore: release query: %w", err)
-	}
 
 	var rows []*utxostore.UTXO
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return 0, fmt.Errorf("aerostore: release query result: %w", res.Err)
-		}
-		u, cerr := recordToUTXO(res.Record)
+	if err := s.streamQuery(ctx, qp, stmt, func(rec *as.Record) error {
+		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
-			return 0, cerr
+			return cerr
 		}
 		rows = append(rows, u)
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("aerostore: release query: %w", err)
 	}
 
 	released := 0
 	for _, u := range rows {
+		if err := ctx.Err(); err != nil {
+			return released, err
+		}
 		ok, rerr := s.releaseRow(u, reservation, keepPins)
 		if rerr != nil {
 			return released, rerr
@@ -804,7 +875,10 @@ func (s *Store) releaseRow(u *utxostore.UTXO, reservation string, overridePin bo
 		}
 		return false, fmt.Errorf("aerostore: release %s: %w", u.Outpoint, aerr)
 	}
-	// The coin is claimable again (unless frozen); re-probe its bucket.
-	s.noteClaimable(u.UserID, u.Basket, u.Tier, u.Satoshis)
+	// The coin is claimable again (unless frozen); re-probe its bucket. Which
+	// TIER's bucket is not knowable here — the restore above derived the key
+	// from the record's LIVE tier bin precisely because a Promote may have moved
+	// it since u was read — so all three are marked (audit P2-6c).
+	s.noteClaimableAllTiers(u.UserID, u.Basket, u.Satoshis)
 	return true, nil
 }
