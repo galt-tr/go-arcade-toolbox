@@ -36,9 +36,14 @@ const KnownTxStatusStuck wdk.ProvenTxReqStatus = "stuck"
 //
 // The third fence is an OBLIGATION ON CALLERS, not a property of this constant:
 // every requeue-shaped write must pass [KnownTxNeverRequeueStatuses] as its
-// skip set. Until that provider wiring lands, a re-drive can still resurrect an
-// aborted row — an unguarded Upsert or UpdateStatus will happily move it back
-// to 'unsent', from where the sweep would broadcast it.
+// skip set. An unguarded Upsert or UpdateStatus will happily move an aborted
+// row back to 'unsent', from where the sweep would broadcast it.
+//
+// Wiring status: processNewTx's Upsert passes the set and treats a skip as a
+// hard error, so a re-drive can no longer resurrect an aborted row that way.
+// The provider's other requeue-shaped write, queueDelayed's UpdateStatus, is
+// still unguarded and is owned by the next task in the sequence; until it
+// lands, a delayed send can still walk an aborted row back to 'unsent'.
 const KnownTxStatusAborted wdk.ProvenTxReqStatus = "aborted"
 
 // knownTxPreBroadcastStatuses are the statuses from which a known tx has

@@ -90,6 +90,28 @@ func (p *Provider) abortTxRow(ctx context.Context, userID int, txRow *wdk.TableT
 			}
 			return fmt.Errorf("storage: mark aborted: %w", err)
 		}
+		// Lift the pre-broadcast pin before releasing: processNewTx pins the
+		// reservation the moment it stores a broadcastable raw tx, and
+		// ReleaseReservation is structurally unable to free a pinned row. Abort
+		// is one of the few parties entitled to declare the transaction dead —
+		// the status CAS above has just proved it never left a pre-broadcast
+		// status — so it unpins first.
+		//
+		// CONSTRAINT: this must stay OUTSIDE the txid != "" branch below. A pin
+		// does not imply a txid. In Mode B the pin commits before the metadata
+		// (see processNewTx), so a rolled-back meta half leaves a pinned
+		// reservation on a row that never got one — and that row, still
+		// unsigned, is precisely what AbortAbandoned brings here. Guarding the
+		// Unpin on the txid would strand exactly the case this reclaims.
+		//
+		// Unpin only lifts the pin; the rows stay reserved, and releasing them
+		// is the separate step below. In Mode A both are one transaction. In
+		// Mode B they are not, and that is what the split buys: a crash between
+		// them degrades to a stale reservation the reaper reclaims, never to a
+		// free coin backing bytes someone could still broadcast.
+		if _, err := p.utxo.Unpin(ctx, int64(userID), string(txRow.Reference)); err != nil {
+			return fmt.Errorf("storage: unpin reservation: %w", err)
+		}
 		// Release the funding reservation (frees reserved inputs).
 		if _, err := p.utxo.ReleaseReservation(ctx, int64(userID), string(txRow.Reference)); err != nil {
 			return fmt.Errorf("storage: release reservation: %w", err)

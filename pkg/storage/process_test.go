@@ -127,13 +127,7 @@ func TestProcessAction_Delayed(t *testing.T) {
 	res, signed, coin := h.createAndSign(t, 0x13, 100_000, 40_000)
 	txid := signed.TxID().String()
 
-	out, err := h.p.ProcessAction(ctx, h.auth, wdk.ProcessActionArgs{
-		IsNewTx:   true,
-		IsDelayed: true,
-		Reference: strptr(res.Reference),
-		TxID:      txidPtr(txid),
-		RawTx:     primitives.ExplicitByteArray(signed.Bytes()),
-	})
+	out, err := h.processDelayed(t, res, signed)
 	require.NoError(t, err)
 	assert.Equal(t, 0, h.oracle.calls, "delayed does not broadcast now")
 	require.Len(t, out.SendWithResults, 1)

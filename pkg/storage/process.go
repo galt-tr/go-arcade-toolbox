@@ -80,10 +80,12 @@ func (p *Provider) ProcessAction(ctx context.Context, auth wdk.AuthID, args wdk.
 	return result, nil
 }
 
-// processNewTx validates and persists a freshly-signed transaction: it sets the
-// txid, records the known-tx (raw tx + input BEEF), transitions the transaction
-// out of unsigned, and mints its change into the change basket at TierSending
-// (the txid is now known). Inputs stay reserved until broadcast acceptance.
+// processNewTx validates and persists a freshly-signed transaction: it PINS the
+// funding reservation, sets the txid, records the known-tx (raw tx + input
+// BEEF), transitions the transaction out of unsigned, and mints its change into
+// the change basket at TierSending (the txid is now known). Inputs stay
+// reserved until broadcast acceptance — and, from here on, pinned, so no
+// janitor can free them while the signed bytes are broadcastable.
 func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.ProcessActionArgs) error {
 	if args.Reference == nil {
 		return fmt.Errorf("storage: process new tx requires a reference")
@@ -115,6 +117,25 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 	default:
 		return fmt.Errorf("storage: transaction %q has status %q, not signable", *args.Reference, txRow.Status)
 	}
+	// A re-drive that carries DIFFERENT bytes is refused outright (audit P1-4).
+	// Repointing the row would orphan the raw tx already stored under the old
+	// txid: it stays resendable in known_txs with nothing in transactions
+	// pointing at it, so the wallet can broadcast bytes it no longer believes
+	// it owns. The same bytes arriving twice is the benign case and proceeds.
+	//
+	// Deliberately BELOW the status switch. Of the two statuses that admit a
+	// signer, only 'unprocessed' can legitimately already carry a txid (a
+	// delayed transaction an earlier call persisted); an 'unsigned' row has
+	// none by definition. Every OTHER txid-bearing row — aborted, failed,
+	// sending, completed — is described far better by "not signable" than by a
+	// divergence report, so the switch must get first refusal on it.
+	//
+	// This read is not atomic with the write; it exists for the message. The
+	// actual fence is [metastore.TransactionsRepo.SetTxID]'s CAS below, which
+	// closes the TOCTOU this check cannot.
+	if txRow.TxID != nil && *txRow.TxID != txid {
+		return divergentReDriveErr(*args.Reference, *txRow.TxID, txid)
+	}
 
 	// Hydrate input source transactions from the stored input BEEF so scripts
 	// can be verified and the EF can be built.
@@ -141,12 +162,66 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 	txStatus, ktxStatus := newTxStatuses(args)
 
 	return p.meta.Do(ctx, func(ctx context.Context) error {
+		// PIN FIRST — before anything that makes the transaction broadcastable
+		// (audit P0-4, provider half). A pin is the committed statement "a
+		// signed transaction spends these coins": pinned rows stay reserved and
+		// refuse claims exactly as before, but ReleaseReservation and
+		// FindStaleReservations skip them, so no janitor can free the inputs of
+		// an in-flight send. See [utxostore.Store.Pin].
+		//
+		// The ORDER is the point, and it differs per deployment mode (see the
+		// package doc):
+		//
+		//   Mode A (shared database): this statement runs inside the very
+		//   transaction that stores the raw tx, so the pin and the bytes commit
+		//   or roll back together — atomic, no window at all.
+		//
+		//   Mode B (split stores): the utxostore cannot join the metastore's
+		//   transaction, so the pin commits HERE, before the metadata does.
+		//   That asymmetry is deliberate and fail-safe. A meta half that rolls
+		//   back leaves the row at whichever status the switch above admitted,
+		//   and the two arms differ:
+		//
+		//     'unsigned' — no raw tx exists anywhere, so the pin is a genuine
+		//     orphan holding coins for nothing. The existing AbortAbandoned
+		//     sweep reclaims it, but only once the row has aged past
+		//     failAbandonedAge, so those coins are unavailable until then.
+		//
+		//     'unprocessed' — an earlier call already stored broadcastable bytes
+		//     under this reference. The pin backs a real transaction and is not
+		//     an orphan at all; continuing to hold those coins is correct.
+		//
+		//   Either way the failure mode is availability. The reverse order would
+		//   leave a stored, broadcastable raw tx whose inputs are still
+		//   sweepable: a double-spend window.
+		//
+		// Pin returns how many rows it NEWLY pinned; 0 is not a failure. Both
+		// zero cases are legitimate here — an identical re-drive whose rows are
+		// already pinned, and a reservation whose rows have since been spent or
+		// released. The count is not load-bearing, so it is discarded.
+		if _, err := p.utxo.Pin(ctx, int64(userID), *args.Reference); err != nil {
+			return fmt.Errorf("storage: pin reserved inputs: %w", err)
+		}
 		if err := p.meta.Transactions().SetTxID(ctx, txRow.TransactionID, txid); err != nil {
+			// The CAS refused: the row was bound to different bytes, possibly
+			// by a racer since the pre-check above read it. Fail the action —
+			// never re-read and overwrite, which is the very repointing this
+			// CAS exists to prevent (see SetTxID's caller guidance).
+			if errors.Is(err, metastore.ErrTxIDMismatch) {
+				return divergentReDriveCASErr(*args.Reference, txid, err)
+			}
 			return fmt.Errorf("storage: set txid: %w", err)
 		}
 		if err := p.meta.Transactions().UpdateStatus(ctx, txRow.TransactionID, txStatus, wdk.TxStatusUnsigned, wdk.TxStatusUnprocessed); err != nil {
 			return fmt.Errorf("storage: update tx status: %w", err)
 		}
+		// The skip set makes this Upsert a guarded BACKWARD transition: it
+		// writes a pre-broadcast status, so it must not apply to a known tx
+		// that has been fenced (aborted), has gone terminal
+		// (suspectFailed/stuck/invalid/doubleSpend), is mid-POST (sending), or
+		// is already past the broadcast stage. Without the guard a re-drive
+		// would reset such a row to 'unsent' and hand its bytes straight back
+		// to the send sweep. See [metastore.KnownTxNeverRequeueStatuses].
 		if err := p.meta.KnownTx().Upsert(ctx, metastore.KnownTx{
 			TxID:         txid,
 			Status:       ktxStatus,
@@ -157,11 +232,63 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 			// twice cost a second ~3.4kB TOASTed write per transaction plus a
 			// second clearing UPDATE at MINED, on the WAL-bound hot path. See
 			// Provider.inputBEEFFor for the read side.
-		}); err != nil {
+		}, metastore.KnownTxNeverRequeueStatuses...); err != nil {
+			// A skip is not a benign no-op here: the caller asked to make these
+			// bytes broadcastable and storage is refusing, so the action must
+			// fail rather than report a success it did not deliver. This is a
+			// cold path whose unit of work is about to roll back anyway, so it
+			// spends one more read to name the status that did the refusing —
+			// "aborted" and "completed" call for very different operator
+			// responses, and the guard alone cannot tell them apart.
+			if errors.Is(err, metastore.ErrStatusUpdateSkipped) {
+				return fmt.Errorf("storage: known tx %s is at status %q, which never re-queues "+
+					"for broadcast: %w", txid, p.knownTxStatusFor(ctx, txid), err)
+			}
 			return fmt.Errorf("storage: upsert known tx: %w", err)
 		}
 		return p.mintChange(ctx, userID, txRow.TransactionID, txid)
 	})
+}
+
+// divergentReDriveErr is the refusal for audit P1-4 as [Provider.processNewTx]'s
+// pre-check sees it: the row it read is already bound to another signing, and a
+// reference bound to one signing may never be repointed at another.
+//
+// Both this and [divergentReDriveCASErr] wrap [metastore.ErrTxIDMismatch], so
+// the two in-tree call sites are matchable as one condition. That is the whole
+// of the claim: there is no storage-level exported sentinel for this yet, the
+// way [ErrFeeBelowFloor] exists for the fee floor, so out-of-tree callers have
+// nothing stable to match on. Re-exporting one belongs with C3's abort work,
+// which gives the divergence a documented resolution to point at.
+func divergentReDriveErr(reference, boundTxID, newTxID string) error {
+	return fmt.Errorf("storage: reference %q is already bound to txid %s; refusing re-drive with %s: %w",
+		reference, boundTxID, newTxID, metastore.ErrTxIDMismatch)
+}
+
+// divergentReDriveCASErr is the same refusal detected one layer down, by
+// [metastore.TransactionsRepo.SetTxID]'s CAS, after a racer bound the row
+// between the pre-check's read and this write.
+//
+// It wraps cause rather than the bare sentinel: cause carries the transaction
+// id the CAS was operating on, which is the only identifying detail available
+// here. The winning txid is deliberately absent — learning it would mean
+// re-reading the row, and SetTxID's caller guidance forbids exactly that,
+// because the re-read is the first half of the overwrite this CAS exists to
+// prevent.
+func divergentReDriveCASErr(reference, newTxID string, cause error) error {
+	return fmt.Errorf("storage: reference %q was bound to a different txid concurrently; "+
+		"refusing re-drive with %s: %w", reference, newTxID, cause)
+}
+
+// knownTxStatusFor reports a known tx's current status for use in an error
+// message. It is best-effort by design: the caller is already failing, and a
+// lookup that cannot answer must not replace the real error with its own.
+func (p *Provider) knownTxStatusFor(ctx context.Context, txid string) wdk.ProvenTxReqStatus {
+	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, txid)
+	if err != nil || !found {
+		return "unknown"
+	}
+	return kt.Status
 }
 
 // ErrFeeBelowFloor is returned when a signed transaction's actual fee is below
