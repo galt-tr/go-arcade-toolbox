@@ -165,10 +165,24 @@ func (c *Config) Validate() error {
 	if c.Denomination == 0 {
 		return fmt.Errorf("perf: denomination must be > 0")
 	}
-	// The payment plus a generous per-tx fee headroom must fit inside one coin
-	// so a single claimed coin can normally fund a whole payment.
-	if c.PaymentSats+50_000 >= c.Denomination {
-		return fmt.Errorf("perf: denomination %d too small for payment %d (leave fee headroom)", c.Denomination, c.PaymentSats)
+	// A single claimed coin must be able to fund a whole payment plus its fee.
+	//
+	// The headroom here used to be a flat 50,000 sat, which is far more than any
+	// fee and quietly encoded an assumption this harness should not make: that
+	// every run wants a large remainder, i.e. a change output. The optimistic
+	// ceiling run wants the opposite — a remainder deliberately BELOW the dust
+	// floor, so the funder donates it and no change is minted (see
+	// optimistic.go). That configuration is legal and useful, and the old
+	// constant rejected it outright.
+	//
+	// The real constraint is only that the coin covers the payment and the fee.
+	// minFeeHeadroom is a small absolute floor: a 1-in/1-out transaction costs
+	// about 20 sat at the default 100 sat/kB, so 50 leaves room for a larger
+	// output script or a higher rate without pretending to size change.
+	const minFeeHeadroom = 50
+	if c.Denomination < c.PaymentSats+minFeeHeadroom {
+		return fmt.Errorf("perf: denomination %d too small for payment %d (needs at least %d for the fee)",
+			c.Denomination, c.PaymentSats, c.PaymentSats+minFeeHeadroom)
 	}
 	if c.Throughput {
 		// ClaimExact requires the denomination to exceed the marginal fuel-input

@@ -84,22 +84,28 @@ func mustUser(ctx context.Context, t *testing.T, s *metastore.Store, identityKey
 func strptr(s string) *string { return &s }
 
 // runMetastoreSuite exercises every repository against a factory-built store.
+//
+// Subtests run in PARALLEL. Each calls factory(t), which mints its own isolated
+// schema on PostgreSQL and its own temp file on SQLite, so they share nothing.
+// Running them concurrently puts the backend under simultaneous unrelated
+// transactions — the condition the deadlock-ordering work in lockorder.go
+// exists for, and one a serial suite can never reproduce.
 func runMetastoreSuite(t *testing.T, factory storeFactory) {
-	t.Run("Users_FindOrInsert", func(t *testing.T) { testUsers(t, factory) })
-	t.Run("Baskets", func(t *testing.T) { testBaskets(t, factory) })
-	t.Run("Transactions_ListActions", func(t *testing.T) { testTransactions(t, factory) })
-	t.Run("Outputs_ListOutputs_Seam", func(t *testing.T) { testOutputs(t, factory) })
-	t.Run("KnownTx_SuspectFailed", func(t *testing.T) { testKnownTx(t, factory) })
-	t.Run("KnownTx_PollProgressAndRepair", func(t *testing.T) { testKnownTxPollProgress(t, factory) })
-	t.Run("KnownTx_BulkMutatorsOverlappingTxIDs", func(t *testing.T) { testKnownTxBulkOverlap(t, factory) })
-	t.Run("Transactions_InputBEEF", func(t *testing.T) { testTransactionsInputBEEF(t, factory) })
-	t.Run("KnownTx_InputBEEFNotSticky", func(t *testing.T) { testKnownTxInputBEEFNotSticky(t, factory) })
-	t.Run("SyncState_RoundTrip", func(t *testing.T) { testSyncState(t, factory) })
-	t.Run("KeyValue", func(t *testing.T) { testKeyValue(t, factory) })
-	t.Run("Certificates", func(t *testing.T) { testCertificates(t, factory) })
-	t.Run("Outbox", func(t *testing.T) { testOutbox(t, factory) })
-	t.Run("Outbox_ConcurrentDrain", func(t *testing.T) { testOutboxConcurrentDrain(t, factory) })
-	t.Run("ModeA_SharedTx", func(t *testing.T) { testModeA(t, factory) })
+	t.Run("Users_FindOrInsert", func(t *testing.T) { t.Parallel(); testUsers(t, factory) })
+	t.Run("Baskets", func(t *testing.T) { t.Parallel(); testBaskets(t, factory) })
+	t.Run("Transactions_ListActions", func(t *testing.T) { t.Parallel(); testTransactions(t, factory) })
+	t.Run("Outputs_ListOutputs_Seam", func(t *testing.T) { t.Parallel(); testOutputs(t, factory) })
+	t.Run("KnownTx_SuspectFailed", func(t *testing.T) { t.Parallel(); testKnownTx(t, factory) })
+	t.Run("KnownTx_PollProgressAndRepair", func(t *testing.T) { t.Parallel(); testKnownTxPollProgress(t, factory) })
+	t.Run("KnownTx_BulkMutatorsOverlappingTxIDs", func(t *testing.T) { t.Parallel(); testKnownTxBulkOverlap(t, factory) })
+	t.Run("Transactions_InputBEEF", func(t *testing.T) { t.Parallel(); testTransactionsInputBEEF(t, factory) })
+	t.Run("KnownTx_InputBEEFNotSticky", func(t *testing.T) { t.Parallel(); testKnownTxInputBEEFNotSticky(t, factory) })
+	t.Run("SyncState_RoundTrip", func(t *testing.T) { t.Parallel(); testSyncState(t, factory) })
+	t.Run("KeyValue", func(t *testing.T) { t.Parallel(); testKeyValue(t, factory) })
+	t.Run("Certificates", func(t *testing.T) { t.Parallel(); testCertificates(t, factory) })
+	t.Run("Outbox", func(t *testing.T) { t.Parallel(); testOutbox(t, factory) })
+	t.Run("Outbox_ConcurrentDrain", func(t *testing.T) { t.Parallel(); testOutboxConcurrentDrain(t, factory) })
+	t.Run("ModeA_SharedTx", func(t *testing.T) { t.Parallel(); testModeA(t, factory) })
 }
 
 func testUsers(t *testing.T, factory storeFactory) {

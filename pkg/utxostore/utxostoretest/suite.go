@@ -13,6 +13,7 @@ import (
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/stress"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 )
 
@@ -114,7 +115,21 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"StaleReservationDating", s.staleReservationDating},
 		{"Close", std(s.closeStore)},
 	} {
-		t.Run(tc.name, tc.fn)
+		t.Run(tc.name, func(t *testing.T) {
+			// Every subtest provisions its own store (its own schema for
+			// PostgreSQL, its own temp file for SQLite, its own set for
+			// Aerospike), so they are independent by construction and running
+			// them in parallel is safe.
+			//
+			// It is also the point. internal/testenv's IsolatedSchemaDSN exists
+			// specifically to make this possible, and nothing used it: the whole
+			// suite ran serially against one container, so the backend was never
+			// asked to serve concurrent unrelated work — which is exactly the
+			// condition a 1000-TPS deployment puts it under. Serial subtests
+			// cannot surface a lock the store takes too broadly.
+			t.Parallel()
+			tc.fn(t)
+		})
 	}
 }
 
@@ -448,12 +463,18 @@ func (s *suite) claimExclusivityConcurrent(t *testing.T, store utxostore.Store) 
 	sc := scope(utxostore.TierMined)
 
 	const (
-		rounds               = 3
-		coinsPerRound        = 90
-		workersPerShape      = 3
 		denomination         = 1_000
 		perClaimBatchMax     = 3
 		maxContentionRetries = 10_000 // per worker; ample for a transient signal
+	)
+	// Scaled by ARCADE_STRESS (see internal/stress): the default run stays at
+	// 3 rounds of 90 coins, and a soak run turns the same assertions into a
+	// long one. Exclusivity is a property that fails rarely, so the count it
+	// runs at is the only thing separating "proven" from "not yet observed".
+	var (
+		rounds          = stress.Scale(3)
+		coinsPerRound   = stress.Scale(90)
+		workersPerShape = stress.Scale(3)
 	)
 
 	// Every shape claims from the same uniform pool, so all coins are

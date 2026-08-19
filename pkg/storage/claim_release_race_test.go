@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/stress"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/conformance"
@@ -40,12 +41,18 @@ import (
 // allocated to two successful actions.
 func TestSweepRacingCreateActionNeverDoubleAllocates(t *testing.T) {
 	const (
-		coins    = 24
-		stranded = 8
-		workers  = 12
-		denom    = 50_000
-		pay      = 40_000
-		ttl      = 15 * time.Minute
+		denom = 50_000
+		pay   = 40_000
+		ttl   = 15 * time.Minute
+	)
+	// Scaled by ARCADE_STRESS (see internal/stress). The ratio between the
+	// three is what makes the test work — stranded reservations must be a
+	// strict subset of the pool, and there must be more coins than workers —
+	// so all three scale together rather than any one being pinned.
+	var (
+		coins    = stress.Scale(24)
+		stranded = stress.Scale(8)
+		workers  = stress.Scale(12)
 	)
 
 	ctx := context.Background()

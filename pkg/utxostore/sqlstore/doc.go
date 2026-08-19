@@ -34,6 +34,17 @@
 //     lock-error retry (isLockError classifies PostgreSQL 40001/40P01/55P03 and
 //     SQLite BUSY/LOCKED; backoff 100ms << attempt, up to three retries).
 //
+// Both paths carry that retry. Claims went without one for a while, which read
+// as a deliberate asymmetry and was not: SKIP LOCKED removes the common reason a
+// claim would block, but it does not make 40001/40P01/55P03 impossible, and the
+// funder above only retries [utxostore.ErrContention] — which this backend never
+// returns. The result was a lock error on the hottest path failing the call
+// outright while the same error on a cold path was retried three times. Retrying
+// a claim is safe without a transaction because the statement is atomic: a
+// failed attempt committed nothing, so re-running it cannot double-allocate.
+// Under an ambient (Mode A) transaction the retry is skipped and the enclosing
+// unit of work owns recovery.
+//
 // # Mode A: shared database
 //
 // The store exposes [Store.SharesDatabase] and honors an ambient transaction

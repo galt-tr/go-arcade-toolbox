@@ -351,7 +351,8 @@ func TestStreamStatus_NonStatusEventSkipped(t *testing.T) {
 // clean-delivery rule: a connection that delivers an event and then dies with a
 // read error (an oversized frame tripping bufio.ErrTooLong on every reconnect)
 // must keep backing off. If backoff were reset on any delivery, reconnects would
-// hot-loop at a fixed cadence; here we assert the gaps between reconnects GROW.
+// hot-loop at a fixed cadence; here we assert each reconnect gap reaches the
+// doubling ceiling its sleep should have used.
 func TestStreamStatus_OversizedFrameNoHotLoop(t *testing.T) {
 	conns := make(chan time.Time, 8)
 	// A single line larger than the 1 MiB scanner cap -> bufio.ErrTooLong.
@@ -404,9 +405,32 @@ func TestStreamStatus_OversizedFrameNoHotLoop(t *testing.T) {
 	g1, g2, g3 := t1.Sub(t0), t2.Sub(t1), t3.Sub(t2)
 	t.Logf("reconnect gaps: g1=%s g2=%s g3=%s", g1, g2, g3)
 
-	// Backoff was NOT reset (delivered>0 but err!=nil), so each gap grows.
-	assert.Greater(t, g2, g1, "second reconnect gap must exceed the first (backoff growing, not hot-looping)")
-	assert.Greater(t, g3, g2, "third reconnect gap must exceed the second")
+	// Backoff was NOT reset (delivered>0 but err!=nil), so each sleep is the next
+	// doubling of the ceiling: 40ms, 80ms, 160ms.
+	//
+	// Assert each gap against its OWN expected sleep rather than against the
+	// previous gap. Comparing gaps to each other looks like the more direct
+	// statement of "the backoff grows", but it is not measurable: a gap is
+	// sleep + scheduling delay, and on a loaded runner the delay can dwarf the
+	// sleep. That is exactly how this failed — g1=63ms g2=298ms g3=174ms, where
+	// a ~218ms stall landed inside the g2 window and made g3 < g2 even though
+	// every sleep was correct. 0847861 pinned the jitter to remove the RNG from
+	// this comparison and judged the 2x margins wide enough to absorb the rest;
+	// they are not, and no fixed margin is, because the stall is unbounded.
+	//
+	// Lower bounds are immune to it. Scheduling delay can only ever make a gap
+	// LONGER than its sleep, never shorter, so `gap >= expected sleep` holds
+	// under arbitrary load while still failing loudly on the bug this test
+	// exists for: a hot loop, or a backoff reset, produces gaps at a flat ~40ms
+	// cadence, which misses the 80ms and 160ms bounds immediately.
+	base := 40 * time.Millisecond
+	assert.GreaterOrEqual(t, g1, base,
+		"first reconnect gap must be at least one backoff ceiling")
+	assert.GreaterOrEqual(t, g2, 2*base,
+		"second reconnect gap must be at least the doubled ceiling — a shorter one "+
+			"means backoff was reset on delivery and reconnects are hot-looping")
+	assert.GreaterOrEqual(t, g3, 4*base,
+		"third reconnect gap must be at least the twice-doubled ceiling")
 
 	cancel()
 	require.ErrorIs(t, waitFor(t, errCh, "return after cancel"), context.Canceled)

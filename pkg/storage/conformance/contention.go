@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/stress"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk/primitives"
@@ -24,10 +25,13 @@ import (
 // [WithApproximateSelection] only the safety properties are required.
 func (s *suite) contentionClaim(t *testing.T) {
 	const (
-		n            = 12
 		denomination = 50_000
 		pay          = 40_000
 	)
+	// Scaled by ARCADE_STRESS (see internal/stress). The pool is sized from n
+	// so the "every request must succeed" bar under exact selection holds at
+	// any factor.
+	n := stress.Scale(12)
 
 	ctx := context.Background()
 	p := s.freshProvider(t)
@@ -51,7 +55,7 @@ func (s *suite) contentionClaim(t *testing.T) {
 
 	bal0, err := p.GetBalance(ctx, auth, "")
 	require.NoError(t, err)
-	require.Equal(t, uint64(n*denomination), bal0)
+	require.Equal(t, uint64(n)*denomination, bal0) //nolint:gosec // n is a small positive worker count
 
 	type outcome struct {
 		res *wdk.StorageCreateActionResult

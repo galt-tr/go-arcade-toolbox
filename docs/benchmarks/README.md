@@ -1,5 +1,19 @@
 # Benchmarks — write-path throughput
 
+> **2026-08-18 — the optimistic create ceiling is ~1,118 TPS, durable.** With a
+> 100,000-coin pool, one input, one output and NO change output, an instant 202
+> and no monitor daemon, PostgreSQL Mode A sustains **1,118 TPS at 384 workers**
+> with `synchronous_commit=on` — roughly double the realistic-payment figure
+> below, on a curve that turns over at 512 workers. Zero contention retries at
+> every worker count. Per-stage: `sign_process` (56.7 ms p50) costs about twice
+> `create` (29.2 ms), which contradicts the gap analysis further down naming the
+> create phase the wall. Two caveats worth reading before quoting the number:
+> PostgreSQL's default `max_connections=100` caps every run above 64 workers and
+> presents as connection errors, and a 1,000,000-coin pool measures ~5% lower
+> with double the p99. Full report:
+> [20260818-optimistic-create-ceiling.md](20260818-optimistic-create-ceiling.md).
+
+
 > **Task 28 update — the per-op `COUNT(*)` is gone; the wall is now the durable
 > commit.** `CreateAction` no longer runs the change-basket `SELECT COUNT(*)`
 > on the throughput hot path (it is skipped entirely under the fuel-pool
@@ -312,6 +326,25 @@ alone. Report: [64w relaxed durability](20260807-postgres-signandprocess-through
   only; it does **not** advance the chaintracks tip stream.
 
 ## Gap analysis — path to 1000+ TPS
+
+> **SUPERSEDED (2026-08-18). Kept for the record; do not plan from it.** This
+> section was written against the Task-27 numbers (~175–210 TPS) and its ranking
+> no longer holds:
+>
+> - **1000 TPS is reached**, durably: ~1,118 TPS at 384 workers on the optimistic
+>   shape, and the curve turns over at 512 — see
+>   [20260818-optimistic-create-ceiling.md](20260818-optimistic-create-ceiling.md).
+> - **Item 1 below is refuted.** `create` is the *cheaper* half: 29.2 ms against
+>   `sign_process` at 56.7 ms. A transaction costs **three** durable commits — one
+>   in `CreateAction` and **two** in `ProcessAction`, separated by the broadcast —
+>   which is exactly that 2:1 ratio, and ~44% of the end-to-end median.
+> - **Items 2, 3 and 5 are done.** Dedicated fuel basket, `COUNT(*)` kill, worker
+>   and connection-pool sweeps (exhausted at 512), `n=1` denomination sizing.
+> - **Item 4 is refuted.** Delayed broadcast does not save a commit: `queueDelayed`
+>   is its own autocommit, and the deferred work is re-done per transaction later.
+>
+> What is actually left: amortizing the flush (group commit), reducing the three
+> commits, and shortening each commit's round trips.
 
 Task 27 wired the fuel-pool `ClaimExact` route and it works, but **neither path
 reaches 1000 TPS on this box** — the ceiling is ~175–210 TPS single-call. With

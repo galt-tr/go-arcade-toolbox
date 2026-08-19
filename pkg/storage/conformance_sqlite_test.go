@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +32,56 @@ func TestProviderConformance_MemstoreSQLite(t *testing.T) {
 		conformance.WithRejectingHeadersProvider(func(t *testing.T) wdk.WalletStorageProvider {
 			return newMemstoreSQLiteProvider(t, conformance.RejectingHeaders())
 		}),
+		conformance.WithRejectReleaseEnv(newMemstoreSQLiteEnv),
 	)
+}
+
+// newMemstoreSQLiteEnv is newMemstoreSQLiteProvider with the two things the
+// reject->release and concurrent-lifecycle subtests need on top of the provider:
+// the oracle they must script, and a clock they can move across the reconciler's
+// grace window. The clock reaches all three layers that stamp time — provider,
+// metastore and utxostore — because a reservation aged on the wall clock while
+// the provider's clock is faked would never look stale.
+func newMemstoreSQLiteEnv(t *testing.T) conformance.RejectReleaseEnv {
+	t.Helper()
+	ctx := context.Background()
+
+	clock := newTestClock()
+	oracle := &conformance.FakeOracle{}
+
+	path := filepath.Join(t.TempDir(), "meta.db")
+	meta, err := metastore.OpenSQLite(ctx, path, metastore.WithClock(clock.Now))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = meta.Close(ctx) })
+
+	utxo := memstore.New(memstore.WithClock(clock.Now))
+	t.Cleanup(func() { _ = utxo.Close(ctx) })
+
+	logger := logging.NewTestLogger(t)
+	fnd := funder.New(logger, utxo, defs.DefaultFeeModel())
+
+	p, err := storage.New(
+		logger, meta, utxo, fnd, oracle, &conformance.FakeHeaders{},
+		storage.WithNetwork(defs.NetworkTestnet),
+		storage.WithStorageName("conformance-sqlite-rr"),
+		storage.WithScriptsVerifier(conformance.AlwaysValidScripts{}),
+		storage.WithClock(clock.Now),
+	)
+	require.NoError(t, err)
+	_, err = p.Migrate(ctx, "conformance", "conformance-identity-key")
+	require.NoError(t, err)
+
+	return conformance.RejectReleaseEnv{Provider: p, Oracle: oracle, Advance: clock.Advance}
+}
+
+// newTestClock seeds the mutex-guarded testClock from reconciler_test.go at a
+// fixed instant. The reconciler's release is gated on a grace period, so the
+// alternative to a movable clock is a test that sleeps for it — and a test that
+// sleeps is a test the first person in a hurry deletes. The mutex matters here
+// beyond the usual: the concurrent-lifecycle subtest reads the clock from many
+// goroutines while the main one moves it.
+func newTestClock() *testClock {
+	return &testClock{t: time.Unix(1_700_000_000, 0).UTC()}
 }
 
 // newMemstoreSQLiteProvider builds a fresh, unmigrated Provider over a

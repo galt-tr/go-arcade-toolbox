@@ -36,7 +36,52 @@ func TestProviderConformance_PostgresModeA(t *testing.T) {
 		conformance.WithRejectingHeadersProvider(func(t *testing.T) wdk.WalletStorageProvider {
 			return newPostgresModeAProvider(t, pg, conformance.RejectingHeaders())
 		}),
+		conformance.WithRejectReleaseEnv(func(t *testing.T) conformance.RejectReleaseEnv {
+			return newPostgresModeAEnv(t, pg)
+		}),
 	)
+}
+
+// newPostgresModeAEnv is newPostgresModeAProvider plus the oracle and the
+// movable clock the reject->release and concurrent-lifecycle subtests need.
+//
+// This is the wiring that matters most: Mode A over one shared PostgreSQL
+// database is the configuration those subtests were written for, because it is
+// the one where the release competes with concurrent claims under real row
+// locks rather than a mutex.
+func newPostgresModeAEnv(t *testing.T, pg *testenv.PostgresContainer) conformance.RejectReleaseEnv {
+	t.Helper()
+	ctx := context.Background()
+
+	clock := newTestClock()
+	oracle := &conformance.FakeOracle{}
+
+	meta, err := metastore.OpenPostgres(ctx, pg.IsolatedSchemaDSN(t), metastore.WithClock(clock.Now))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = meta.Close(ctx) })
+
+	utxo, err := sqlstore.New(ctx, meta.DB(), sqlstore.Engine(string(meta.Engine())),
+		sqlstore.WithClock(clock.Now))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = utxo.Close(ctx) })
+
+	logger := logging.NewTestLogger(t)
+	fnd := funder.New(logger, utxo, defs.DefaultFeeModel())
+
+	p, err := storage.New(
+		logger, meta, utxo, fnd, oracle, &conformance.FakeHeaders{},
+		storage.WithNetwork(defs.NetworkTestnet),
+		storage.WithStorageName("conformance-postgres-rr"),
+		storage.WithScriptsVerifier(conformance.AlwaysValidScripts{}),
+		storage.WithClock(clock.Now),
+	)
+	require.NoError(t, err)
+	require.True(t, p.ModeA(), "provider must detect Mode A over the shared database")
+
+	_, err = p.Migrate(ctx, "conformance", "conformance-identity-key")
+	require.NoError(t, err)
+
+	return conformance.RejectReleaseEnv{Provider: p, Oracle: oracle, Advance: clock.Advance}
 }
 
 // newPostgresModeAProvider builds a fresh, unmigrated Provider over an
