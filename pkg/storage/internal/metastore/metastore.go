@@ -241,18 +241,21 @@ func (s *Store) isClosed() bool {
 type queryer = sqlkit.SQLExecer
 
 // execer returns the queryer for a statement: the ambient transaction carried
-// by ctx (Mode A / Do) if present, else the pool.
+// by ctx (Mode A / Do) if present AND opened over this store's own *sql.DB,
+// else the pool.
 func (s *Store) execer(ctx context.Context) queryer {
 	return sqlkit.Execer(ctx, s.db)
 }
 
-// inTx runs fn inside a transaction. If ctx already carries one (Mode A / a
-// surrounding Do) it is reused and neither committed nor rolled back here — the
-// owner handles that, including retry. Otherwise a fresh transaction is opened,
-// committed on success, rolled back on error, and the whole call is wrapped in
-// the bounded lock-error retry.
+// inTx runs fn inside a transaction. If ctx already carries one opened over
+// this store's own *sql.DB (Mode A / a surrounding Do) it is reused and
+// neither committed nor rolled back here — the owner handles that, including
+// retry. Otherwise — including when ctx carries a transaction opened over a
+// DIFFERENT *sql.DB — a fresh transaction is opened, committed on success,
+// rolled back on error, and the whole call is wrapped in the bounded
+// lock-error retry.
 func (s *Store) inTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	if _, ok := sqltx.From(ctx); ok {
+	if _, ok := sqltx.From(ctx, s.db); ok {
 		return fn(ctx)
 	}
 	return sqlkit.WithRetry(ctx, func() error {
@@ -260,7 +263,7 @@ func (s *Store) inTx(ctx context.Context, fn func(ctx context.Context) error) er
 		if err != nil {
 			return err
 		}
-		if err := fn(sqltx.With(ctx, tx)); err != nil {
+		if err := fn(sqltx.With(ctx, tx, s.db)); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

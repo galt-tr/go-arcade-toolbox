@@ -56,9 +56,9 @@ func TestOutbox_SkipLocked_Postgres(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = tx2.Rollback() }()
 
-	batch1, err := s.Outbox().FetchPending(sqltx.With(ctx, tx1), 5)
+	batch1, err := s.Outbox().FetchPending(sqltx.With(ctx, tx1, db), 5)
 	require.NoError(t, err)
-	batch2, err := s.Outbox().FetchPending(sqltx.With(ctx, tx2), 5)
+	batch2, err := s.Outbox().FetchPending(sqltx.With(ctx, tx2, db), 5)
 	require.NoError(t, err)
 
 	require.Len(t, batch1, 5, "first transaction locks its half")

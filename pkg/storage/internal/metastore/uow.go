@@ -20,15 +20,18 @@ import (
 // bounded number of attempts. fn must therefore be idempotent enough to re-run;
 // the repository mutations here are.
 //
-// If ctx already carries an ambient transaction (a surrounding Do, or a
-// caller-managed one), Do reuses it and does NOT commit, roll back, or retry —
-// the outermost owner is solely responsible for the transaction's fate. This
-// makes Do safely nestable.
+// If ctx already carries an ambient transaction opened over this store's own
+// *sql.DB (a surrounding Do, or a caller-managed one on the same handle), Do
+// reuses it and does NOT commit, roll back, or retry — the outermost owner is
+// solely responsible for the transaction's fate. This makes Do safely
+// nestable. An ambient transaction opened over a DIFFERENT *sql.DB is not
+// reused — sqltx's ownership check rejects it — so Do opens and owns its own
+// transaction instead, exactly as if ctx carried none.
 func (s *Store) Do(ctx context.Context, fn func(ctx context.Context) error) error {
 	if s.isClosed() {
 		return errClosed
 	}
-	if _, ok := sqltx.From(ctx); ok {
+	if _, ok := sqltx.From(ctx, s.db); ok {
 		return fn(ctx)
 	}
 	return sqlkit.WithRetry(ctx, func() error {
@@ -36,7 +39,7 @@ func (s *Store) Do(ctx context.Context, fn func(ctx context.Context) error) erro
 		if err != nil {
 			return err
 		}
-		if err := fn(sqltx.With(ctx, tx)); err != nil {
+		if err := fn(sqltx.With(ctx, tx, s.db)); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

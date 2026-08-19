@@ -48,11 +48,12 @@
 // # Mode A: shared database
 //
 // The store exposes [Store.SharesDatabase] and honors an ambient transaction
-// carried in the context under the internal/sqltx key, so a co-located store
-// (the metastore, later) can enlist the utxostore in one caller-owned
-// transaction over a shared *sql.DB. Every statement runs against
-// execer(ctx)/withTx, which use the ambient transaction when present and the
-// pool otherwise. The goose version table is named goose_db_version_utxo so the
+// carried in the context under the internal/sqltx key IFF it was opened over
+// this store's own *sql.DB, so a co-located store (the metastore, later) can
+// enlist the utxostore in one caller-owned transaction over a shared *sql.DB.
+// Every statement runs against execer(ctx)/withTx, which use the ambient
+// transaction when present and owned by this store's db, and the pool
+// otherwise. The goose version table is named goose_db_version_utxo so the
 // two packages' migration chains never collide in a shared database.
 //
 // # Design notes

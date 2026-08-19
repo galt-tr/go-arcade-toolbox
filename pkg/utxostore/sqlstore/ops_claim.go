@@ -80,7 +80,7 @@ type claimedRow struct {
 // Under an ambient transaction the retry is deliberately skipped: the enclosing
 // tx is already poisoned by the lock error and only the owner can restart it.
 func (s *Store) runClaim(ctx context.Context, query string, args ...any) ([]claimedRow, error) {
-	if _, ambient := sqltx.From(ctx); ambient {
+	if _, ambient := sqltx.From(ctx, s.db); ambient {
 		return s.claimOnce(ctx, query, args...)
 	}
 	var out []claimedRow

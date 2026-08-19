@@ -250,24 +250,26 @@ func (s *Store) isClosed() bool {
 type queryer = sqlkit.SQLExecer
 
 // execer returns the queryer for a non-transactional statement: the ambient
-// transaction carried by ctx (Mode A) if present, else the pool.
+// transaction carried by ctx (Mode A) if present AND opened over this store's
+// own *sql.DB, else the pool.
 func (s *Store) execer(ctx context.Context) queryer {
 	return sqlkit.Execer(ctx, s.db)
 }
 
-// withTx runs fn inside a transaction. If ctx already carries one (Mode A) it
-// is reused and neither committed nor rolled back here — the caller owns it,
-// including any retry. Otherwise a fresh transaction is opened and the call is
-// wrapped in the bounded lock-error retry: fn must return a lock error to
-// request a rollback-and-retry; any other non-nil error also rolls back but is
-// returned as-is; nil commits.
+// withTx runs fn inside a transaction. If ctx already carries one opened over
+// this store's own *sql.DB (Mode A) it is reused and neither committed nor
+// rolled back here — the caller owns it, including any retry. Otherwise —
+// including when ctx carries a transaction opened over a DIFFERENT *sql.DB —
+// a fresh transaction is opened and the call is wrapped in the bounded
+// lock-error retry: fn must return a lock error to request a rollback-and-retry;
+// any other non-nil error also rolls back but is returned as-is; nil commits.
 //
 // Per-item failures (guard mismatches recorded on op.Err or a joined item
 // error) must NOT be returned from fn: they are not transaction failures, and
 // the successful items in the same batch must still commit. Callers track them
 // out of band and assemble [utxostore.ErrBatch] after withTx returns nil.
 func (s *Store) withTx(ctx context.Context, fn func(q queryer) error) error {
-	if tx, ok := sqltx.From(ctx); ok {
+	if tx, ok := sqltx.From(ctx, s.db); ok {
 		return fn(tx)
 	}
 	return sqlkit.WithRetry(ctx, func() error {

@@ -87,7 +87,7 @@ func TestAmbientTransaction(t *testing.T) {
 
 	tx, err := s.DB().BeginTx(ctx, nil)
 	require.NoError(t, err)
-	txCtx := sqltx.With(ctx, tx)
+	txCtx := sqltx.With(ctx, tx, s.DB())
 
 	require.NoError(t, s.Mint(txCtx, []*utxostore.Mint{mint}))
 	require.NoError(t, mint.Err)
@@ -101,4 +101,56 @@ func TestAmbientTransaction(t *testing.T) {
 	require.NoError(t, tx.Rollback())
 	_, err = s.Get(ctx, op)
 	require.ErrorIs(t, err, &utxostore.NotFoundError{})
+}
+
+// TestForeignTransactionNotEnlisted is the Mode B counterpart of
+// TestAmbientTransaction: a transaction opened over a DIFFERENT *sql.DB must
+// never be picked up. Before the ownership fix, sqltx.From ignored who placed
+// the transaction and a store would enlist in whatever *sql.Tx it found on the
+// context — so a utxostore wired on its own database, but called with a
+// context that happens to carry the metastore's ambient transaction (Mode B),
+// would silently run its statements against the wrong connection. Ownership is
+// now structural: [sqltx.From] reports a hit only when the store's own
+// *sql.DB matches the one [sqltx.With] recorded, so a foreign transaction is
+// never returned and the store falls back to its own pool.
+func TestForeignTransactionNotEnlisted(t *testing.T) {
+	ctx := context.Background()
+	storeA := newSQLiteStore(t) // the store under test
+	storeB := newSQLiteStore(t) // a different database — Mode B
+
+	txB, err := storeB.DB().BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = txB.Rollback() })
+
+	// ctx carries a transaction owned by storeB's *sql.DB, not storeA's.
+	foreignCtx := sqltx.With(ctx, txB, storeB.DB())
+
+	op := utxostoretest.NewOutpoint("foreign-tx", 0)
+	mint := utxostoretest.NewMint(op, 1, "default", utxostore.TierMined, 250)
+
+	// storeA must not enlist in txB: From(foreignCtx, storeA.DB()) reports
+	// false because the owners differ, so the mint runs — and commits — on
+	// storeA's own pool, each item its own statement (see Mint's doc).
+	require.NoError(t, storeA.Mint(foreignCtx, []*utxostore.Mint{mint}))
+	require.NoError(t, mint.Err)
+
+	// Visible immediately through storeA's own pool, with no dependency on txB
+	// ever committing.
+	got, err := storeA.Get(ctx, op)
+	require.NoError(t, err)
+	require.Equal(t, uint64(250), got.Satoshis)
+
+	// And never written to storeB at all — not even inside txB, the very
+	// transaction foreignCtx carried. storeB.Get(foreignCtx, op) resolves
+	// against txB (foreignCtx's owner IS storeB's db), so a hit here would
+	// mean the mint leaked into the foreign transaction; it must not.
+	_, err = storeB.Get(foreignCtx, op)
+	require.ErrorIs(t, err, &utxostore.NotFoundError{})
+
+	// Rolling back the foreign transaction must not undo storeA's write,
+	// proving the mint never ran inside txB in the first place.
+	require.NoError(t, txB.Rollback())
+	got, err = storeA.Get(ctx, op)
+	require.NoError(t, err)
+	require.Equal(t, uint64(250), got.Satoshis)
 }
