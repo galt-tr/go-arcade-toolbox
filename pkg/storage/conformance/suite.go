@@ -116,6 +116,7 @@ func RunProviderSuite(t *testing.T, newProvider func(t *testing.T) wdk.WalletSto
 		{"ContentionClaim", s.contentionClaim},
 		{"Internalize", s.internalize},
 		{"AbortRestores", s.abortRestores},
+		{"AbortFence", s.abortFence},
 		{"MultiUserIsolation", s.multiUserIsolation},
 		{"ListAndBalanceConsistency", s.listAndBalanceConsistency},
 		{"RejectRelease", s.rejectRelease},

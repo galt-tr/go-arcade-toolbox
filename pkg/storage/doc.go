@@ -19,12 +19,20 @@
 // inventory ops are applied DIRECTLY against the utxostore and the metadata half
 // is committed in its own transaction: CreateAction reserves inputs via the
 // funder, then persists metadata and COMPENSATES (a whole-token
-// ReleaseReservation) if that metadata write fails; ProcessAction/AbortAction
-// apply the Spend / Promote / Mint / RemoveByMintTx directly. A process that
-// crashes between the two direct writes is healed by the outbox-backed
-// crash-recovery drain: the monitor's reject_release task calls DrainOutbox,
-// which replays the durable utxo_ops_outbox rows idempotently (oldest-first,
-// parked after MaxOutboxAttempts).
+// ReleaseReservation) if that metadata write fails; ProcessAction applies the
+// Spend / Promote / Mint directly. A process that crashes between the two direct
+// writes is healed by the outbox-backed crash-recovery drain: the monitor's
+// reject_release task calls DrainOutbox, which replays the durable
+// utxo_ops_outbox rows idempotently (oldest-first, parked after
+// MaxOutboxAttempts).
+//
+// Two write paths do NOT apply their inventory ops directly, because for them a
+// half-applied write is a double spend rather than a stale row: the reconciler's
+// verified-dead release and AbortAction. Both commit the METADATA decision plus
+// a durable outbox INTENT in one transaction and execute the utxo half
+// afterwards, so the only residue a crash can leave is a transaction nobody can
+// broadcast whose coins are still held — never freed coins behind sendable
+// bytes. See [Provider.abortViaOutbox] and [Provider.releaseViaOutbox].
 //
 // # The txid timing decision (change minting)
 //

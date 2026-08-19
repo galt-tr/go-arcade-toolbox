@@ -270,9 +270,14 @@ func (d *Daemon) taskRunner(ctx context.Context, name defs.MonitorTask) (func(),
 func (d *Daemon) runRejectRelease(ctx context.Context) error {
 	if drain, err := d.storage.DrainOutbox(ctx, d.limits.rejectRelease); err != nil {
 		d.logger.WarnContext(ctx, "reconciler: outbox drain failed", slog.String("error", err.Error()))
-	} else if drain.Drained > 0 || drain.Parked > 0 {
+	} else if drain.Drained > 0 || drain.Parked > 0 || drain.ParkedTotal > 0 {
+		// ParkedTotal is in the gate as well as the payload, deliberately: it is
+		// the standing backlog, and a pass that drains nothing while rows sit
+		// parked is exactly the case that used to log nothing at all.
 		d.logger.InfoContext(ctx, "reconciler: outbox drained",
-			slog.Int("drained", drain.Drained), slog.Int("failed", drain.Failed), slog.Int("parked", drain.Parked))
+			slog.Int("drained", drain.Drained), slog.Int("failed", drain.Failed),
+			slog.Int("parked", drain.Parked),
+			slog.Int("outbox_parked_total", drain.ParkedTotal))
 	}
 
 	report, err := d.storage.VerifyAndReleaseSuspects(ctx, d.suspectGrace, d.maxQuarantine, d.limits.rejectRelease)

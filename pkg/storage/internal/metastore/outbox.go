@@ -122,3 +122,23 @@ func (r OutboxRepo) CountPending(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+
+// CountParked returns how many rows have EXHAUSTED their attempts and are no
+// longer handed out by FetchPending — the standing backlog of utxo ops that
+// will never be replayed without intervention.
+//
+// It exists because parking was otherwise unobservable. A row logs one INFO
+// line on the pass that parks it and then disappears: it is absent from
+// CountPending by construction, and the drain report's Parked counts only rows
+// that crossed the ceiling on THAT pass, so a backlog reads as zero forever
+// after. That matters most for an aborted action's ABORT_RELEASE op, whose
+// parked row means user funds pinned and reserved with no automated healer
+// (see [Provider.abortViaOutbox]).
+func (r OutboxRepo) CountParked(ctx context.Context) (int, error) {
+	q := r.s.rebind("SELECT COUNT(*) FROM utxo_ops_outbox WHERE attempts >= ?")
+	var n int
+	if err := r.s.execer(ctx).QueryRowContext(ctx, q, MaxOutboxAttempts).Scan(&n); err != nil {
+		return 0, fmt.Errorf("metastore: outbox count parked: %w", err)
+	}
+	return n, nil
+}
