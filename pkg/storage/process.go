@@ -400,12 +400,203 @@ func (p *Provider) mintChange(ctx context.Context, userID int, transactionID uin
 // queueDelayed marks a transaction as waiting-to-send (the monitor broadcasts
 // later). It does not spend inputs or broadcast; the transaction stays at a
 // pre-broadcast (abortable) status and the known-tx at "unsent".
+//
+// This is a requeue-shaped write — its target status puts the bytes back on
+// [metastore.KnownTxRepo.FindResendable]'s ungraced arm — so it carries
+// [metastore.KnownTxNeverRequeueStatuses] as its guard, not the narrower
+// beyond-broadcast set. That difference IS the fence: with only the narrow
+// guard, a ProcessAction{IsDelayed, SendWith: [aborted txid]} walked an aborted
+// row back to 'unsent' and handed the sweep bytes whose inputs the abort had
+// already released. It also keeps a delayed re-request from yanking a row out
+// from under a live broadcaster ('sending' is in the set).
+//
+// A skip is read, not swallowed. The two kinds mean opposite things: a row past
+// the broadcast stage (or mid-POST) is an idempotent no-op — a retrying client
+// is entitled to re-request a send that already happened — while a fenced or
+// terminal row means storage is refusing to deliver what the caller asked for,
+// and reporting success for that would be a lie the caller cannot detect.
 func (p *Provider) queueDelayed(ctx context.Context, txid string) error {
-	if err := p.meta.KnownTx().UpdateStatus(ctx, txid, wdk.ProvenTxStatusUnsent, wdk.ProvenTxReqBeyondBroadcastStageStatuses...); err != nil &&
-		!errors.Is(err, metastore.ErrStatusUpdateSkipped) && !errors.Is(err, metastore.ErrNotFound) {
+	err := p.meta.KnownTx().UpdateStatus(ctx, txid, wdk.ProvenTxStatusUnsent, metastore.KnownTxNeverRequeueStatuses...)
+	switch {
+	case err == nil, errors.Is(err, metastore.ErrNotFound):
+		return nil
+	case !errors.Is(err, metastore.ErrStatusUpdateSkipped):
 		return fmt.Errorf("storage: mark unsent: %w", err)
 	}
-	return nil
+	// Guarded out. One extra read (cold path only — the guard blocks nothing on
+	// the ordinary delayed flow) buys an error that names the status, because
+	// "aborted" and "completed" call for very different operator responses.
+	st, rerr := p.statusBehindRefusal(ctx, txid)
+	if rerr != nil {
+		return rerr
+	}
+	if st.WasBroadcastStatus() || st == wdk.ProvenTxStatusSending {
+		return nil
+	}
+	return notBroadcastableErr(txid, st)
+}
+
+// notBroadcastableError refuses a send for a known tx whose status the
+// broadcast arbiter will not claim and which carries no evidence of ever having
+// reached the network: fenced (aborted) or terminal (suspectFailed / stuck /
+// invalidTx / doubleSpend).
+//
+// It is a type rather than a wrapped sentinel so callers can recover the STATUS
+// without re-reading the row or scraping the message — the sweep logs it as a
+// structured field. It still unwraps to [metastore.ErrStatusUpdateSkipped], so
+// every refusal from the gate stays matchable as one condition.
+//
+// The distinction it carries is load-bearing for the sweep: this is the one
+// refusal that is PERMANENT for the current row state, as opposed to the
+// transient read failures below, which are worth retrying.
+type notBroadcastableError struct {
+	txid   string
+	status wdk.ProvenTxReqStatus
+}
+
+func (e *notBroadcastableError) Error() string {
+	return fmt.Sprintf("storage: transaction %s is %s; not broadcastable", e.txid, e.status)
+}
+
+func (e *notBroadcastableError) Unwrap() error { return metastore.ErrStatusUpdateSkipped }
+
+func notBroadcastableErr(txid string, st wdk.ProvenTxReqStatus) error {
+	return &notBroadcastableError{txid: txid, status: st}
+}
+
+// statusBehindRefusal re-reads the status that made a guard refuse. Its whole
+// job is to keep three outcomes distinguishable, because the verdicts they
+// justify are not the same:
+//
+//   - a status — the row really is fenced, terminal or already sent, and the
+//     caller may name it in a permanent-sounding refusal, which is what it is.
+//   - the row is GONE — it existed one statement ago (the guard's own zero-rows
+//     disambiguation proved that), so something removed it concurrently.
+//   - the read FAILED — we know nothing at all. This is the case that must not
+//     be collapsed into the other two: a transient database blip reported as
+//     "transaction X is unknown; not broadcastable" is a permanent-sounding
+//     verdict about a transaction that may be perfectly sendable a second later,
+//     and an operator reading it would go looking for the wrong problem.
+//
+// All three fail CLOSED — no confirmed status, no broadcast — but they say
+// which they are, so "this transaction is dead" is never confused with "ask
+// again". That is the difference from [Provider.knownTxStatusFor], which is
+// deliberately best-effort: its caller already holds a real error and is only
+// decorating it, whereas this one's callers are DECIDING on the answer.
+func (p *Provider) statusBehindRefusal(ctx context.Context, txid string) (wdk.ProvenTxReqStatus, error) {
+	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, txid)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("storage: transaction %s: status could not be read (transient); "+
+			"refusing to broadcast this attempt: %w", txid, err)
+	case !found:
+		return "", fmt.Errorf("storage: transaction %s: known tx row vanished while it was being claimed; "+
+			"refusing to broadcast this attempt", txid)
+	}
+	return kt.Status, nil
+}
+
+// sendClaim is the verdict of the broadcast gate: who, if anyone, owns the
+// right to POST these bytes right now.
+type sendClaim int
+
+const (
+	// sendClaimOwned: the row is ours, at 'sending'. POST it.
+	sendClaimOwned sendClaim = iota
+	// sendClaimInFlight: another claimant holds a live send. Do not POST.
+	sendClaimInFlight
+	// sendClaimAlreadySent: the network already has these bytes. Do not POST.
+	sendClaimAlreadySent
+)
+
+// claimForBroadcast is the SEND half of the P0-3 one-row arbiter, shared by the
+// synchronous broadcast path ([Provider.broadcastOne]) and the sweep
+// ([Provider.sendOneWaiting]). No caller may hand bytes to the network without
+// first winning here.
+//
+// known is the status the caller already read for this row, and it selects the
+// arm: a row the caller found at 'sending' came off FindResendable's crash-
+// recovery arm and is taken with [metastore.KnownTxRepo.ReclaimStaleSend] (the
+// row is already in the fenced state; only its clock needs re-stamping), while
+// anything else is taken with [metastore.KnownTxRepo.ClaimForSend]. Both are
+// CAS writes, so a stale `known` costs at most a lost race, never a wrong write.
+//
+// THE CUTOFF: every ReclaimStaleSend here passes [resendGrace] — the same
+// constant [metastore.KnownTxRepo.FindResendable] selects with. Sourcing the
+// taker's cutoff anywhere else would let the selector and the taker disagree
+// about what "stranded" means, which is how a live send gets stolen (taker too
+// eager) or a dead one never recovered (taker too patient).
+//
+// A row at 'sending' can never be aborted: [metastore.KnownTxRepo.TransitionToAborted]
+// refuses that status at any age, deliberately, so a claim cannot be
+// snatched out from under a POST that may already be on the wire. The
+// consequence is that a PERMANENTLY stuck send has no abort escape. What it has
+// instead: the graced arm re-drives it once per grace forever, and it leaves
+// 'sending' only by succeeding (→ unconfirmed) or by drawing a tx-level
+// rejection (→ suspectFailed), at which point the reject→release reconciler
+// owns it and can take it terminal. There is no operator path that fences a
+// stuck 'sending' row directly, and adding one would mean re-opening the very
+// window this CAS closes.
+func (p *Provider) claimForBroadcast(ctx context.Context, txid string, known wdk.ProvenTxReqStatus) (sendClaim, error) {
+	kt := p.meta.KnownTx()
+	recovering := known == wdk.ProvenTxStatusSending
+
+	var err error
+	if recovering {
+		err = kt.ReclaimStaleSend(ctx, txid, resendGrace)
+	} else {
+		err = kt.ClaimForSend(ctx, txid)
+	}
+	switch {
+	case err == nil:
+		return sendClaimOwned, nil
+	case errors.Is(err, metastore.ErrNotFound):
+		return 0, vanishedWhileClaimingErr(txid, err)
+	case !errors.Is(err, metastore.ErrStatusUpdateSkipped):
+		return 0, fmt.Errorf("storage: claim %s for broadcast: %w", txid, err)
+	}
+
+	// The CAS refused. Re-read rather than trusting `known`: the refusal itself
+	// says the row is not where the caller last saw it.
+	st, rerr := p.statusBehindRefusal(ctx, txid)
+	if rerr != nil {
+		return 0, rerr
+	}
+	switch {
+	case st.WasBroadcastStatus():
+		return sendClaimAlreadySent, nil
+	case st != wdk.ProvenTxStatusSending:
+		return 0, notBroadcastableErr(txid, st)
+	case recovering:
+		// Already attempted the takeover above and lost it: either the claim is
+		// live, or another sweep re-drove it this window.
+		return sendClaimInFlight, nil
+	}
+
+	// The row was claimed by someone else. If that claim is stranded past the
+	// grace, its owner is presumed dead and this caller may take the send over —
+	// the same recovery the sweep performs, available to a client re-driving
+	// ProcessAction{SendWith} after the claiming process died.
+	switch err := kt.ReclaimStaleSend(ctx, txid, resendGrace); {
+	case err == nil:
+		return sendClaimOwned, nil
+	case errors.Is(err, metastore.ErrStatusUpdateSkipped):
+		return sendClaimInFlight, nil
+	case errors.Is(err, metastore.ErrNotFound):
+		return 0, vanishedWhileClaimingErr(txid, err)
+	default:
+		return 0, fmt.Errorf("storage: reclaim stranded send %s: %w", txid, err)
+	}
+}
+
+// vanishedWhileClaimingErr reports a claim CAS that found no row at all. This
+// is NOT the ordinary "this transaction has no stored bytes" case — the caller
+// read the row, and its raw tx, moments earlier — so it must not borrow that
+// message. It means the known_txs row was removed between the read and the CAS,
+// which nothing on the send path does; it is worth surfacing as its own
+// anomaly rather than as a missing-bytes error an operator would chase.
+func vanishedWhileClaimingErr(txid string, cause error) error {
+	return fmt.Errorf("storage: known tx row for %s vanished between load and claim: %w", txid, cause)
 }
 
 // broadcastOne EF-encodes and broadcasts one transaction, then commits the
@@ -413,6 +604,14 @@ func (p *Provider) queueDelayed(ctx context.Context, txid string) error {
 // TierUnproven, and marks the tx unproven; on a 4xx rejection (final) it marks
 // the tx failed / suspectFailed WITHOUT releasing inputs (the reconciler's job);
 // on 503 backpressure it honors Retry-After once, then returns a service error.
+//
+// It CLAIMS the known-tx row before any of that — see [Provider.claimForBroadcast].
+// Until that gate existed this function would POST any SendWith txid that had
+// stored bytes, with no look at the row's status at all, which is what made the
+// abort fence unenforceable: aborting releases the inputs, so a SendWith
+// arriving afterwards broadcast a transaction the wallet had already spent the
+// coins of. The claim also makes the two no-POST outcomes representable —
+// another instance already sending, and the network already holding the bytes.
 func (p *Provider) broadcastOne(ctx context.Context, userID int, txid string) (wdk.SendWithResult, *wdk.ReviewActionResult, error) {
 	swr := wdk.SendWithResult{TxID: primitives.TXIDHexString(txid)}
 
@@ -442,10 +641,61 @@ func (p *Provider) broadcastOne(ctx context.Context, userID int, txid string) (w
 		return swr, nil, fmt.Errorf("storage: EF-encode %s: %w", txid, err)
 	}
 
+	// The gate. Everything above is local work that can be redone for free; from
+	// here on the bytes may leave the process, so the row must be ours first.
+	claim, err := p.claimForBroadcast(ctx, txid, kt.Status)
+	if err != nil {
+		return swr, nil, err
+	}
+	switch claim {
+	case sendClaimAlreadySent:
+		// Idempotent success: the network already accepted these bytes, so the
+		// caller gets exactly what the original 202 gave it. Re-POSTing would be
+		// harmless at arcade (duplicates are idempotent by txid) but it is a
+		// round trip spent to learn something the row already knows.
+		swr.Status = wdk.SendWithResultStatusUnproven
+		return swr, &wdk.ReviewActionResult{
+			TxID:   primitives.TXIDHexString(txid),
+			Status: wdk.ReviewActionResultStatusSuccess,
+		}, nil
+	case sendClaimInFlight:
+		// A live claim elsewhere owns this send: not this caller's error, and
+		// nothing was POSTed. It still gets a review entry, because a non-delayed
+		// batch keeps the invariant that every SendWithResult which is not
+		// 'unproven' has one explaining itself.
+		//
+		// That invariant is what the wallet-side validator's error is built from
+		// (see validate.NotDelayedProcessActionResult, which fails a batch whose
+		// send results are not all unproven, and pkgerrors.ProcessActionError,
+		// which carries BOTH lists to the caller). A mixed batch — one tx
+		// accepted, one in flight elsewhere — fails that validation either way;
+		// the entry is what stops it failing while saying nothing about the
+		// transaction that caused it.
+		//
+		// serviceError is the established status for "handed off, fate not yet
+		// known", which the backpressure and transport arms below already use;
+		// the message is what distinguishes this cause from those.
+		swr.Status = wdk.SendWithResultStatusSending
+		return swr, &wdk.ReviewActionResult{
+			TxID:   primitives.TXIDHexString(txid),
+			Status: wdk.ReviewActionResultStatusServiceError,
+			Errors: wdk.ReviewActionErrors{
+				"storage": errors.New("a concurrent broadcast attempt holds this transaction; " +
+					"it is in flight and will be re-driven by the send sweep if that attempt dies"),
+			},
+		}, nil
+	case sendClaimOwned:
+		// The row is ours and now reads 'sending'. Fall through to the POST.
+	}
+
 	res, berr := p.broadcastWithBackpressure(ctx, txid, ef)
 	switch {
 	case berr != nil && isBackpressure(berr):
-		// Exhausted the single retry: leave the tx in-flight, report service error.
+		// Exhausted the single retry: leave the tx in-flight, report service
+		// error. "In-flight" is now literal — the row stays at the 'sending' this
+		// call's claim put it in, which is exactly where FindResendable's graced
+		// arm looks for stranded sends. The row therefore backs off one full
+		// grace and is then re-driven, instead of being retried on every tick.
 		swr.Status = wdk.SendWithResultStatusSending
 		return swr, &wdk.ReviewActionResult{
 			TxID:   primitives.TXIDHexString(txid),
@@ -453,7 +703,8 @@ func (p *Provider) broadcastOne(ctx context.Context, userID int, txid string) (w
 			Errors: wdk.ReviewActionErrors{"arcade": berr},
 		}, nil
 	case berr != nil:
-		// Opaque/transport failure: unknown fate; report service error, keep in-flight.
+		// Opaque/transport failure: unknown fate; report service error, keep
+		// in-flight at 'sending' for the graced recovery arm (as above).
 		swr.Status = wdk.SendWithResultStatusSending
 		return swr, &wdk.ReviewActionResult{
 			TxID:   primitives.TXIDHexString(txid),

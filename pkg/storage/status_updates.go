@@ -970,6 +970,16 @@ func recordTxIDs(recs []arcade.TxRecord) []string {
 // ProcessAction is about to broadcast it) from being double-sent by the sweep;
 // anything unbroadcast longer than this was stranded (e.g. an open arcade
 // circuit breaker skipped the send) and is safe to re-broadcast.
+//
+// It is the SINGLE definition of "stranded" for this package, and both sides of
+// the recovery path must read it from here: the SELECTOR
+// ([metastore.KnownTxRepo.FindResendable], which decides what the sweep is
+// handed) and the TAKER ([metastore.KnownTxRepo.ReclaimStaleSend], via
+// [Provider.claimForBroadcast], which decides what may actually be re-driven).
+// A second cutoff defined anywhere else would let the two disagree, and the
+// disagreement has a direction either way: a taker more eager than the selector
+// steals live sends, a taker more patient than it never recovers dead ones
+// while the selector keeps re-offering them.
 const resendGrace = 20 * time.Second
 
 // SendWaitingTransactions broadcasts up to limit re-drivable known txs through
@@ -1100,6 +1110,13 @@ func (p *Provider) reservationResendable(ctx context.Context, userID int, refere
 
 // sendOneWaiting EF-encodes and broadcasts one delayed tx, then commits the
 // outcome.
+//
+// It CLAIMS the row before the POST — see [Provider.claimForBroadcast]. The
+// work list it is driven from is a SELECT, so between that snapshot and this
+// POST another instance (or the synchronous path) can take the same row; losing
+// that race must cost one silent no-op, never a second POST. kt.Status is the
+// snapshot's status and picks the arm: rows off the graced 'sending' arm are
+// crash recoveries and are taken by re-claim, everything else by first claim.
 func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx, inputBEEF []byte) error {
 	txid := kt.TxID
 	if len(kt.RawTx) == 0 {
@@ -1119,9 +1136,38 @@ func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx, in
 	if err != nil {
 		return fmt.Errorf("EF-encode %s: %w", txid, err)
 	}
+	claim, err := p.claimForBroadcast(ctx, txid, kt.Status)
+	var fenced *notBroadcastableError
+	switch {
+	case errors.As(err, &fenced):
+		// The row went fenced or terminal between FindResendable's SELECT and
+		// this CAS — an abort landed, or a rejection did. This is NOT a failure
+		// to report: the sweep's error path logs "will retry next cycle", and
+		// there is no next cycle for these rows, because FindResendable excludes
+		// every one of these statuses at any age. Counting it as a failed
+		// broadcast would put a permanent, self-inflating number in front of an
+		// operator for an outcome that is the fence working exactly as designed.
+		p.logger.DebugContext(ctx, "send waiting: row left the broadcastable set mid-sweep",
+			slog.String("txid", txid), slog.String("status", string(fenced.status)))
+		return nil
+	case err != nil:
+		// Transient by contrast (an unreadable status, a vanished row): those DO
+		// deserve the warning and the failed count.
+		return err
+	}
+	if claim != sendClaimOwned {
+		// Another instance claimed it this tick, or the bytes are already on the
+		// network. Either way this sweep has nothing to do for this row, and that
+		// is a normal outcome — reporting it as a failure would make a healthy
+		// multi-instance deployment look like a broken one.
+		return nil
+	}
 	res, berr := p.broadcastWithBackpressure(ctx, txid, ef)
 	if berr != nil {
-		// Backpressure exhausted or opaque/transport failure: leave unsent.
+		// Backpressure exhausted or opaque/transport failure: the row stays at
+		// the 'sending' the claim put it in, which is FindResendable's graced
+		// recovery arm. The re-claim's clock re-stamp is what makes that a
+		// once-per-grace retry rather than a once-per-tick POST loop.
 		return berr
 	}
 	if res.Rejected {

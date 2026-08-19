@@ -39,11 +39,14 @@ const KnownTxStatusStuck wdk.ProvenTxReqStatus = "stuck"
 // skip set. An unguarded Upsert or UpdateStatus will happily move an aborted
 // row back to 'unsent', from where the sweep would broadcast it.
 //
-// Wiring status: processNewTx's Upsert passes the set and treats a skip as a
-// hard error, so a re-drive can no longer resurrect an aborted row that way.
-// The provider's other requeue-shaped write, queueDelayed's UpdateStatus, is
-// still unguarded and is owned by the next task in the sequence; until it
-// lands, a delayed send can still walk an aborted row back to 'unsent'.
+// Both of the provider's requeue-shaped writes now discharge it: processNewTx's
+// Upsert (a skip of any kind is a hard error there — the caller asked to make
+// bytes broadcastable and storage refused) and queueDelayed's UpdateStatus (a
+// skip on a FENCED or TERMINAL status is a hard error; a skip on a row already
+// past the broadcast stage, or mid-POST, is the idempotent no-op a retrying
+// client is entitled to). A NEW requeue-shaped write inherits the obligation:
+// the skip set is not enforced by the type system, so an unguarded write is a
+// hole that compiles.
 const KnownTxStatusAborted wdk.ProvenTxReqStatus = "aborted"
 
 // knownTxPreBroadcastStatuses are the statuses from which a known tx has

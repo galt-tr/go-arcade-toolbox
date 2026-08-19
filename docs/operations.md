@@ -107,6 +107,27 @@ tasks, and the reject→release reconciler. Watch these signals:
   connection pool isn't starving it behind the write workers.
 - **Circuit-breaker state.** Repeated `ErrCircuitOpen` on broadcast means Arcade
   is unreachable (opaque failures); the breaker probes `GET /health` to recover.
+- **The send sweep, when "my transaction isn't going out."** Before any POST, a
+  broadcaster CLAIMS the transaction's `known_txs` row by moving it to `sending`
+  (this is what stops an aborted transaction being re-broadcast after its inputs
+  were released). Two consequences shape what a stalled send looks like:
+  - **A failed POST backs off a full grace, not a tick.** A transport failure or
+    exhausted backpressure leaves the row at `sending`; the sweep re-drives it
+    only once it has aged past the resend grace (`resendGrace`, 20s), and each
+    re-drive re-stamps the clock. So a transaction failing against a sick Arcade
+    retries roughly every 20s, NOT on every monitor cycle. A row sitting at
+    `sending` for a minute or two is the backoff working, not a stuck send —
+    give it a few grace periods before escalating.
+  - **A row stuck at `sending` cannot be aborted.** The abort CAS deliberately
+    refuses that status at any age, so the claim can never be snatched out from
+    under a POST that may already be on the wire. There is therefore **no
+    operator path that fences a permanently-stuck `sending` row.** It leaves
+    that status only by succeeding (→ `unconfirmed`) or by drawing a tx-level
+    rejection (→ `suspectFailed`), after which the reject→release reconciler
+    owns it and can take it terminal — the reconciler is the only escape.
+    Transactions that have sat at `sending` for hours with no Arcade rejection
+    mean POSTs are failing at the transport layer; fix reachability rather than
+    looking for a way to cancel them.
 
 ## Running `cmd/storage-server`
 
