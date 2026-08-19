@@ -74,6 +74,44 @@
 // and must keep them for the life of the transaction, so its decision cannot be
 // folded into a single write's WHERE.
 //
+// # Set-based batches (PostgreSQL)
+//
+// The guarded mutations take a LIST of outpoints, and on PostgreSQL each one is
+// a single statement over the whole list rather than a statement per item.
+// Spend, ReleaseOutpoints, Unspend, Promote and Freeze/Unfreeze join their
+// target rows against a two-parameter key relation (pgKeyRel: the two-argument
+// unnest of a bytea[] of txids and a bigint[] of vouts), carrying exactly the
+// guard conjuncts the per-op write carried. Two arrays rather than N tuples
+// keeps the statement text — and so the cached plan — constant across batch
+// sizes, and keeps a wide batch clear of the 65535-parameter ceiling. The
+// two-ARGUMENT spelling is deliberate: it pairs the arrays positionally by
+// definition, where two unnests in a target list would leave that to a planner
+// rule that has differed between major versions, and a mis-pairing here spends
+// the wrong coin. See pgKeyRel.
+//
+// This is where the round trips were. Spend runs on the broadcast-accept path
+// of every accepted transaction, once per input; ReleaseOutpoints is the
+// funder's rollback tail. At 1000 TPS those were per-coin round trips on paths
+// that already know everything they need in one go.
+//
+// Nothing about the guarded-mutation contract changes. Spend still writes
+// first, still classifies only what the write missed, and still runs the
+// two-attempt guardAttempts loop — all of it lifted to the batch, so a mixed
+// batch costs one write plus one classifying read and re-drives only the items
+// that are actually contended. Where a statement's result is per item (Spend's
+// verdicts, Freeze's NotFoundErrors) the write RETURNS its keys, and the misses
+// are the input minus the returned set, reported in the caller's order. A
+// duplicated outpoint behaves as it did under the loop: PostgreSQL applies at
+// most one UPDATE per target row per statement, so the second occurrence
+// resolves against the first's result rather than writing again.
+//
+// SQLite deliberately keeps the loops. Its pool is pinned to one local writer
+// connection, so a statement per op costs no network round trip, and the
+// dialect has neither unnest nor a derived-table column-alias list to express
+// the batch with. The conformance suite runs both arms and pins that they rule
+// identically; guarded_stmt_test.go and set_based_pg_test.go pin the statement
+// COUNTS, which is the only way the difference is visible at all.
+//
 // # Mode A: shared database
 //
 // The store exposes [Store.SharesDatabase] and honors an ambient transaction

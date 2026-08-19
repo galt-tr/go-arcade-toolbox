@@ -933,17 +933,28 @@ func (p *Provider) changeOutpoints(ctx context.Context, userID int, transactionI
 }
 
 // markInputsSpent records the spend history on the local input output rows.
+//
+// The input rows are resolved in ONE batched lookup rather than a keyed query
+// per input: this runs inside the broadcast-accept commit, for every accepted
+// transaction, so the round trips it used to spend scaled with the input count
+// of every send.
 func (p *Provider) markInputsSpent(ctx context.Context, userID int, spendingTxID uint, tx *transaction.Transaction) error {
-	var ids []uint
+	ops := make([]wdk.OutPoint, 0, len(tx.Inputs))
 	for _, in := range tx.Inputs {
 		if in.SourceTXID == nil {
 			continue
 		}
-		row, err := p.findLocalOutput(ctx, userID, in.SourceTXID.String(), in.SourceTxOutIndex)
-		if err != nil {
-			return err
-		}
-		if row != nil {
+		ops = append(ops, wdk.OutPoint{TxID: in.SourceTXID.String(), Vout: in.SourceTxOutIndex})
+	}
+	rows, err := p.localOutputsByOutpoint(ctx, userID, ops)
+	if err != nil {
+		return err
+	}
+	// Walk the inputs, not the result: an input with no local row is skipped
+	// (it is somebody else's coin), and the id order stays the input order.
+	var ids []uint
+	for _, op := range ops {
+		if row := rows[op]; row != nil {
 			ids = append(ids, row.OutputID)
 		}
 	}

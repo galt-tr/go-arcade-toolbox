@@ -22,28 +22,43 @@ import (
 // [utxostore.ErrContention] when a row keeps flipping between spendable and
 // held, which is transient: re-drive the spend. Fact-mode callers recording an
 // accepted broadcast must tolerate it rather than read it as a refused coin.
+//
+// On PostgreSQL the whole batch is ONE statement per (spender, guard mode)
+// group — in practice one, since a call records a single transaction's inputs —
+// instead of a round trip per op. See [Store.spendSet]. SQLite keeps the
+// per-op loop.
 func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp, force bool) error {
 	if s.isClosed() {
 		return errClosed
 	}
 
-	var failed int
 	err := s.withTx(ctx, func(x queryer) error {
-		failed = 0
+		// Clear every verdict up front rather than as each item is decided: a
+		// lock-error retry re-runs this whole function, and a stale Err from
+		// the aborted attempt must not survive into the new one.
+		for _, sp := range spends {
+			sp.Err = nil
+		}
+		if s.engine == EnginePostgres {
+			return s.spendSet(ctx, x, spends, force)
+		}
 		for _, sp := range spends {
 			itemErr, fatal := s.spendOne(ctx, x, sp, force)
 			if fatal != nil {
 				return fatal
 			}
 			sp.Err = itemErr
-			if itemErr != nil {
-				failed++
-			}
 		}
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	var failed int
+	for _, sp := range spends {
+		if sp.Err != nil {
+			failed++
+		}
 	}
 	if failed > 0 {
 		return batchErr(failed, len(spends))
@@ -157,6 +172,251 @@ func (s *Store) classifySpendFailure(ctx context.Context, x queryer, sp *utxosto
 	}
 }
 
+// The set-based (PostgreSQL) spend statements. Each is the per-op guarded
+// UPDATE with its outpoint predicate replaced by a join against [pgKeyRel], so
+// a whole batch costs ONE round trip; the guard conjuncts are otherwise
+// verbatim what [Store.spendUpdate] carries, per mode:
+//
+//   - guarded: spent_by IS NULL AND reserved_by=$4 AND NOT frozen
+//   - fact:    spent_by IS NULL  (a freeze or a stale reservation cannot
+//     un-happen a spend the network already accepted)
+//
+// RETURNING names the keys rather than a count, because a batch needs to know
+// WHICH ops the write matched, not how many.
+var (
+	spendSetGuardedPG = `UPDATE utxos u SET spent_by=$3, pinned=FALSE FROM ` + pgKeyRel +
+		` WHERE ` + pgKeyMatch + ` AND u.spent_by IS NULL AND u.reserved_by=$4 AND ` + notFrozenOn("u") +
+		` RETURNING u.txid, u.vout`
+
+	spendSetFactPG = `UPDATE utxos u SET spent_by=$3, pinned=FALSE FROM ` + pgKeyRel +
+		` WHERE ` + pgKeyMatch + ` AND u.spent_by IS NULL` +
+		` RETURNING u.txid, u.vout`
+
+	// spendClassifySetPG reads the state of every miss in ONE query. It serves
+	// both modes: fact mode simply ignores the two columns whose refusals it
+	// does not honor, which is cheaper than a second statement text.
+	spendClassifySetPG = `SELECT u.txid, u.vout, u.spent_by, u.frozen, u.reserved_by
+		FROM utxos u JOIN ` + pgKeyRel + ` ON ` + pgKeyMatch
+)
+
+// spendGroup is a run of spends that ONE set-based statement can carry: they
+// write the same spent_by and, under a guard, assert the same reservation.
+type spendGroup struct {
+	spendingTxID chainhash.Hash
+	reservation  string // "" in fact mode: the guard does not name it
+	ops          []*utxostore.SpendOp
+}
+
+// groupSpends partitions spends into the fewest statements that preserve each
+// item's semantics. The write's SET clause carries the spender and (under a
+// guard) its WHERE carries the reservation, so those two are what a group must
+// hold constant; fact mode drops the reservation from both, so it groups on the
+// spender alone. In practice every caller records one transaction's inputs and
+// gets exactly one group.
+//
+// Groups keep first-appearance order, so when the same outpoint appears under
+// two spenders the earlier one wins the row and the later one classifies
+// against it — the ruling the sequential loop made.
+func groupSpends(spends []*utxostore.SpendOp, force bool) []*spendGroup {
+	var (
+		order []*spendGroup
+		byKey = make(map[string]*spendGroup, 1)
+	)
+	for _, sp := range spends {
+		key := string(sp.SpendingTxID[:])
+		res := ""
+		if !force {
+			res = sp.Reservation
+			key += "\x00" + res
+		}
+		g, ok := byKey[key]
+		if !ok {
+			g = &spendGroup{spendingTxID: sp.SpendingTxID, reservation: res}
+			byKey[key] = g
+			order = append(order, g)
+		}
+		g.ops = append(g.ops, sp)
+	}
+	return order
+}
+
+// outpoints projects a group's ops onto the key array [pairArgs] binds.
+func (g *spendGroup) outpoints() []utxostore.Outpoint {
+	ops := make([]utxostore.Outpoint, len(g.ops))
+	for i, sp := range g.ops {
+		ops[i] = sp.Outpoint
+	}
+	return ops
+}
+
+// spendSet is the PostgreSQL arm of [Store.Spend]: the per-op write→classify→
+// retry loop, lifted to the whole batch. The happy path is one statement per
+// group (one, for a caller recording one transaction's inputs) where the loop
+// paid a round trip per input on the broadcast-accept path of every accepted
+// transaction.
+//
+// The 2-attempt budget [guardAttempts] names is preserved at the BATCH level
+// and means the same thing it did per op: a write that matched nothing followed
+// by a read that finds the row eligible again is a concurrent release or
+// unspend, and one more attempt settles it. Only the still-unclassified misses
+// are re-driven, so the second round is as small as the contention actually is.
+// Items that never settle are reported as [utxostore.ErrContention], exactly as
+// the per-op loop reported them.
+func (s *Store) spendSet(ctx context.Context, x queryer, spends []*utxostore.SpendOp, force bool) error {
+	// Validation is not a row state, so it is settled before any statement and
+	// its items never enter a group.
+	pending := make([]*utxostore.SpendOp, 0, len(spends))
+	for _, sp := range spends {
+		if sp.Reservation == "" {
+			sp.Err = fmt.Errorf("sqlstore: spend %s: reservation must be non-empty", sp.Outpoint)
+			continue
+		}
+		pending = append(pending, sp)
+	}
+
+	attempt := pending
+	for range guardAttempts {
+		if len(attempt) == 0 {
+			return nil
+		}
+		misses, err := s.spendWriteSet(ctx, x, attempt, force)
+		if err != nil {
+			return err
+		}
+		if len(misses) == 0 {
+			return nil
+		}
+		unresolved, err := s.classifySpendMisses(ctx, x, misses, force)
+		if err != nil {
+			return err
+		}
+		if len(unresolved) == 0 {
+			return nil
+		}
+		attempt = unresolved
+	}
+	// These rows kept looking spendable between the guarded write and the read
+	// that followed it; see the per-op twin, [Store.spendOne], for why that is
+	// contention rather than a refusal.
+	for _, sp := range attempt {
+		sp.Err = fmt.Errorf("sqlstore: spend %s: %w", sp.Outpoint, utxostore.ErrContention)
+	}
+	return nil
+}
+
+// spendWriteSet runs one set-based guarded UPDATE per group and returns the ops
+// the write did NOT match — the only ones that pay for a classifying read.
+func (s *Store) spendWriteSet(ctx context.Context, x queryer, spends []*utxostore.SpendOp, force bool) ([]*utxostore.SpendOp, error) {
+	q := spendSetGuardedPG
+	if force {
+		q = spendSetFactPG
+	}
+
+	var misses []*utxostore.SpendOp
+	for _, g := range groupSpends(spends, force) {
+		txids, vouts := pairArgs(g.outpoints())
+		args := []any{txids, vouts, g.spendingTxID[:]}
+		if !force {
+			args = append(args, g.reservation)
+		}
+		rows, err := x.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		recorded, err := scanOutpointSet(rows)
+		if err != nil {
+			return nil, err
+		}
+		for _, sp := range g.ops {
+			if _, ok := recorded[sp.Outpoint]; !ok {
+				misses = append(misses, sp)
+			}
+		}
+	}
+	return misses, nil
+}
+
+// spendState is one miss's row state, as [spendClassifySetPG] projects it.
+type spendState struct {
+	spentBy    []byte
+	frozen     bool
+	reservedBy sql.NullString
+}
+
+// classifySpendMisses turns every miss into its per-item verdict with ONE read,
+// and returns the ops that look spendable again (the caller re-drives those).
+// The taxonomy and its precedence are [Store.classifySpendFailure]'s, item for
+// item — a recorded spend wins over a freeze, the spent_by arbiter rules in
+// BOTH modes, and the freeze/reservation refusals exist only under a guard.
+// The conformance suite pins the rulings; the two classifiers must stay in step
+// with each other and with the aerostore twin.
+func (s *Store) classifySpendMisses(ctx context.Context, x queryer, misses []*utxostore.SpendOp, force bool) ([]*utxostore.SpendOp, error) {
+	ops := make([]utxostore.Outpoint, len(misses))
+	for i, sp := range misses {
+		ops[i] = sp.Outpoint
+	}
+	txids, vouts := pairArgs(ops)
+	rows, err := x.QueryContext(ctx, spendClassifySetPG, txids, vouts)
+	if err != nil {
+		return nil, err
+	}
+	state, err := s.scanSpendStates(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	var unresolved []*utxostore.SpendOp
+	for _, sp := range misses {
+		st, present := state[sp.Outpoint]
+		if !present {
+			sp.Err = &utxostore.NotFoundError{Op: sp.Outpoint}
+			continue
+		}
+		switch {
+		case len(st.spentBy) > 0:
+			w, herr := decodeHash(st.spentBy)
+			if herr != nil {
+				return nil, herr
+			}
+			if *w == sp.SpendingTxID {
+				continue // idempotent same-spender replay
+			}
+			sp.Err = &utxostore.SpentError{Op: sp.Outpoint, Winner: *w}
+		case !force && st.frozen:
+			sp.Err = &utxostore.FrozenError{Op: sp.Outpoint}
+		case !force && st.reservedBy.String != sp.Reservation:
+			sp.Err = &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: st.reservedBy.String}
+		default:
+			unresolved = append(unresolved, sp)
+		}
+	}
+	return unresolved, nil
+}
+
+// scanSpendStates reads the classifying join into a per-outpoint state map.
+// Outpoints with no entry are absent rows.
+func (s *Store) scanSpendStates(rows *sql.Rows) (map[utxostore.Outpoint]spendState, error) {
+	defer func() { _ = rows.Close() }()
+	out := make(map[utxostore.Outpoint]spendState)
+	for rows.Next() {
+		var (
+			txid   []byte
+			vout   uint32
+			st     spendState
+			frozen boolScan
+		)
+		if err := rows.Scan(&txid, &vout, &st.spentBy, s.boolDest(&frozen), &st.reservedBy); err != nil {
+			return nil, err
+		}
+		st.frozen = s.boolGet(frozen)
+		var op utxostore.Outpoint
+		copy(op.TxID[:], txid)
+		op.Vout = vout
+		out[op] = st
+	}
+	return out, rows.Err()
+}
+
 // Unspend implements [utxostore.Store]: for each op whose row is spent by
 // spendingTxID, clears the spend AND the reservation, returning the coin to the
 // claimable pool. Guard mismatches and missing outpoints are skips. Frozen rows
@@ -169,6 +429,29 @@ func (s *Store) Unspend(ctx context.Context, spendingTxID chainhash.Hash, ops []
 	var released int
 	err := s.withTx(ctx, func(x queryer) error {
 		released = 0
+		if len(ops) == 0 {
+			return nil
+		}
+		// PostgreSQL: one set-based UPDATE for the whole list. RowsAffected is
+		// the release count directly — a duplicated outpoint updates its row
+		// once, the same total the loop reached by having the second write
+		// match nothing.
+		if s.engine == EnginePostgres {
+			txids, vouts := pairArgs(ops)
+			res, err := x.ExecContext(ctx,
+				`UPDATE utxos u SET spent_by=NULL, reserved_by=NULL, reserved_at=NULL, pinned=FALSE FROM `+pgKeyRel+
+					` WHERE `+pgKeyMatch+` AND u.spent_by=$3`,
+				txids, vouts, spendingTxID[:])
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			released = int(n)
+			return nil
+		}
 		for _, op := range ops {
 			res, err := x.ExecContext(ctx, s.rebind(
 				`UPDATE utxos SET spent_by=NULL, reserved_by=NULL, reserved_at=NULL, pinned=`+s.boolLit(false)+`
@@ -204,6 +487,28 @@ func (s *Store) Promote(ctx context.Context, ops []utxostore.Outpoint, to utxost
 	var changed int
 	err := s.withTx(ctx, func(x queryer) error {
 		changed = 0
+		if len(ops) == 0 {
+			return nil
+		}
+		// PostgreSQL: one set-based UPDATE. The tier<>$3 guard keeps the count
+		// "rows whose tier actually changed" the interface promises, and a
+		// duplicated outpoint is still counted once.
+		if s.engine == EnginePostgres {
+			txids, vouts := pairArgs(ops)
+			res, err := x.ExecContext(ctx,
+				`UPDATE utxos u SET tier=$3 FROM `+pgKeyRel+
+					` WHERE `+pgKeyMatch+` AND u.tier<>$3`,
+				txids, vouts, int64(to))
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			changed = int(n)
+			return nil
+		}
 		for _, op := range ops {
 			res, err := x.ExecContext(ctx, s.rebind(
 				"UPDATE utxos SET tier=? WHERE txid=? AND vout=? AND tier<>?"),
@@ -410,6 +715,32 @@ func (s *Store) setFrozen(ctx context.Context, ops []utxostore.Outpoint, frozen 
 	var itemErrs []error
 	err := s.withTx(ctx, func(x queryer) error {
 		itemErrs = itemErrs[:0]
+		if len(ops) == 0 {
+			return nil
+		}
+		// PostgreSQL: one set-based UPDATE, whose RETURNING names the rows that
+		// existed. The misses are the per-item NotFoundErrors, reported in the
+		// caller's op order (and once per occurrence, as the loop did).
+		if s.engine == EnginePostgres {
+			txids, vouts := pairArgs(ops)
+			rows, err := x.QueryContext(ctx,
+				`UPDATE utxos u SET frozen=$3 FROM `+pgKeyRel+
+					` WHERE `+pgKeyMatch+` RETURNING u.txid, u.vout`,
+				txids, vouts, s.boolVal(frozen))
+			if err != nil {
+				return err
+			}
+			found, err := scanOutpointSet(rows)
+			if err != nil {
+				return err
+			}
+			for _, op := range ops {
+				if _, ok := found[op]; !ok {
+					itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
+				}
+			}
+			return nil
+		}
 		for _, op := range ops {
 			res, err := x.ExecContext(ctx, s.rebind("UPDATE utxos SET frozen=? WHERE txid=? AND vout=?"),
 				s.boolVal(frozen), op.TxID[:], op.Vout)

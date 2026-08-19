@@ -356,6 +356,92 @@ func (s *Store) forUpdate() string {
 // live contention rather than a lost race, and is reported as such.
 const guardAttempts = 2
 
+// pgKeyRel is the outpoint key relation every SET-BASED PostgreSQL mutation in
+// this package joins its target rows against: $1 binds the txids as a bytea[]
+// and $2 the vouts as a bigint[], so ONE statement carries a whole batch. Every
+// statement built on it therefore starts its own parameters at $3.
+//
+// Two ARRAYS rather than N (txid, vout) tuples is what keeps the statement text
+// constant across batch sizes: PostgreSQL caches one plan instead of one per
+// distinct N, and a thousand-item batch comes nowhere near the 65535-parameter
+// ceiling a tuple list would spend two placeholders per op against.
+//
+// The casts are load-bearing, not decoration. An untyped parameter defaults to
+// text, and `bytea = text` resolves to no operator at all — the statement fails
+// to parse rather than mis-matching quietly. pgx binds [][]byte to bytea[] and
+// []int64 to bigint[] natively (see [pairArgs]).
+//
+// # Why the two-ARGUMENT unnest, and not two unnests in a target list
+//
+// `unnest(a, b)` in the FROM clause is DEFINED to walk its arrays positionally,
+// emitting the i-th element of each as one row: the pairing between a txid and
+// its vout is a property of the function. The equivalent-looking
+// `SELECT unnest($1) AS txid, unnest($2) AS vout` is not — there the pairing is
+// a property of how the PLANNER expands multiple set-returning functions in a
+// target list, and that rule has changed across major versions (before 10 they
+// were cycled to the least common multiple of their row counts; 10 and later
+// advance them in lockstep under ProjectSet, padding the shorter with NULLs).
+// PostgreSQL's own documentation discourages relying on it.
+//
+// The failure that buys is not theoretical: a batch's arrays hold one txid per
+// op, and a mis-pairing under any such rule crosses txid i with vout j and
+// SPENDS THE WRONG COIN. Only a batch spanning several txids with asymmetric
+// vouts can tell the two apart, which is what the mixed-txid conformance case
+// exists for — a same-txid batch pairs correctly either way.
+//
+// PostgreSQL only: SQLite keeps the per-op loops these replace. There the loop
+// costs no network round trip (the store pins a single local writer connection)
+// and the engine has neither unnest nor a column-alias list for a derived
+// table, so a batch statement there would be more text for no saving.
+const pgKeyRel = `unnest($1::bytea[], $2::bigint[]) AS k(txid, vout)`
+
+// pgKeyMatch pairs a target row aliased "u" with [pgKeyRel]. The ::integer
+// narrows the key's bigint to the vout column's own type, so the comparison is
+// int4 = int4 and the (txid, vout) primary key is directly usable.
+//
+// A key appearing TWICE in the arrays still updates — and RETURNS — its row
+// exactly once: PostgreSQL applies at most one UPDATE per target row per
+// statement. That is what makes a batch carrying a duplicate outpoint behave
+// exactly as the sequential loop did, where the second write simply matched
+// nothing.
+const pgKeyMatch = `u.txid = k.txid AND u.vout = k.vout::integer`
+
+// pairArgs splits ops into the two parallel arrays [pgKeyRel] binds: txids as
+// bytea[] and vouts as bigint[]. The txid slices alias ops' backing array,
+// which the driver reads before the call returns.
+func pairArgs(ops []utxostore.Outpoint) ([][]byte, []int64) {
+	txids := make([][]byte, len(ops))
+	vouts := make([]int64, len(ops))
+	for i := range ops {
+		txids[i] = ops[i].TxID[:]
+		vouts[i] = int64(ops[i].Vout)
+	}
+	return txids, vouts
+}
+
+// scanOutpointSet collects a (txid, vout) projection — a set-based statement's
+// RETURNING clause, or the classifying join's key columns — into a set. It is
+// the batch counterpart of RowsAffected: which of the ops the statement carried
+// actually matched, rather than merely how many did.
+func scanOutpointSet(rows *sql.Rows) (map[utxostore.Outpoint]struct{}, error) {
+	defer func() { _ = rows.Close() }()
+	out := make(map[utxostore.Outpoint]struct{})
+	for rows.Next() {
+		var (
+			txid []byte
+			vout uint32
+		)
+		if err := rows.Scan(&txid, &vout); err != nil {
+			return nil, err
+		}
+		var op utxostore.Outpoint
+		copy(op.TxID[:], txid)
+		op.Vout = vout
+		out[op] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // notPinned is the "row is not pinned" predicate. It needs no dialect switch:
 // SQLite has no boolean type, but NOT over an INTEGER 0/1 evaluates correctly
 // (NOT 0 = 1, NOT 1 = 0), the same ruling [Store.Balance] already makes for
@@ -375,6 +461,10 @@ func notPinnedOn(alias string) string { return "NOT " + alias + ".pinned" }
 // INTEGER 0/1 evaluates correctly, the same ruling [Store.Balance] and the
 // claim statements already make.
 const notFrozen = "NOT frozen"
+
+// notFrozenOn is [notFrozen] for a column carrying a table alias ("u" → "NOT
+// u.frozen"), used by the set-based mutations that join against [pgKeyRel].
+func notFrozenOn(alias string) string { return "NOT " + alias + ".frozen" }
 
 // boolLit renders a boolean LITERAL for the engine (PostgreSQL TRUE/FALSE,
 // SQLite 1/0), for the SET clauses that carry the value inline rather than as a

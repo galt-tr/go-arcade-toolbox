@@ -102,12 +102,24 @@ func (p *Provider) buildResultInputs(ctx context.Context, userID int, provided [
 		vin++
 	}
 
+	// One lookup for every storage-allocated input, rather than a keyed query
+	// per coin: a funded action can carry dozens, and this runs on the create
+	// path of every transaction.
+	allocatedOps := make([]wdk.OutPoint, 0, len(allocated))
 	for _, u := range allocated {
+		allocatedOps = append(allocatedOps, wdk.OutPoint{TxID: u.TxID.String(), Vout: u.Vout})
+	}
+	localRows, err := p.localOutputsByOutpoint(ctx, userID, allocatedOps)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, u := range allocated {
 		txid := u.TxID.String()
-		row, err := p.findLocalOutput(ctx, userID, txid, u.Vout)
-		if err != nil {
-			return nil, err
-		}
+		// Absent stays absent: a coin with no local output row falls back to
+		// the BEEF for its locking script and carries no derivation material,
+		// exactly as the per-coin lookup's nil row did.
+		row := localRows[allocatedOps[i]]
 
 		lockingScript := lockingScriptFor(row, beef, txid, u.Vout)
 		unlockLen := primitives.PositiveInteger(txDefaultUnlockLen)
@@ -151,21 +163,39 @@ func sourceTxBytesFor(beef *transaction.Beef, txid string) primitives.ExplicitBy
 
 const txDefaultUnlockLen = 107 // P2PKH unlocking script estimate
 
-// findLocalOutput returns the metastore output row for (txid, vout) under
-// userID, or nil when absent.
-func (p *Provider) findLocalOutput(ctx context.Context, userID int, txid string, vout uint32) (*metastore.OutputRow, error) {
-	rows, err := p.meta.Outputs().FindOutputs(ctx, wdk.FindOutputsArgs{
-		UserID: &userID,
-		TxID:   &txid,
-		Vout:   &vout,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("storage: find local output %s:%d: %w", txid, vout, err)
-	}
-	if len(rows) == 0 {
+// localOutputsByOutpoint resolves the metastore output rows for ops under
+// userID in one batched query, keyed by outpoint. Outpoints with no local row
+// are simply absent from the map, so a caller reads a miss as a nil row.
+//
+// When two rows share an outpoint the LOWEST output_id wins. That case is
+// reachable — outputs is unique on (transaction_id, vout), but transactions.txid
+// is NOT unique, so two transaction rows can carry the same txid — and picking
+// the first preserves what the per-outpoint FindOutputs lookup this replaces
+// returned (it took rows[0] of an output_id-ordered result).
+//
+// Keys round-trip exactly: callers build ops from chainhash.Hash.String(), the
+// metastore stores the hex decode of that string, and OutputRow.TxID re-encodes
+// it with the same lowercase hex alphabet.
+func (p *Provider) localOutputsByOutpoint(ctx context.Context, userID int, ops []wdk.OutPoint) (map[wdk.OutPoint]*metastore.OutputRow, error) {
+	if len(ops) == 0 {
 		return nil, nil
 	}
-	return &rows[0], nil
+	rows, err := p.meta.Outputs().FindOutputsByOutpoints(ctx, userID, ops)
+	if err != nil {
+		return nil, fmt.Errorf("storage: find local outputs: %w", err)
+	}
+	byOp := make(map[wdk.OutPoint]*metastore.OutputRow, len(rows))
+	for i := range rows {
+		if rows[i].TxID == nil {
+			continue
+		}
+		op := wdk.OutPoint{TxID: *rows[i].TxID, Vout: rows[i].Vout}
+		if _, dup := byOp[op]; dup {
+			continue
+		}
+		byOp[op] = &rows[i]
+	}
+	return byOp, nil
 }
 
 // lockingScriptFor resolves a source locking script: the metastore row's stored

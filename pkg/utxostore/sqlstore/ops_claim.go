@@ -647,6 +647,11 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 // A matching token OVERRIDES the pin (and clears it): the callers are the
 // funder, whose rows are never pinned, and the reconciler's verified-dead
 // release, which must be able to reclaim a transaction proven never to live.
+//
+// On PostgreSQL the whole list is ONE statement. This is the funder's rollback
+// tail — a drainBatch that comes up short releases everything it holds — so at
+// 1000 TPS the loop it replaces was a round trip per coin on a path that is
+// already conceding.
 func (s *Store) ReleaseOutpoints(ctx context.Context, reservation string, ops []utxostore.Outpoint) error {
 	if s.isClosed() {
 		return errClosed
@@ -656,6 +661,17 @@ func (s *Store) ReleaseOutpoints(ctx context.Context, reservation string, ops []
 	}
 
 	return s.withTx(ctx, func(x queryer) error {
+		if len(ops) == 0 {
+			return nil
+		}
+		if s.engine == EnginePostgres {
+			txids, vouts := pairArgs(ops)
+			_, err := x.ExecContext(ctx,
+				`UPDATE utxos u SET reserved_by=NULL, reserved_at=NULL, pinned=FALSE FROM `+pgKeyRel+
+					` WHERE `+pgKeyMatch+` AND u.reserved_by=$3 AND u.spent_by IS NULL`,
+				txids, vouts, reservation)
+			return err
+		}
 		for _, op := range ops {
 			if _, err := x.ExecContext(ctx, s.rebind(
 				`UPDATE utxos SET reserved_by=NULL, reserved_at=NULL, pinned=`+s.boolLit(false)+`

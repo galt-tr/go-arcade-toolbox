@@ -27,6 +27,22 @@ import (
 // assertion on outcomes cannot pin it: the old check-then-write code passes
 // those tests too. So these assert on the statements the store actually sends
 // to the driver, using the same wrapper technique as claim_retry_test.go.
+//
+// # What this file pins, and what its PostgreSQL twin pins
+//
+// The recorder below drives SQLite, whose mutations are deliberately still a
+// LOOP over the ops: the engine pins a single local writer connection, so a
+// statement per op costs no network round trip, and SQLite has neither unnest
+// nor a derived-table column-alias list to express a batch with. The
+// assertions here are therefore about the guard CONJUNCTS a single op's write
+// carries, plus (in "sqlite keeps its per-op loop") the engine split itself.
+//
+// The batch shapes — an N-op Spend or ReleaseOutpoints as ONE statement — are
+// a PostgreSQL property and are pinned by set_based_pg_test.go, which points
+// the same recorder at the pgx driver. Keeping the count assertions in both
+// places is what makes them a perf regression guard rather than a comment: a
+// change that quietly reintroduced the loop on PostgreSQL would still pass
+// every behavioral test in the suite.
 
 // recorded is one statement the store issued, captured with its text.
 type recorded struct {
@@ -140,6 +156,28 @@ func (c *recConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx
 		return b.BeginTx(ctx, opts)
 	}
 	return c.Conn.Begin() //nolint:staticcheck // fallback for drivers without ConnBeginTx
+}
+
+// CheckNamedValue forwards the inner driver's argument conversion. Without it
+// the wrapper would silently DOWNGRADE the driver it wraps: database/sql looks
+// for driver.NamedValueChecker on the connection, finds only the wrapper, and
+// falls back to its default converter — which accepts nothing wider than an
+// int64/float64/bool/[]byte/string/time.Time. pgx implements the interface
+// permissively (it encodes arbitrary Go values itself), and that is what lets
+// the set-based statements bind [][]byte and []int64 as bytea[]/bigint[]. A
+// recorder that hid it would fail those calls at the sql package, before any
+// statement reached the server, and the failure would look like a store bug.
+//
+// driver.ErrSkip is the documented "use the default conversion" answer, so a
+// driver with no checker of its own (modernc's SQLite) behaves exactly as it
+// did before this method existed. recStmt deliberately does NOT implement the
+// interface: database/sql prefers a statement's checker over its connection's,
+// and neither driver here has a statement-level one to forward.
+func (c *recConn) CheckNamedValue(nv *driver.NamedValue) error {
+	if ck, ok := c.Conn.(driver.NamedValueChecker); ok {
+		return ck.CheckNamedValue(nv)
+	}
+	return driver.ErrSkip
 }
 
 type recStmt struct {
@@ -291,6 +329,34 @@ func TestGuardedMutationsAreOneGuardedStatement(t *testing.T) {
 		require.Contains(t, q, "DELETE FROM utxos")
 		require.NotContains(t, q, "reserved_by")
 		require.NotContains(t, q, "frozen")
+	})
+
+	t.Run("sqlite keeps its per-op loop", func(t *testing.T) {
+		store, rec := newRecordingStore(t)
+		ops := utxostoretest.MintTx(t, store, "sqlite-loop", 1, "default", utxostore.TierMined, 100, 200, 300)
+		claimed, err := store.ClaimLargestInsufficient(ctx, sc, "res-loop", 1_000, 3)
+		require.NoError(t, err)
+		require.Len(t, claimed, 3)
+
+		// Deliberate, not an oversight. On PostgreSQL each of these is ONE
+		// set-based statement (see set_based_pg_test.go); on SQLite a statement
+		// per op costs no round trip — the pool is pinned to one local writer
+		// connection — and the dialect cannot express the batch anyway, so the
+		// loop stays. Pinning the count here is what makes the split a decision
+		// the tests record rather than an accident either arm could drift into.
+		rec.start()
+		spends := make([]*utxostore.SpendOp, len(ops))
+		for i, op := range ops {
+			spends[i] = &utxostore.SpendOp{Outpoint: op, Reservation: "res-loop", SpendingTxID: utxostoretest.NewTxID("loop-tx")}
+		}
+		require.NoError(t, store.Spend(ctx, spends, false))
+		stmts := rec.stop()
+		require.Len(t, stmts, len(ops), "SQLite spends one statement per op; got %s", render(stmts))
+
+		rec.start()
+		require.NoError(t, store.ReleaseOutpoints(ctx, "res-loop", ops))
+		stmts = rec.stop()
+		require.Len(t, stmts, len(ops), "SQLite releases one statement per op; got %s", render(stmts))
 	})
 
 	t.Run("a refusal is the one path that pays for a read", func(t *testing.T) {
