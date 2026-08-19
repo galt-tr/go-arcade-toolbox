@@ -14,7 +14,9 @@ import (
 //
 //  1. Every method is atomic PER ITEM, never across items. Batch methods may
 //     partially succeed and report per-item Err (plus the [ErrBatch]
-//     sentinel at the top level).
+//     sentinel at the top level). [Store.ReserveOutpoints] is the ONE
+//     documented exception: it is all-or-nothing across its ops, because a
+//     partially reserved input set is not a usable transaction.
 //  2. Claim methods are single-round-trip atomic transitions; no interface
 //     method ever requires the caller to hold a lock across calls. This is
 //     what makes one funder correct on both SQL and Aerospike.
@@ -24,14 +26,20 @@ import (
 //     success, in either mode), Unspend (guard mismatch = skip), Release
 //     (already free = skip), Remove (missing = no-op), Promote (already there
 //     = counts as unchanged), Pin/Unpin (already in that state = uncounted
-//     skip). Every op a crash-recovery outbox replays is idempotent by
-//     construction.
+//     skip), ReserveOutpoints (rows already held by exactly this token count
+//     as satisfied and are not re-stamped). Every op a crash-recovery outbox
+//     replays is idempotent by construction.
 //  5. Frozen rows are invisible to claims and refuse a GUARDED Spend
 //     ([FrozenError]), but Release, Unspend, Promote, and a forced
 //     (fact-mode) Spend still apply to them.
 //  6. Pinned rows are reserved rows that no janitor may free: they are
 //     invisible to FindStaleReservations and untouched by ReleaseReservation.
 //     pinned = TRUE implies reserved and unspent, always. See [Store.Pin].
+//  7. FOUR operations create a reservation — the three claim shapes and
+//     [Store.ReserveOutpoints] — and they all produce the SAME thing: a row
+//     held by (userID, reservation), unpinned, sweepable, released by token.
+//     Nothing downstream distinguishes a coin the funder selected from one the
+//     caller named.
 type Store interface {
 	// Health reports the store's health: an HTTP-convention status code
 	// (200 healthy, 503 unavailable), a human-readable message, and an error
@@ -87,6 +95,36 @@ type Store interface {
 	// denomination within s. len(result) < count signals pool underflow and
 	// is NOT an error. count <= 0 returns (nil, nil).
 	ClaimExact(ctx context.Context, s Scope, reservation string, denomination uint64, count int) ([]*UTXO, error)
+
+	// ReserveOutpoints reserves the EXACT listed rows under (userID,
+	// reservation) — the outpoint-targeted analog of the claim methods, used
+	// for caller-provided wallet-owned inputs so they get the same exclusivity
+	// as funded coins. ALL-OR-NOTHING: every op must exist, belong to userID,
+	// and be claimable (unreserved, unspent, not frozen); if ANY op fails, NO
+	// row is left newly reserved, and the error joins per-item causes
+	// ([NotFoundError], [ReservedError], [SpentError], [FrozenError]) under
+	// [ErrBatch]. A row that belongs to a DIFFERENT user reports
+	// [NotFoundError], never [ReservedError]: the answer must not leak whether
+	// another user's coin exists. Refusal precedence per row matches Remove:
+	// spent > reserved-by-another > frozen. Duplicate outpoints are collapsed;
+	// a refusal is reported once per DISTINCT outpoint.
+	//
+	// On non-transactional backends (Aerospike) the all-or-nothing guarantee is
+	// enforced by compensation, so a crash on a refused reserve can leave rows
+	// under the caller's token until the stale sweep reclaims them; callers may
+	// ReleaseReservation on the token as insurance.
+	//
+	// An optimistic backend may return [ErrContention] (nothing was reserved);
+	// it is retryable, not a refusal.
+	//
+	// Idempotent for a replay under the same reservation: rows already reserved
+	// by exactly this token count as satisfied (and are not re-stamped, so
+	// ReservedAt keeps naming when the hold began; a row already ours that has
+	// since been FROZEN still refuses with [FrozenError] — the freeze outranks
+	// the replay). reservation must be non-empty; ops must be non-empty.
+	//
+	// The rows it reserves are ordinary UNPINNED reservations — rule 7.
+	ReserveOutpoints(ctx context.Context, userID int64, reservation string, ops []Outpoint) error
 
 	// ReleaseReservation frees every unspent, UNPINNED row held by (userID,
 	// reservation) and returns how many it freed. Idempotent: an unknown or
@@ -149,7 +187,7 @@ type Store interface {
 	// already spent by the SAME SpendingTxID is an idempotent success; a row
 	// spent by a DIFFERENT transaction still fails with [SpentError], because
 	// two spend facts cannot both hold and the caller must alert rather than
-	// overwrite. No row STATE refuses a fact: reserved by another token,
+	// overwrite. No OTHER row state refuses a fact: reserved by another token,
 	// unreserved, or frozen, it is RECORDED ANYWAY.
 	//
 	// Beyond those two, a fact-mode item can still fail for reasons that are

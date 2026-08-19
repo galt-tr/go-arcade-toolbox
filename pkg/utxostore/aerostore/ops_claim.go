@@ -309,6 +309,237 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	return claimed, nil
 }
 
+// validateReserveOutpoints rejects underspecified outpoint-reservation inputs.
+// An empty op list is a programmer error, not a degenerate success: the caller
+// asked for an all-or-nothing hold and named nothing to hold.
+func validateReserveOutpoints(reservation string, ops []utxostore.Outpoint) error {
+	switch {
+	case reservation == "":
+		return errors.New("aerostore: reservation must be non-empty")
+	case len(ops) == 0:
+		return errors.New("aerostore: ops must be non-empty")
+	}
+	return nil
+}
+
+// ReserveOutpoints implements [utxostore.Store]: an all-or-nothing hold on the
+// exact rows the caller named, so provided inputs get the same exclusivity a
+// funded coin gets. Each op is one guarded CAS, the same single-record
+// transition a claim uses — the record's claimKey bin exists IFF the coin is
+// claimable, so demanding its presence is the whole precondition, and removing
+// it in the same Operate is what takes the coin out of the claim index.
+//
+// # Atomicity is BOUNDED here, not absolute
+//
+// Aerospike has no multi-record transaction, so "no row is left newly reserved"
+// is enforced by COMPENSATION: rows won earlier in the call are handed back
+// through the same token-guarded release path the funder's rollback uses
+// ([Store.releaseRow] with [keepPins] — a fresh reservation is never pinned, so
+// there is no pin to override). A crash between the failing op and the last
+// compensating release leaves rows reserved by a token nobody will ever use:
+// the ordinary stale-reservation sweep reclaims them, exactly as it does for a
+// funder that died mid-run.
+//
+// That is the same CLASS of bounded window [Store.Pin] documents, but it fails
+// the other way and the difference matters. A partial Pin leaves rows
+// UNDER-pinned — sweepable when they should not be — while this residue leaves
+// rows OVER-reserved: held when they should be free. Over-reserved is the safe
+// direction (no second transaction can take those coins), but unlike a missing
+// pin it does not self-correct at the next broadcast; it waits for the sweep.
+// A deployment that needs the window closed rather than bounded wants a SQL
+// backend, where one transaction reserves the whole set or none of it.
+//
+// Rows already held by exactly this reservation are satisfied WITHOUT a write:
+// a replay must not slide resAt forward and hide the reservation from the
+// stale reaper.
+func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation string, ops []utxostore.Outpoint) error {
+	if s.closed.Load() {
+		return errClosed
+	}
+	if err := validateReserveOutpoints(reservation, ops); err != nil {
+		return err
+	}
+
+	// ONE timestamp for the whole set: the named inputs were reserved by a
+	// single decision, so they must age as a unit under the stale reaper rather
+	// than by however long the per-record CAS loop took.
+	nowMs := s.nowMillis()
+	var (
+		itemErrs []error
+		won      []*utxostore.UTXO
+	)
+	for _, op := range distinctOutpoints(ops) {
+		u, itemErr, fatal := s.reserveOutpointOne(op, userID, reservation, nowMs)
+		if fatal != nil {
+			s.undoReserveOutpoints(won, reservation)
+			return fatal
+		}
+		if itemErr != nil {
+			itemErrs = append(itemErrs, itemErr)
+			continue
+		}
+		if u != nil {
+			won = append(won, u)
+		}
+	}
+	if len(itemErrs) > 0 {
+		s.undoReserveOutpoints(won, reservation)
+		return joinBatch(itemErrs)
+	}
+	return nil
+}
+
+// distinctOutpoints drops repeats, preserving first-seen order. Duplicates in
+// one ReserveOutpoints call name the same row, so classifying it twice would
+// report the same refusal twice for a single coin.
+func distinctOutpoints(ops []utxostore.Outpoint) []utxostore.Outpoint {
+	seen := make(map[utxostore.Outpoint]struct{}, len(ops))
+	out := make([]utxostore.Outpoint, 0, len(ops))
+	for _, op := range ops {
+		if _, dup := seen[op]; dup {
+			continue
+		}
+		seen[op] = struct{}{}
+		out = append(out, op)
+	}
+	return out
+}
+
+// reserveOutpointOne reserves one named row. It returns a non-nil UTXO only for
+// a row this CALL won (so the caller knows exactly what to hand back on
+// failure); an already-ours row is a satisfied no-op and reports nothing.
+func (s *Store) reserveOutpointOne(op utxostore.Outpoint, userID int64, reservation string, nowMs int64) (won *utxostore.UTXO, itemErr, fatal error) {
+	u, satisfied, itemErr, fatal := s.classifyForReserve(op, userID, reservation)
+	if fatal != nil || itemErr != nil || satisfied {
+		return nil, itemErr, fatal
+	}
+
+	ok, err := s.casReserveOutpoint(u, userID, reservation, nowMs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ok {
+		return u, nil, nil
+	}
+
+	// The snapshot went stale between the read and the CAS. Look again: the
+	// live state usually names the refusal in the taxonomy (a concurrent
+	// claimer took it, an operator froze it, a broadcast spent it).
+	_, satisfied, itemErr, fatal = s.classifyForReserve(op, userID, reservation)
+	switch {
+	case fatal != nil:
+		return nil, nil, fatal
+	case itemErr != nil:
+		return nil, itemErr, nil
+	case satisfied:
+		return nil, nil, nil
+	}
+	// It does not: the row read as claimable again, so the CAS lost a race that
+	// has since resolved. Transient, and the caller's retry is the fix.
+	return nil, nil, utxostore.ErrContention
+}
+
+// classifyForReserve reads a named row and decides its fate. satisfied marks a
+// row already held by exactly this reservation, which needs no write at all.
+//
+// Refusal precedence matches [Store.Remove]: spent > reserved-by-another >
+// frozen. A row owned by a DIFFERENT user reports NotFound rather than
+// Reserved — the caller named the outpoint, so the reply must not confirm that
+// somebody else's coin exists. It shares its name with sqlstore's classifier
+// because it must make the identical rulings; the two stay in step by design.
+//
+// The read is only a snapshot; [Store.casReserveOutpoint] is the arbiter, and a
+// stale snapshot costs a second look, never a wrong write.
+func (s *Store) classifyForReserve(op utxostore.Outpoint, userID int64, reservation string) (u *utxostore.UTXO, satisfied bool, itemErr, fatal error) {
+	rec, found, gerr := s.getRecord(op)
+	if gerr != nil {
+		return nil, false, nil, gerr
+	}
+	if !found {
+		return nil, false, &utxostore.NotFoundError{Op: op}, nil
+	}
+	row, cerr := recordToUTXO(rec)
+	if cerr != nil {
+		return nil, false, nil, cerr
+	}
+	switch {
+	case row.UserID != userID:
+		return nil, false, &utxostore.NotFoundError{Op: op}, nil
+	case row.SpentBy != nil:
+		return nil, false, &utxostore.SpentError{Op: op, Winner: *row.SpentBy}, nil
+	case row.ReservedBy != "" && row.ReservedBy != reservation:
+		return nil, false, &utxostore.ReservedError{Op: op, HeldBy: row.ReservedBy}, nil
+	case row.Frozen:
+		return nil, false, &utxostore.FrozenError{Op: op}, nil
+	case row.ReservedBy == reservation:
+		return row, true, nil, nil
+	}
+	return row, false, nil, nil
+}
+
+// casReserveOutpoint is the single-record transition behind ReserveOutpoints:
+// guarded by "still claimable AND owned by this user", it stamps resBy/resAt
+// and removes claimKey so the coin leaves the claim index synchronously. The
+// claimKey guard is what makes it exclusive against every concurrent claim
+// shape — both write the same bin under the same precondition, so exactly one
+// wins. Returns false on a lost race (FILTERED_OUT, or KEY_NOT_FOUND when the
+// record was durably deleted).
+func (s *Store) casReserveOutpoint(u *utxostore.UTXO, userID int64, reservation string, nowMs int64) (bool, error) {
+	key, err := s.keyFor(u.Outpoint)
+	if err != nil {
+		return false, err
+	}
+	wp := as.NewWritePolicy(0, 0)
+	wp.RecordExistsAction = as.UPDATE_ONLY
+	wp.FilterExpression = as.ExpAnd(
+		as.ExpBinExists(binClaimKey),
+		as.ExpEq(as.ExpIntBin(binUserID), as.ExpIntVal(userID)),
+	)
+
+	if _, aerr := s.client.Operate(wp, key,
+		as.PutOp(as.NewBin(binResBy, reservation)),
+		as.PutOp(as.NewBin(binResAt, nowMs)),
+		removeBinOp(binClaimKey),
+	); aerr != nil {
+		if aerr.Matches(types.FILTERED_OUT) || aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
+			return false, nil // lost the race
+		}
+		return false, fmt.Errorf("aerostore: reserve outpoint %s: %w", u.Outpoint, aerr)
+	}
+	u.ReservedBy = reservation
+	u.ReservedAt = msToTime(nowMs)
+	return true, nil
+}
+
+// undoReserveOutpoints hands back the rows a failed ReserveOutpoints won,
+// restoring their claimKey (and telling the claim cache about it) through the
+// same token-guarded release the funder's own rollback uses. keepPins is the
+// right posture rather than a compromise: these reservations are seconds old
+// and nothing has pinned them.
+//
+// Neither way of failing to compensate is returned — the caller already has the
+// error that matters — but BOTH are logged, because both leave the same
+// residue: a row still held by a token the caller has abandoned, waiting on the
+// stale sweep. A backend error is one way. The other is a release the server
+// simply refused: releaseRow reports ok=false when its guard no longer holds,
+// which here means something pinned or spent the row in the moments after we
+// won it. That is a silent skip unless it is logged, and a silent skip in a
+// rollback is exactly the kind of thing that turns into an unexplained stuck
+// coin weeks later.
+func (s *Store) undoReserveOutpoints(won []*utxostore.UTXO, reservation string) {
+	for _, u := range won {
+		ok, err := s.releaseRow(u, reservation, keepPins)
+		switch {
+		case err != nil:
+			s.logger.Error("rolling back a partial ReserveOutpoints failed; the row stays reserved by this token until the stale sweep frees it",
+				"outpoint", u.String(), "reservation", reservation, "err", err)
+		case !ok:
+			s.logger.Warn("rolling back a partial ReserveOutpoints skipped a row: its release guard no longer holds (pinned or spent); it stays reserved by this token until the stale sweep frees it",
+				"outpoint", u.String(), "reservation", reservation)
+		}
+	}
+}
+
 // ReleaseReservation implements [utxostore.Store]: frees every unspent,
 // UNPINNED row held by (userID, reservation) and returns the count freed.
 // Idempotent; spent rows are never touched (their reservation is provenance),

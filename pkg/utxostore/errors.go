@@ -12,7 +12,7 @@ var (
 	// ErrBatch is the top-level sentinel returned by batch methods when one
 	// or more items failed — inspect the per-item Err (Mint, SpendOp) or use
 	// errors.As on the returned error for methods whose ops carry no Err
-	// slot (Remove, Freeze, Unfreeze).
+	// slot (Remove, Freeze, Unfreeze, ReserveOutpoints).
 	ErrBatch = errors.New("utxostore: one or more batch items failed — inspect per-item Err")
 
 	// ErrContention is returned by optimistic providers when their CAS

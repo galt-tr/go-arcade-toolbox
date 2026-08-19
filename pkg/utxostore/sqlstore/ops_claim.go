@@ -1,8 +1,11 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -250,6 +253,180 @@ func collect(rows []claimedRow) []*utxostore.UTXO {
 	for i, r := range rows {
 		out[i] = r.u
 	}
+	return out
+}
+
+// ReserveOutpoints implements [utxostore.Store]: an ALL-OR-NOTHING hold on the
+// exact rows the caller named, so provided inputs get the same exclusivity a
+// funded coin gets.
+//
+// # Why two phases and not one set-based UPDATE
+//
+// The obvious shape is a single CTE that locks the matching rows FOR UPDATE and
+// updates them in the same statement, then compares the RETURNING count against
+// len(ops) and fails the transaction on a shortfall — atomic for free, because
+// the rollback un-reserves whatever the UPDATE touched. That is correct for a
+// store that owns its transaction, and WRONG in Mode A: under an AMBIENT
+// transaction (internal/sqltx) [Store.withTx] neither commits nor rolls back,
+// so there is nothing to undo the mutation with. The statement would have
+// already reserved the good rows before it discovered the bad one, and the
+// caller's enclosing unit of work may well go on to commit.
+//
+// So the guard runs BEFORE any write, in both modes: phase one locks every
+// target row (FOR UPDATE on PostgreSQL; SQLite's single writer connection
+// already serializes) and classifies it; phase two stamps only if the whole set
+// passed. Holding the locks across the two phases is what keeps it race-free —
+// a concurrent claimer either got there first (and phase one refuses it) or
+// blocks until this transaction ends.
+//
+// The cost is real and worth naming: N locking reads plus N stamps where the
+// compact shape needed one statement. That is affordable because this runs once
+// per CreateAction over a handful of named inputs, not per claim on the
+// 1000-TPS path — and it is the same per-op posture [Store.Spend] already takes.
+// Phase two can collapse to a single IN-list UPDATE later without changing the
+// guarantee, since the guarantee comes from phase one's locks, not from the
+// write's shape.
+//
+// Rows already held by exactly this reservation are satisfied WITHOUT being
+// re-stamped: a replay must not slide ReservedAt forward and hide the
+// reservation from the stale reaper.
+func (s *Store) ReserveOutpoints(ctx context.Context, userID int64, reservation string, ops []utxostore.Outpoint) error {
+	if s.isClosed() {
+		return errClosed
+	}
+	if err := validateReserveOutpoints(reservation, ops); err != nil {
+		return err
+	}
+
+	// Lock in a deterministic order so two callers whose input sets overlap
+	// queue behind each other instead of deadlocking on a lock cycle.
+	targets := sortedDistinct(ops)
+
+	var itemErrs []error
+	err := s.withTx(ctx, func(x queryer) error {
+		itemErrs = itemErrs[:0]
+		var toStamp []utxostore.Outpoint
+
+		for _, op := range targets {
+			needsStamp, itemErr, fatal := s.classifyForReserve(ctx, x, op, userID, reservation)
+			if fatal != nil {
+				return fatal
+			}
+			if itemErr != nil {
+				itemErrs = append(itemErrs, itemErr)
+				continue
+			}
+			if needsStamp {
+				toStamp = append(toStamp, op)
+			}
+		}
+		if len(itemErrs) > 0 {
+			return nil // phase two never runs: nothing was mutated
+		}
+
+		// ONE timestamp for the whole set, read once outside the loop: the
+		// named inputs were reserved by a single decision, so they must age as
+		// a unit under the stale reaper rather than by however long the loop
+		// took.
+		ts := s.encTime(s.now())
+		for _, op := range toStamp {
+			// Phase one already holds this row's lock and proved it unreserved,
+			// unspent and ours, so these predicates cannot change the outcome —
+			// they are a belt-and-braces assertion that the lock did its job,
+			// checked below via RowsAffected. reserved_by IS NULL is safe
+			// because rows already held by this token never reach toStamp.
+			res, err := x.ExecContext(ctx, s.rebind(
+				`UPDATE utxos SET reserved_by=?, reserved_at=?
+				 WHERE txid=? AND vout=? AND user_id=?
+				   AND reserved_by IS NULL AND spent_by IS NULL`),
+				reservation, ts, op.TxID[:], op.Vout, userID)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n != 1 {
+				// Unreachable while the row lock holds. If it ever fires, the
+				// isolation assumption this method rests on is broken, and
+				// failing the transaction is the only safe answer.
+				return fmt.Errorf("sqlstore: reserve outpoints: %s changed under its own row lock (%d rows stamped)", op, n)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return joinBatch(itemErrs)
+}
+
+// classifyForReserve locks one target row and decides its fate. needsStamp is
+// true only for a row that is claimable and not already held by this token;
+// a row already held by it is satisfied and reports needsStamp false with no
+// error, so a replay re-stamps nothing.
+//
+// Refusal precedence matches [Store.Remove]: spent > reserved-by-another >
+// frozen. A row owned by a DIFFERENT user reports NotFound rather than
+// Reserved — the caller named the outpoint, so the reply must not confirm that
+// somebody else's coin exists. The aerostore twin of this classifier makes the
+// identical rulings; the two must stay in step.
+func (s *Store) classifyForReserve(ctx context.Context, x queryer, op utxostore.Outpoint, userID int64, reservation string) (needsStamp bool, itemErr, fatal error) {
+	var (
+		rowUser    int64
+		spentBy    []byte
+		reservedBy sql.NullString
+		frozen     boolScan
+	)
+	q := s.rebind("SELECT user_id, spent_by, reserved_by, frozen FROM utxos WHERE txid=? AND vout=?" + s.forUpdate())
+	err := x.QueryRowContext(ctx, q, op.TxID[:], op.Vout).
+		Scan(&rowUser, &spentBy, &reservedBy, s.boolDest(&frozen))
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, &utxostore.NotFoundError{Op: op}, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if rowUser != userID {
+		return false, &utxostore.NotFoundError{Op: op}, nil
+	}
+
+	switch {
+	case len(spentBy) > 0:
+		w, herr := decodeHash(spentBy)
+		if herr != nil {
+			return false, nil, herr
+		}
+		return false, &utxostore.SpentError{Op: op, Winner: *w}, nil
+	case reservedBy.String != "" && reservedBy.String != reservation:
+		return false, &utxostore.ReservedError{Op: op, HeldBy: reservedBy.String}, nil
+	case s.boolGet(frozen):
+		return false, &utxostore.FrozenError{Op: op}, nil
+	case reservedBy.String == reservation:
+		return false, nil, nil // already ours: satisfied, not re-stamped
+	}
+	return true, nil, nil
+}
+
+// sortedDistinct returns ops deduplicated and ordered by (txid, vout), the
+// canonical lock order [Store.ReserveOutpoints] acquires row locks in.
+func sortedDistinct(ops []utxostore.Outpoint) []utxostore.Outpoint {
+	seen := make(map[utxostore.Outpoint]struct{}, len(ops))
+	out := make([]utxostore.Outpoint, 0, len(ops))
+	for _, op := range ops {
+		if _, dup := seen[op]; dup {
+			continue
+		}
+		seen[op] = struct{}{}
+		out = append(out, op)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if c := bytes.Compare(out[i].TxID[:], out[j].TxID[:]); c != 0 {
+			return c < 0
+		}
+		return out[i].Vout < out[j].Vout
+	})
 	return out
 }
 

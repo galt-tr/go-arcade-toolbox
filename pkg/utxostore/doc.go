@@ -110,8 +110,8 @@
 // record the spend there is precisely how a lost reservation becomes a silent
 // double spend: the coin stays claimable, a later funding run hands it to a
 // second transaction, and the two race on-chain. So fact mode (force=true)
-// records the spend over a reservation mismatch and over a freeze: no row
-// STATE refuses a fact.
+// records the spend over a reservation mismatch and over a freeze: no
+// reservation state and no freeze refuses a fact.
 //
 // Two STATE errors survive fact mode, for opposite reasons:
 //
@@ -130,15 +130,63 @@
 // everything except [SpentError] would silently drop those, which is why the
 // skip list is [NotFoundError] alone and not "everything but SpentError".
 //
+// # Reserving coins the caller named
+//
+// The three claim shapes answer "find me a coin"; [Store.ReserveOutpoints]
+// answers "hold THESE coins". A caller that names explicit inputs (BRC-100's
+// CreateAction lets it) needs the same exclusivity a funded coin gets, or two
+// concurrent requests select the same outpoint and the funder can hand it out
+// a third time. So the store has one outpoint-targeted reservation primitive
+// alongside the scope-based ones.
+//
+// What it produces is deliberately indistinguishable from a claim: a row held
+// by (userID, reservation), UNPINNED, visible to the stale reaper, freed by
+// [Store.ReleaseReservation] or a token-guarded [Store.ReleaseOutpoints],
+// hardened by [Store.Pin] when the signed transaction is stored, and consumed
+// by [Store.Spend]. Pinning is not its job — a reservation becomes a pin at
+// the same point for every coin, when a broadcastable transaction exists.
+//
+// Two things separate it from a claim, both forced by "the caller named these
+// rows and no others":
+//
+//   - It is ALL-OR-NOTHING. A claim that finds fewer coins than asked reports
+//     a short result and the caller adapts; a named input set that is only
+//     half reservable is not a transaction, so nothing is left newly reserved
+//     and the per-item causes ([NotFoundError], [ReservedError],
+//     [SpentError], [FrozenError]) are joined under [ErrBatch]. This is the
+//     one documented exception to per-item atomicity below.
+//   - A row belonging to another user reports [NotFoundError], not
+//     [ReservedError]. The caller supplied the outpoint, so the reply must not
+//     confirm that a coin it does not own exists.
+//
+// How far all-or-nothing reaches depends on the backend, and the difference is
+// disclosed rather than papered over. A SQL provider gets it from one
+// transaction. A non-transactional one (Aerospike) enforces it by
+// COMPENSATION — handing back the rows it already won — so a crash on a
+// REFUSED reserve can leave rows under the caller's token until the stale
+// sweep reclaims them. That residue is over-reserved, never over-issued: no
+// second transaction can take those coins meanwhile. A caller that wants the
+// window closed sooner may [Store.ReleaseReservation] on the token as
+// insurance, which is idempotent and costs nothing when there is nothing left
+// to free.
+//
+// Idempotency follows the table: a replay under the SAME token finds its own
+// rows already reserved, counts them satisfied, and re-stamps nothing. A row
+// that is already ours but has since been FROZEN still refuses — the freeze
+// outranks the replay. Duplicate outpoints in one call are collapsed, so a
+// refusal is reported once per distinct outpoint.
+//
 // # Atomicity contracts
 //
-// These six rules are the core of the interface; the conformance suite
+// These seven rules are the core of the interface; the conformance suite
 // enforces them and every provider must honor them:
 //
 //  1. Every method is atomic PER ITEM, never across items. Batch methods may
 //     partially succeed; they report failures per item (via the op's Err
 //     field where one exists, otherwise via typed errors joined into the
-//     returned error) plus the [ErrBatch] sentinel at the top level.
+//     returned error) plus the [ErrBatch] sentinel at the top level. The one
+//     exception is [Store.ReserveOutpoints], which is atomic across its ops
+//     for the reason given above.
 //  2. Claim methods are single-round-trip atomic transitions. No interface
 //     method ever requires the caller to hold a lock across calls — this is
 //     what makes one funder correct on both SQL and Aerospike.
@@ -154,6 +202,8 @@
 //     Remove: missing = no-op.
 //     Promote: already at the target tier = counts as unchanged.
 //     Pin/Unpin: already in that state = uncounted skip.
+//     ReserveOutpoints: rows already held by exactly this token = satisfied,
+//     not re-stamped.
 //  5. Frozen rows are invisible to claims and refuse a GUARDED Spend
 //     ([FrozenError]), but Release, Unspend, Promote, and a forced
 //     (fact-mode) Spend still apply to them. Precedence, in both spend modes:
@@ -163,6 +213,10 @@
 //  6. Pinned rows are reserved rows no janitor may free: ReleaseReservation
 //     leaves them alone and FindStaleReservations never reports them (see the
 //     pre-broadcast pin above). Pinned always implies reserved and unspent.
+//  7. FOUR operations create a reservation — the three claim shapes and
+//     ReserveOutpoints — and every one of them produces the same, unpinned,
+//     sweepable, token-released hold. No downstream operation asks which one
+//     made it.
 //
 // # Design notes
 //
@@ -197,10 +251,10 @@
 //     RemoveByMintTx, by contrast, removes frozen-but-unreserved rows: if the
 //     minting transaction is invalid the coin is phantom, and a frozen
 //     phantom is strictly worse than no row.
-//   - Batch methods whose ops are plain []Outpoint (Remove, Freeze, Unfreeze)
-//     have no per-item Err slot; they report failures as typed per-item
-//     errors joined into the returned error together with [ErrBatch]
-//     (errors.Is finds ErrBatch, errors.As finds the item errors).
+//   - Batch methods whose ops are plain []Outpoint (Remove, Freeze, Unfreeze,
+//     ReserveOutpoints) have no per-item Err slot; they report failures as
+//     typed per-item errors joined into the returned error together with
+//     [ErrBatch] (errors.Is finds ErrBatch, errors.As finds the item errors).
 //   - Balance buckets: a row is Claimable (per tier) when unspent, unreserved
 //     and not frozen; Reserved when reserved and unspent (frozen or not).
 //     Frozen unreserved rows appear in neither bucket — a freeze removes
@@ -224,4 +278,10 @@
 //     empty reservation would make reserved rows indistinguishable from free
 //     ones, so it is rejected as a programmer error (plain error, not part
 //     of the state-outcome taxonomy).
+//   - ReserveOutpoints validates the same way and additionally rejects an
+//     EMPTY op list, where the claim shapes return an empty result. The
+//     difference is that a claim for zero coins is a legitimate degenerate
+//     query, while reserving zero named inputs means the caller lost its
+//     input list — silently succeeding would hand it an all-or-nothing
+//     guarantee over nothing at all.
 package utxostore

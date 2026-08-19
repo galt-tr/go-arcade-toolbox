@@ -99,6 +99,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"ClaimExact", std(s.claimExact)},
 		{"ClaimScopeIsolation", std(s.claimScopeIsolation)},
 		{"ClaimExclusivityConcurrent", std(s.claimExclusivityConcurrent)},
+		{"ReserveOutpointsExclusivity", std(s.reserveOutpointsExclusivity)},
 		{"ReleaseReservation", std(s.releaseReservation)},
 		{"ReleaseOutpoints", std(s.releaseOutpoints)},
 		{"PinLifecycle", std(s.pinLifecycle)},
@@ -271,6 +272,14 @@ func (s *suite) inputValidation(t *testing.T, store utxostore.Store) {
 	require.Error(t, err, "Pin must reject an empty reservation")
 	_, err = store.Unpin(ctx, user, "")
 	require.Error(t, err, "Unpin must reject an empty reservation")
+
+	// ...and by the outpoint-targeted reservation, which additionally rejects
+	// an EMPTY op list: a caller that names zero inputs has lost its input
+	// list, and an all-or-nothing guarantee over nothing is not a success.
+	require.Error(t, store.ReserveOutpoints(ctx, user, "", ops),
+		"ReserveOutpoints must reject an empty reservation")
+	require.Error(t, store.ReserveOutpoints(ctx, user, "res-v", nil),
+		"ReserveOutpoints must reject an empty op list")
 
 	// Spend with an empty reservation guard: per-item failure under ErrBatch.
 	sp := &utxostore.SpendOp{Outpoint: ops[0], Reservation: "", SpendingTxID: NewTxID("validate-tx")}
@@ -598,6 +607,300 @@ func (s *suite) claimExclusivityConcurrent(t *testing.T, store utxostore.Store) 
 		require.Len(t, claimedBy, coinsPerRound,
 			"round %d: every coin must be claimed exactly once", round)
 	}
+}
+
+// reserveOutpointsExclusivity is the outpoint-targeted half of the exclusivity
+// contract: coins the CALLER named must be held exactly as tightly as coins the
+// funder selected, and a named input set is all-or-nothing — a half-reserved
+// set is not a transaction, so a single bad op must leave every other row
+// exactly as it found it.
+func (s *suite) reserveOutpointsExclusivity(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	// --- happy path: reserving by outpoint produces an ordinary reservation --
+	ops := MintTx(t, store, "ro-happy", user, basket, utxostore.TierMined, 11, 12, 13)
+	require.NoError(t, store.ReserveOutpoints(ctx, user, "res-ro", ops))
+
+	reservedAt := make(map[utxostore.Outpoint]time.Time, len(ops))
+	for _, op := range ops {
+		u := getPinChecked(ctx, t, store, op)
+		// A named reservation is held to the SAME invariants a claim is: this
+		// is rule 7 in assertion form.
+		requireClaimed(t, u, sc, "res-ro")
+		require.False(t, u.Pinned,
+			"ReserveOutpoints must not pin: a reservation becomes a pin only when a broadcastable tx exists")
+		reservedAt[op] = u.ReservedAt
+	}
+
+	// The pool is exactly those three rows, and every one of them is held, so
+	// a claim must find nothing.
+	none, err := store.ClaimSmallestSufficient(ctx, sc, "res-claim", 1)
+	require.NoError(t, err)
+	require.Nil(t, none, "rows held by ReserveOutpoints must be invisible to claims")
+
+	// ...and being unpinned, they are ordinary sweepable work: the reaper must
+	// see this token exactly as it sees a funder's. A named reservation that
+	// hid from the sweep would strand the caller's coins on any abandoned
+	// request.
+	refs, err := store.FindStaleReservations(ctx, reservedAt[ops[0]].Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, refs, 1, "an unpinned named reservation must be visible to the stale reaper")
+	require.Equal(t, "res-ro", refs[0].Reservation)
+	require.Equal(t, user, refs[0].UserID)
+	require.ElementsMatch(t, ops, refs[0].Outpoints,
+		"the ref must list every row the named reservation holds")
+
+	// Replay under the SAME token: satisfied, and nothing is re-stamped.
+	require.NoError(t, store.ReserveOutpoints(ctx, user, "res-ro", ops),
+		"a replay under the same reservation must be an idempotent success")
+	for _, op := range ops {
+		u := getPinChecked(ctx, t, store, op)
+		require.Equal(t, "res-ro", u.ReservedBy)
+		require.Equal(t, reservedAt[op], u.ReservedAt,
+			"a same-token replay must not re-stamp ReservedAt")
+	}
+
+	// The hold is released by the ordinary token path, like any reservation.
+	n, err := store.ReleaseReservation(ctx, user, "res-ro")
+	require.NoError(t, err)
+	require.Equal(t, len(ops), n)
+	for _, op := range ops {
+		u := getPinChecked(ctx, t, store, op)
+		require.Empty(t, u.ReservedBy)
+		require.True(t, u.ReservedAt.IsZero())
+	}
+	back, err := store.ClaimSmallestSufficient(ctx, sc, "res-back", 1)
+	require.NoError(t, err)
+	require.NotNil(t, back, "released rows are claimable again")
+	_, err = store.ReleaseReservation(ctx, user, "res-back")
+	require.NoError(t, err)
+
+	// --- all-or-nothing: one bad op poisons the whole call ------------------
+	s.reserveOutpointsAllOrNothing(t, store)
+
+	// --- duplicates name ONE row, so they get one answer --------------------
+	dup := MintTx(t, store, "ro-dup", user, basket, utxostore.TierMined, 41)[0]
+	require.NoError(t, store.ReserveOutpoints(ctx, user, "res-dup", []utxostore.Outpoint{dup, dup}),
+		"a repeated outpoint is the same row twice, not a conflict with itself")
+	requireClaimed(t, getPinChecked(ctx, t, store, dup), sc, "res-dup")
+
+	gone := NewOutpoint("ro-dup-never-minted", 0)
+	dupErr := store.ReserveOutpoints(ctx, user, "res-dup-missing", []utxostore.Outpoint{gone, gone})
+	require.ErrorIs(t, dupErr, utxostore.ErrBatch)
+	require.Len(t, batchItemErrors(dupErr), 1,
+		"duplicate outpoints are collapsed: one refusal per DISTINCT outpoint, not one per mention")
+
+	// --- cross-user: another user's coin reads as absent, never as reserved --
+	mine := MintTx(t, store, "ro-xuser-mine", user, basket, utxostore.TierMined, 21, 22)
+	theirs := MintTx(t, store, "ro-xuser-theirs", user+1, basket, utxostore.TierMined, 23)
+	xuser := append(append([]utxostore.Outpoint{}, mine...), theirs[0])
+
+	err = store.ReserveOutpoints(ctx, user, "res-xuser", xuser)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	require.ErrorIs(t, err, &utxostore.NotFoundError{},
+		"another user's coin must read as absent, not as reserved — the reply must not confirm it exists")
+	var nf *utxostore.NotFoundError
+	require.ErrorAs(t, err, &nf)
+	require.Equal(t, theirs[0], nf.Op)
+	for _, op := range xuser {
+		u := getPinChecked(ctx, t, store, op)
+		require.Empty(t, u.ReservedBy, "a rejected call must leave %s untouched", op)
+		require.True(t, u.ReservedAt.IsZero(), "an unreserved row must carry no ReservedAt")
+	}
+
+	// --- race: a claim and a reservation may not both take the same coin ----
+	s.reserveOutpointsRacesClaim(t, store, sc)
+}
+
+// reserveOutpointsAllOrNothing drives the four ways one op can refuse — held by
+// another token, spent, frozen, absent — and pins that each returns its typed
+// cause under ErrBatch while leaving the batch's OTHER rows completely
+// unreserved. A partially reserved input set would be the worst outcome: the
+// caller sees a failure and the coins stay stuck until the reaper fires.
+func (s *suite) reserveOutpointsAllOrNothing(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+
+	// Each case owns a disjoint denomination range, so the reclaim assertion
+	// below can only ever select the row this case minted.
+	for i, tc := range []struct {
+		name string
+		// spoil makes the last op of the batch unreservable and returns the op
+		// to substitute in (the same one, unless the case needs a missing row).
+		spoil  func(t *testing.T, op utxostore.Outpoint) utxostore.Outpoint
+		expect error
+		// verify inspects the typed error the call must have joined.
+		verify func(t *testing.T, err error, bad utxostore.Outpoint)
+	}{
+		{
+			name: "reserved-by-other",
+			spoil: func(t *testing.T, op utxostore.Outpoint) utxostore.Outpoint {
+				require.NoError(t, store.ReserveOutpoints(ctx, user, "res-holder", []utxostore.Outpoint{op}))
+				return op
+			},
+			expect: &utxostore.ReservedError{},
+			verify: func(t *testing.T, err error, bad utxostore.Outpoint) {
+				var re *utxostore.ReservedError
+				require.ErrorAs(t, err, &re)
+				require.Equal(t, bad, re.Op)
+				require.Equal(t, "res-holder", re.HeldBy, "ReservedError must name the holder")
+			},
+		},
+		{
+			name: "spent",
+			spoil: func(t *testing.T, op utxostore.Outpoint) utxostore.Outpoint {
+				require.NoError(t, store.ReserveOutpoints(ctx, user, "res-spender", []utxostore.Outpoint{op}))
+				sp := &utxostore.SpendOp{Outpoint: op, Reservation: "res-spender", SpendingTxID: NewTxID("ro-spender")}
+				require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
+				return op
+			},
+			expect: &utxostore.SpentError{},
+			verify: func(t *testing.T, err error, bad utxostore.Outpoint) {
+				var se *utxostore.SpentError
+				require.ErrorAs(t, err, &se)
+				require.Equal(t, bad, se.Op)
+				require.Equal(t, NewTxID("ro-spender"), se.Winner,
+					"a spend outranks the reservation that produced it")
+			},
+		},
+		{
+			name: "frozen",
+			spoil: func(t *testing.T, op utxostore.Outpoint) utxostore.Outpoint {
+				require.NoError(t, store.Freeze(ctx, []utxostore.Outpoint{op}))
+				return op
+			},
+			expect: &utxostore.FrozenError{},
+			verify: func(t *testing.T, err error, bad utxostore.Outpoint) {
+				var fe *utxostore.FrozenError
+				require.ErrorAs(t, err, &fe)
+				require.Equal(t, bad, fe.Op)
+			},
+		},
+		{
+			name: "missing",
+			spoil: func(_ *testing.T, _ utxostore.Outpoint) utxostore.Outpoint {
+				return NewOutpoint("ro-never-minted", 7)
+			},
+			expect: &utxostore.NotFoundError{},
+			verify: func(t *testing.T, err error, bad utxostore.Outpoint) {
+				var nf *utxostore.NotFoundError
+				require.ErrorAs(t, err, &nf)
+				require.Equal(t, bad, nf.Op)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seed := "ro-aon-" + tc.name
+			base := uint64(1_000 + i*10) //nolint:gosec // i is a small loop index
+			minted := MintTx(t, store, seed, user, basket, utxostore.TierMined, base, base+1, base+2, base+3)
+			good := minted[:3]
+			bad := tc.spoil(t, minted[3])
+
+			token := "res-aon-" + tc.name
+			err := store.ReserveOutpoints(ctx, user, token, append(append([]utxostore.Outpoint{}, good...), bad))
+			require.ErrorIs(t, err, utxostore.ErrBatch,
+				"a refused op must surface under the batch sentinel")
+			require.ErrorIs(t, err, tc.expect)
+			tc.verify(t, err, bad)
+
+			// The whole point: NOTHING was newly reserved.
+			for _, op := range good {
+				u := getPinChecked(ctx, t, store, op)
+				require.Empty(t, u.ReservedBy,
+					"all-or-nothing: %s must not be left reserved when a sibling op fails", op)
+				require.True(t, u.ReservedAt.IsZero())
+			}
+			// ...and the good rows are still claimable.
+			claimed, cerr := store.ClaimExact(ctx, scope(utxostore.TierMined), token+"-after", base, 1)
+			require.NoError(t, cerr)
+			require.Len(t, claimed, 1, "a failed reservation must leave its rows in the claimable pool")
+			require.Equal(t, good[0], claimed[0].Outpoint)
+			_, rerr := store.ReleaseReservation(ctx, user, token+"-after")
+			require.NoError(t, rerr)
+		})
+	}
+}
+
+// reserveOutpointsRacesClaim runs a named reservation head-on against a scope
+// claim for the SAME coin. Exactly one may take it: this is the property that
+// makes caller-provided inputs safe, and it is why ReserveOutpoints exists at
+// all. ErrContention is a legal transient answer from optimistic backends (the
+// caller retries), and a losing reservation legitimately surfaces its refusal
+// as a ReservedError under ErrBatch.
+func (s *suite) reserveOutpointsRacesClaim(t *testing.T, store utxostore.Store, sc utxostore.Scope) {
+	ctx := context.Background()
+
+	// Far larger than every other coin this subtest mints, so the claim below
+	// can only ever select this one row.
+	const bigSats = 9_000_000
+	const maxContentionRetries = 10_000
+
+	raceOp := MintTx(t, store, "ro-race", user, basket, utxostore.TierMined, bigSats)[0]
+
+	var (
+		mu      sync.Mutex
+		winners []string
+	)
+	win := func(token string) {
+		mu.Lock()
+		defer mu.Unlock()
+		winners = append(winners, token)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for retries := 0; ; retries++ {
+			err := store.ReserveOutpoints(ctx, user, "res-race-named", []utxostore.Outpoint{raceOp})
+			switch {
+			case err == nil:
+				win("res-race-named")
+			case errors.Is(err, utxostore.ErrContention):
+				if retries < maxContentionRetries {
+					continue // legal transient answer: retry within a bound
+				}
+				t.Errorf("ReserveOutpoints: contention retries exhausted")
+			default:
+				// The ONLY legal loss is a refusal. Checking the batch
+				// sentinel first, with its own message, keeps a genuinely
+				// broken backend from reading as a lost race — which is
+				// exactly the confusion that would let an exclusivity bug
+				// hide in this test.
+				if !assert.ErrorIs(t, err, utxostore.ErrBatch,
+					"a losing ReserveOutpoints must REFUSE under ErrBatch, not fail outright: %v", err) {
+					return
+				}
+				assert.ErrorIs(t, err, &utxostore.ReservedError{},
+					"the loser's refusal must be the claim's hold on the coin")
+			}
+			return
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for retries := 0; ; retries++ {
+			u, err := store.ClaimSmallestSufficient(ctx, sc, "res-race-claim", bigSats)
+			if errors.Is(err, utxostore.ErrContention) {
+				if retries < maxContentionRetries {
+					continue
+				}
+				t.Errorf("ClaimSmallestSufficient: contention retries exhausted")
+				return
+			}
+			if assert.NoError(t, err) && u != nil {
+				win("res-race-claim")
+			}
+			return
+		}
+	}()
+	wg.Wait()
+
+	require.Len(t, winners, 1,
+		"a claim and a named reservation must never both take %s", raceOp)
+	u := getPinChecked(ctx, t, store, raceOp)
+	require.Equal(t, winners[0], u.ReservedBy)
+	require.False(t, u.Pinned)
 }
 
 func (s *suite) releaseReservation(t *testing.T, store utxostore.Store) {
@@ -1805,6 +2108,36 @@ func (s *suite) closeStore(t *testing.T, store utxostore.Store) {
 
 	_, err := store.Get(ctx, NewOutpoint("after-close", 0))
 	require.Error(t, err, "operations after Close must fail")
+}
+
+// batchItemErrors flattens the TYPED per-item errors joined under [ErrBatch],
+// so a subtest can assert how many items a call refused rather than only that
+// it refused something. Both wrappers in play — fmt.Errorf's two-verb %w and
+// errors.Join — expose Unwrap() []error, so one recursive walk covers them; the
+// ErrBatch sentinel itself is skipped because it is not an item outcome.
+func batchItemErrors(err error) []error {
+	var out []error
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil {
+			return
+		}
+		if multi, ok := e.(interface{ Unwrap() []error }); ok {
+			for _, sub := range multi.Unwrap() {
+				walk(sub)
+			}
+			return
+		}
+		switch {
+		case errors.Is(e, &utxostore.NotFoundError{}),
+			errors.Is(e, &utxostore.ReservedError{}),
+			errors.Is(e, &utxostore.SpentError{}),
+			errors.Is(e, &utxostore.FrozenError{}):
+			out = append(out, e)
+		}
+	}
+	walk(err)
+	return out
 }
 
 // satsOf projects the satoshi values of claimed coins, in order.

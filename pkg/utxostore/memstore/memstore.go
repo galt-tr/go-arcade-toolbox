@@ -314,6 +314,88 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	return claimed, nil
 }
 
+// ReserveOutpoints implements [utxostore.Store]: an all-or-nothing hold on the
+// EXACT listed rows. Two phases inside one critical section — classify every op
+// first, and mutate only when the whole set passed — which is all the atomicity
+// the reference implementation needs: no other goroutine can observe the gap.
+func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation string, ops []utxostore.Outpoint) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errClosed
+	}
+	if err := validateReserveOutpoints(reservation, ops); err != nil {
+		return err
+	}
+
+	var (
+		itemErrs []error
+		toStamp  []*row
+	)
+	for _, op := range distinctOutpoints(ops) {
+		r, ok := s.rows[op]
+		if !ok || r.utxo.UserID != userID {
+			// A row belonging to someone else reads as absent: the caller
+			// supplied the outpoint, so the answer must not confirm that
+			// another user's coin exists.
+			itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
+			continue
+		}
+		switch {
+		case r.utxo.SpentBy != nil:
+			itemErrs = append(itemErrs, &utxostore.SpentError{Op: op, Winner: *r.utxo.SpentBy})
+		case r.utxo.ReservedBy != "" && r.utxo.ReservedBy != reservation:
+			itemErrs = append(itemErrs, &utxostore.ReservedError{Op: op, HeldBy: r.utxo.ReservedBy})
+		case r.utxo.Frozen:
+			itemErrs = append(itemErrs, &utxostore.FrozenError{Op: op})
+		case r.utxo.ReservedBy == reservation:
+			// Already ours: satisfied, and deliberately not re-stamped, so a
+			// replay cannot slide ReservedAt out from under the stale reaper.
+		default:
+			toStamp = append(toStamp, r)
+		}
+	}
+	if len(itemErrs) > 0 {
+		return joinBatch(itemErrs) // nothing mutated: all-or-nothing
+	}
+
+	// ONE timestamp for the whole set: the named inputs were reserved by a
+	// single decision, so they must age as a unit under the stale reaper.
+	now := s.now()
+	for _, r := range toStamp {
+		r.utxo.ReservedBy = reservation
+		r.utxo.ReservedAt = now
+	}
+	return nil
+}
+
+// validateReserveOutpoints rejects underspecified inputs; see the interface doc.
+func validateReserveOutpoints(reservation string, ops []utxostore.Outpoint) error {
+	switch {
+	case reservation == "":
+		return errors.New("memstore: reservation must be non-empty")
+	case len(ops) == 0:
+		return errors.New("memstore: ops must be non-empty")
+	}
+	return nil
+}
+
+// distinctOutpoints drops repeats, preserving first-seen order. Duplicates in
+// one ReserveOutpoints call name the same row, so classifying it twice would
+// report the same refusal twice for a single coin.
+func distinctOutpoints(ops []utxostore.Outpoint) []utxostore.Outpoint {
+	seen := make(map[utxostore.Outpoint]struct{}, len(ops))
+	out := make([]utxostore.Outpoint, 0, len(ops))
+	for _, op := range ops {
+		if _, dup := seen[op]; dup {
+			continue
+		}
+		seen[op] = struct{}{}
+		out = append(out, op)
+	}
+	return out
+}
+
 // heldBy reports whether the row belongs to the live (unspent) membership of
 // (userID, reservation): the set the janitor release, Pin, and Unpin all act on.
 func heldBy(r *row, userID int64, reservation string) bool {

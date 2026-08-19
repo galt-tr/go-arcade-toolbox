@@ -103,6 +103,47 @@ func TestAmbientTransaction(t *testing.T) {
 	require.ErrorIs(t, err, &utxostore.NotFoundError{})
 }
 
+// TestReserveOutpointsAmbientTxLeavesNothingReserved is the reason
+// ReserveOutpoints validates every row BEFORE it writes any of them.
+//
+// The compact implementation — one statement that locks and reserves the
+// matching rows, then fails the transaction when it matched fewer than
+// len(ops) — gets its all-or-nothing guarantee from the rollback. That works
+// only while the store owns the transaction. In Mode A it does not: [sqltx]
+// hands it a caller-owned transaction that [Store.withTx] must neither commit
+// nor roll back, so the good rows would stay reserved and ride the caller's
+// commit out to disk.
+//
+// This test therefore commits the ambient transaction on purpose. The
+// guarantee has to survive that, which it can only do by never having written.
+func TestReserveOutpointsAmbientTxLeavesNothingReserved(t *testing.T) {
+	ctx := context.Background()
+	s := newSQLiteStore(t)
+
+	ops := utxostoretest.MintTx(t, s, "ambient-reserve", 1, "default", utxostore.TierMined, 10, 20, 30)
+	// The last row refuses, so the first two must come back untouched.
+	require.NoError(t, s.Freeze(ctx, ops[2:]))
+
+	tx, err := s.DB().BeginTx(ctx, nil)
+	require.NoError(t, err)
+	txCtx := sqltx.With(ctx, tx, s.DB())
+
+	err = s.ReserveOutpoints(txCtx, 1, "res-ambient", ops)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	require.ErrorIs(t, err, &utxostore.FrozenError{})
+
+	// The caller owns this transaction and goes on to commit it.
+	require.NoError(t, tx.Commit())
+
+	for _, op := range ops[:2] {
+		u, gerr := s.Get(ctx, op)
+		require.NoError(t, gerr)
+		require.Empty(t, u.ReservedBy,
+			"a refused ReserveOutpoints must leave %s unreserved even when the ambient tx commits", op)
+		require.True(t, u.ReservedAt.IsZero())
+	}
+}
+
 // TestForeignTransactionNotEnlisted is the Mode B counterpart of
 // TestAmbientTransaction: a transaction opened over a DIFFERENT *sql.DB must
 // never be picked up. Before the ownership fix, sqltx.From ignored who placed

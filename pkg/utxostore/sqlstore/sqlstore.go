@@ -440,6 +440,19 @@ func joinBatch(itemErrs []error) error {
 	return fmt.Errorf("%w: %w", utxostore.ErrBatch, errors.Join(itemErrs...))
 }
 
+// validateReserveOutpoints rejects underspecified outpoint-reservation inputs.
+// An empty op list is a programmer error rather than a degenerate success: the
+// caller asked for an all-or-nothing hold and named nothing to hold.
+func validateReserveOutpoints(reservation string, ops []utxostore.Outpoint) error {
+	switch {
+	case reservation == "":
+		return errors.New("sqlstore: reservation must be non-empty")
+	case len(ops) == 0:
+		return errors.New("sqlstore: ops must be non-empty")
+	}
+	return nil
+}
+
 // validateClaim rejects underspecified claim inputs; see the interface doc.
 func validateClaim(sc utxostore.Scope, reservation string) error {
 	switch {
