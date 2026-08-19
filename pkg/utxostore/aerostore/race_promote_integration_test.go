@@ -132,7 +132,7 @@ func TestAerostore_PromoteRestoreRace(t *testing.T) {
 				require.NoError(t, err)
 				require.Len(t, got, 1)
 				sp := &utxostore.SpendOp{Outpoint: op, Reservation: "r", SpendingTxID: spendTxID}
-				require.NoError(t, s.Spend(ctx, []*utxostore.SpendOp{sp}))
+				require.NoError(t, s.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 				require.NoError(t, sp.Err)
 			},
 			restore: func(t *testing.T, s *Store, op utxostore.Outpoint) {

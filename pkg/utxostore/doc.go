@@ -91,6 +91,45 @@
 // SpentBy == nil. Claims are unaffected — a pinned coin is reserved, so it was
 // already invisible to them — which is why pinning costs the hot path nothing.
 //
+// # Spend: a guarded transition and a recorded fact
+//
+// [Store.Spend] serves two callers whose relationship to the network is
+// opposite, and its force parameter says which one is calling.
+//
+// While the wallet is still AUTHORING a spend, the reservation is the
+// authority: the coin may only move to spent if this funding run still holds
+// it. That is the guarded mode (force=false), and every guard failure —
+// frozen, held by another token, held by nobody — is a real refusal that must
+// stop the caller.
+//
+// Once the broadcast has been ACCEPTED, the spend is a fact of the network.
+// The transaction is in mempools; the inputs are consumed whatever the local
+// row says. A reservation that has since been released (a reaper that fired
+// mid-broadcast, an operator release, a crash-recovery path) does not make the
+// spend un-happen — it only means the store's view is stale. Refusing to
+// record the spend there is precisely how a lost reservation becomes a silent
+// double spend: the coin stays claimable, a later funding run hands it to a
+// second transaction, and the two race on-chain. So fact mode (force=true)
+// records the spend over a reservation mismatch and over a freeze: no row
+// STATE refuses a fact.
+//
+// Two STATE errors survive fact mode, for opposite reasons:
+//
+//   - [NotFoundError] — there is no row, so the input was never the wallet's
+//     to record (a genuinely external input). This is the ONLY error a
+//     fact-mode caller may skip.
+//   - [SpentError] — a DIFFERENT transaction is already recorded as spending
+//     the coin. Two spend facts cannot both be true; one of them is a real
+//     double spend and the caller must alert, never overwrite. (A replay by
+//     the SAME spender is an idempotent success, as always.)
+//
+// Beyond these two, a fact-mode item can still fail for reasons that are not
+// row state: an empty op.Reservation (a programmer error) and transient
+// backend errors — an optimistic backend may report [ErrContention], which is
+// retryable, not skippable and not a double spend. A caller that skips
+// everything except [SpentError] would silently drop those, which is why the
+// skip list is [NotFoundError] alone and not "everything but SpentError".
+//
 // # Atomicity contracts
 //
 // These six rules are the core of the interface; the conformance suite
@@ -109,15 +148,16 @@
 //  4. Idempotency table — every operation a crash-recovery outbox replays is
 //     idempotent by construction:
 //     Mint: same data again = no-op success.
-//     Spend: same spender again = success.
+//     Spend: same spender again = success (guarded and fact mode alike).
 //     Unspend: guard mismatch = skip.
 //     Release: already free = skip.
 //     Remove: missing = no-op.
 //     Promote: already at the target tier = counts as unchanged.
 //     Pin/Unpin: already in that state = uncounted skip.
-//  5. Frozen rows are invisible to claims and refuse Spend ([FrozenError]),
-//     but Release, Unspend, and Promote still apply to them. Precedence: an
-//     already-recorded spend wins over the freeze — a same-spender Spend
+//  5. Frozen rows are invisible to claims and refuse a GUARDED Spend
+//     ([FrozenError]), but Release, Unspend, Promote, and a forced
+//     (fact-mode) Spend still apply to them. Precedence, in both spend modes:
+//     an already-recorded spend wins over the freeze — a same-spender Spend
 //     replay on a since-frozen row is an idempotent success, and a competing
 //     spender gets [SpentError], not [FrozenError].
 //  6. Pinned rows are reserved rows no janitor may free: ReleaseReservation
@@ -131,14 +171,23 @@
 //   - ReleaseOutpoints guard mismatch is a per-item SKIP, not an error,
 //     consistent with the idempotency table: releasing something you no
 //     longer hold is a stale intent, and replays must be harmless.
-//   - Spend keeps ReservedBy on the row after the transition. The reservation
-//     is provenance (which funding run spent the coin) and drives the
+//   - Spend keeps ReservedBy on the row after the transition. After a GUARDED
+//     spend that is true provenance — the guard proved the token is the
+//     funding run that spent the coin — and it drives the
 //     AlreadyReserved/AlreadySpentBy classification in [RemoveByMintReport].
-//     Unspend clears both SpentBy and the reservation: the coin returns to
-//     the claimable pool.
+//     In fact mode the kept reservation is simply whatever the row last
+//     carried — possibly a foreign token, possibly none — so it is the row's
+//     last reservation, not necessarily the run that broadcast. Neither mode
+//     writes op.Reservation onto the row. Unspend clears both SpentBy and the
+//     reservation: the coin returns to the claimable pool.
 //   - [ReservedError] is the general reservation-guard failure: HeldBy names
-//     the current holder, and HeldBy == "" means the row is not reserved at
-//     all (e.g. Spend of an unreserved row).
+//     the current holder, and HeldBy == "" means the row is IN the inventory
+//     but not reserved at all (e.g. a guarded Spend of a released row). It
+//     never means "external input" — only [NotFoundError] means that, which
+//     is why fact mode keeps NotFound and drops the reservation guard.
+//   - Spend's force parameter, like Remove's, picks preconditions and not
+//     effects: a forced and a guarded spend that both succeed write exactly
+//     the same row state (spent_by set, pin cleared, reservation kept).
 //   - Mint idempotency compares the immutable coin identity only (UserID,
 //     Basket, Satoshis, InputSize). Tier is a starting state, not identity: a
 //     replayed mint whose row has since been promoted, reserved, or spent is

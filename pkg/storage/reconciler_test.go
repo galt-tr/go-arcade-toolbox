@@ -237,7 +237,7 @@ func (h *reconStack) spendCoin(op utxostore.Outpoint, basket string, tier utxost
 	require.NotNil(h.t, u, "coin %s must be claimable in %s/%s", op, basket, tier)
 	require.Equal(h.t, op, u.Outpoint)
 	sp := &utxostore.SpendOp{Outpoint: op, Reservation: resv, SpendingTxID: mustHash(h.t, txid)}
-	require.NoError(h.t, h.utxo.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(h.t, h.utxo.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	require.NoError(h.t, sp.Err)
 }
 

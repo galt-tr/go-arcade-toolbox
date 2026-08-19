@@ -406,7 +406,9 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 
 // Spend implements [utxostore.Store]: reserved(reservation) → spent(txid),
 // idempotent for the same spender, [utxostore.SpentError] for a different one.
-func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
+// With force it records a spend the network has already accepted, skipping the
+// reservation and freeze guards (see [utxostore.Store.Spend]).
+func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -415,7 +417,7 @@ func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
 
 	failed := 0
 	for _, sp := range spends {
-		sp.Err = s.spendOne(sp)
+		sp.Err = s.spendOne(sp, force)
 		if sp.Err != nil {
 			failed++
 		}
@@ -427,7 +429,7 @@ func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
 }
 
 // spendOne applies a single spend transition; the caller holds the mutex.
-func (s *Store) spendOne(sp *utxostore.SpendOp) error {
+func (s *Store) spendOne(sp *utxostore.SpendOp, force bool) error {
 	if sp.Reservation == "" {
 		return fmt.Errorf("memstore: spend %s: reservation must be non-empty", sp.Outpoint)
 	}
@@ -436,17 +438,22 @@ func (s *Store) spendOne(sp *utxostore.SpendOp) error {
 	if !ok {
 		return &utxostore.NotFoundError{Op: sp.Outpoint}
 	}
+	// The spent_by arbiter runs in BOTH modes: two spend facts cannot both hold.
 	if r.utxo.SpentBy != nil {
 		if *r.utxo.SpentBy == sp.SpendingTxID {
 			return nil // idempotent: same spender replay
 		}
 		return &utxostore.SpentError{Op: sp.Outpoint, Winner: *r.utxo.SpentBy}
 	}
-	if r.utxo.Frozen {
-		return &utxostore.FrozenError{Op: sp.Outpoint}
-	}
-	if r.utxo.ReservedBy != sp.Reservation {
-		return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: r.utxo.ReservedBy}
+	// Fact mode skips exactly these two guards: the spend is already on the
+	// network, so neither a freeze nor a stale reservation can un-happen it.
+	if !force {
+		if r.utxo.Frozen {
+			return &utxostore.FrozenError{Op: sp.Outpoint}
+		}
+		if r.utxo.ReservedBy != sp.Reservation {
+			return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: r.utxo.ReservedBy}
+		}
 	}
 
 	spentBy := sp.SpendingTxID

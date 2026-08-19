@@ -108,6 +108,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"SpendLifecycle", std(s.spendLifecycle)},
 		{"SpendPerItemErrors", std(s.spendPerItemErrors)},
 		{"SpendPrecedence", std(s.spendPrecedence)},
+		{"SpendFactMode", std(s.spendFactMode)},
 		{"Unspend", std(s.unspend)},
 		{"Promote", std(s.promote)},
 		{"FreezeUnfreeze", std(s.freezeUnfreeze)},
@@ -273,9 +274,17 @@ func (s *suite) inputValidation(t *testing.T, store utxostore.Store) {
 
 	// Spend with an empty reservation guard: per-item failure under ErrBatch.
 	sp := &utxostore.SpendOp{Outpoint: ops[0], Reservation: "", SpendingTxID: NewTxID("validate-tx")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{sp})
+	err = store.Spend(ctx, []*utxostore.SpendOp{sp}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	require.Error(t, sp.Err, "Spend must reject an empty reservation per item")
+
+	// ...including in fact mode: force waives STATE guards, never the
+	// programmer-error check. The token is unread there, but a caller that
+	// cannot name the funding run it is recording has a bug.
+	forced := &utxostore.SpendOp{Outpoint: ops[0], Reservation: "", SpendingTxID: NewTxID("validate-tx")}
+	err = store.Spend(ctx, []*utxostore.SpendOp{forced}, true)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	require.Error(t, forced.Err, "force must not waive the non-empty reservation check")
 
 	// Underspecified scopes are rejected by every claim shape.
 	for name, bad := range map[string]utxostore.Scope{
@@ -641,7 +650,7 @@ func (s *suite) releaseReservation(t *testing.T, store utxostore.Store) {
 	require.Len(t, forSpend, 1)
 	spendTx := NewTxID("release-res-spender")
 	sp := &utxostore.SpendOp{Outpoint: forSpend[0].Outpoint, Reservation: "res-c", SpendingTxID: spendTx}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 
 	n, err = store.ReleaseReservation(ctx, user, "res-c")
 	require.NoError(t, err)
@@ -685,7 +694,7 @@ func (s *suite) releaseOutpoints(t *testing.T, store utxostore.Store) {
 	// Spent rows are skips: release never touches them.
 	spendTx := NewTxID("release-ops-spender")
 	sp := &utxostore.SpendOp{Outpoint: b, Reservation: "res-a", SpendingTxID: spendTx}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	require.NoError(t, store.ReleaseOutpoints(ctx, "res-a", []utxostore.Outpoint{b}))
 	got, err = store.Get(ctx, b)
 	require.NoError(t, err)
@@ -802,7 +811,7 @@ func (s *suite) pinScopingAndNoOps(t *testing.T, store utxostore.Store) {
 	require.NoError(t, err)
 	require.Len(t, spentClaim, 1)
 	sp := &utxostore.SpendOp{Outpoint: spentClaim[0].Outpoint, Reservation: "res-spent", SpendingTxID: NewTxID("pin-scope-spender")}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	n, err = store.Pin(ctx, user, "res-spent")
 	require.NoError(t, err)
 	require.Zero(t, n, "a fully spent reservation has nothing to pin")
@@ -849,7 +858,7 @@ func (s *suite) pinClearedBySpendAndUnspend(t *testing.T, store utxostore.Store)
 	// A pin never blocks the spend it exists to protect.
 	spender := NewTxID("pin-spend-spender")
 	sp := &utxostore.SpendOp{Outpoint: op, Reservation: "res-p", SpendingTxID: spender}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	require.NoError(t, sp.Err)
 
 	u := getPinChecked(ctx, t, store, op)
@@ -937,7 +946,7 @@ func (s *suite) spendLifecycle(t *testing.T, store utxostore.Store) {
 
 	// reserved(reservation) -> spent(txid).
 	sp := &utxostore.SpendOp{Outpoint: op, Reservation: "res-1", SpendingTxID: winner}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	require.NoError(t, sp.Err)
 	got, err := store.Get(ctx, op)
 	require.NoError(t, err)
@@ -946,12 +955,12 @@ func (s *suite) spendLifecycle(t *testing.T, store utxostore.Store) {
 
 	// Same spender replay: idempotent success.
 	replay := &utxostore.SpendOp{Outpoint: op, Reservation: "res-1", SpendingTxID: winner}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{replay}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{replay}, false))
 	require.NoError(t, replay.Err)
 
 	// Different spender: SpentError carrying the winner.
 	loser := &utxostore.SpendOp{Outpoint: op, Reservation: "res-1", SpendingTxID: NewTxID("spend-loser")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{loser})
+	err = store.Spend(ctx, []*utxostore.SpendOp{loser}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	require.ErrorIs(t, loser.Err, &utxostore.SpentError{})
 	var spent *utxostore.SpentError
@@ -962,7 +971,7 @@ func (s *suite) spendLifecycle(t *testing.T, store utxostore.Store) {
 	// Spend of an unreserved row: reservation-guard failure, HeldBy == "".
 	unreserved := NewOutpoint("spend", 1) // the 200-sat coin, never claimed
 	noRes := &utxostore.SpendOp{Outpoint: unreserved, Reservation: "res-x", SpendingTxID: NewTxID("t")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{noRes})
+	err = store.Spend(ctx, []*utxostore.SpendOp{noRes}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	var resErr *utxostore.ReservedError
 	require.ErrorAs(t, noRes.Err, &resErr)
@@ -973,7 +982,7 @@ func (s *suite) spendLifecycle(t *testing.T, store utxostore.Store) {
 	require.NoError(t, err)
 	require.Len(t, held, 1)
 	wrongRes := &utxostore.SpendOp{Outpoint: held[0].Outpoint, Reservation: "res-thief", SpendingTxID: NewTxID("t2")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{wrongRes})
+	err = store.Spend(ctx, []*utxostore.SpendOp{wrongRes}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	require.ErrorAs(t, wrongRes.Err, &resErr)
 	require.Equal(t, "res-holder", resErr.HeldBy)
@@ -995,7 +1004,7 @@ func (s *suite) spendPerItemErrors(t *testing.T, store utxostore.Store) {
 	// the good item still committed.
 	good := &utxostore.SpendOp{Outpoint: claimed[0].Outpoint, Reservation: "res-1", SpendingTxID: NewTxID("shape-tx")}
 	bad := &utxostore.SpendOp{Outpoint: NewOutpoint("spend-shape-missing", 0), Reservation: "res-1", SpendingTxID: NewTxID("shape-tx")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{good, bad})
+	err = store.Spend(ctx, []*utxostore.SpendOp{good, bad}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	require.NoError(t, good.Err)
 	require.ErrorIs(t, bad.Err, &utxostore.NotFoundError{})
@@ -1021,24 +1030,172 @@ func (s *suite) spendPrecedence(t *testing.T, store utxostore.Store) {
 	winner := NewTxID("precedence-winner")
 
 	sp := &utxostore.SpendOp{Outpoint: op, Reservation: "res-1", SpendingTxID: winner}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 
 	// Freeze AFTER the spend was recorded.
 	require.NoError(t, store.Freeze(ctx, []utxostore.Outpoint{op}))
 
 	// Same-spender replay succeeds despite the freeze.
 	replay := &utxostore.SpendOp{Outpoint: op, Reservation: "res-1", SpendingTxID: winner}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{replay}),
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{replay}, false),
 		"same-spender replay on a since-frozen row must succeed")
 	require.NoError(t, replay.Err)
 
 	// A different spender sees the recorded spend, not the freeze.
 	loser := &utxostore.SpendOp{Outpoint: op, Reservation: "res-1", SpendingTxID: NewTxID("precedence-loser")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{loser})
+	err = store.Spend(ctx, []*utxostore.SpendOp{loser}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	require.ErrorIs(t, loser.Err, &utxostore.SpentError{})
 	require.NotErrorIs(t, loser.Err, &utxostore.FrozenError{},
 		"the recorded spend, not the freeze, must be reported")
+}
+
+// spendFactMode pins the forced (force=true) mode: at broadcast-accept the
+// spend has ALREADY happened on the network, so the store records the fact
+// instead of guarding a transition. Reservation mismatches (including an
+// unreserved row) and freezes are recorded anyway; only two errors survive —
+// NotFoundError (a genuinely external input, the one error a caller may skip)
+// and SpentError from a DIFFERENT spender (two facts cannot both hold).
+func (s *suite) spendFactMode(t *testing.T, store utxostore.Store) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	// Rows 0..6, one per scenario below. Denominations are distinct so each
+	// ClaimExact names exactly one row; see the bucket note at the reclaim
+	// probe before adding any coin to this list.
+	ops := MintTx(t, store, "spend-fact", user, basket, utxostore.TierMined,
+		100, 200, 300, 400, 500, 600, 700)
+	fact := NewTxID("spend-fact-broadcast")
+
+	// claimOne reserves the single coin worth denom under res.
+	claimOne := func(res string, denom uint64) utxostore.Outpoint {
+		t.Helper()
+		claimed, cerr := store.ClaimExact(ctx, sc, res, denom, 1)
+		require.NoError(t, cerr)
+		require.Len(t, claimed, 1, "the %d-sat coin must be claimable under %s", denom, res)
+		return claimed[0].Outpoint
+	}
+
+	// requireRecorded re-reads op and asserts the fact was written: spent by
+	// the expected tx, and never left pinned (the coin is consumed, not in
+	// flight).
+	requireRecorded := func(op utxostore.Outpoint, spender chainhash.Hash) *utxostore.UTXO {
+		t.Helper()
+		u := getPinChecked(ctx, t, store, op)
+		require.NotNil(t, u.SpentBy, "fact mode must record the spend on %s", op)
+		require.Equal(t, spender, *u.SpentBy)
+		require.False(t, u.Pinned, "a recorded spend clears the pin on %s", op)
+		return u
+	}
+
+	// Row 0 (100): reserved under a DIFFERENT token than the op carries. The
+	// reservation the broadcast was built under is long gone; the spend is not.
+	require.Equal(t, ops[0], claimOne("res-other", 100))
+
+	// Row 2 (300): reserved by the op's own token, then FROZEN.
+	frozenOutpoint := claimOne("res-mine", 300)
+	require.NoError(t, store.Freeze(ctx, []utxostore.Outpoint{frozenOutpoint}))
+
+	// One batch, four items: wrong holder, unreserved (row 1, never claimed),
+	// frozen, and an outpoint that is not in the inventory at all.
+	missing := NewOutpoint("spend-fact-missing", 0)
+	wrongHolder := &utxostore.SpendOp{Outpoint: ops[0], Reservation: "res-mine", SpendingTxID: fact}
+	unreserved := &utxostore.SpendOp{Outpoint: ops[1], Reservation: "res-mine", SpendingTxID: fact}
+	frozenOp := &utxostore.SpendOp{Outpoint: frozenOutpoint, Reservation: "res-mine", SpendingTxID: fact}
+	external := &utxostore.SpendOp{Outpoint: missing, Reservation: "res-mine", SpendingTxID: fact}
+
+	err := store.Spend(ctx, []*utxostore.SpendOp{wrongHolder, unreserved, frozenOp, external}, true)
+	require.ErrorIs(t, err, utxostore.ErrBatch, "the missing row still fails the batch")
+	require.NoError(t, wrongHolder.Err, "a foreign reservation must not refuse the fact")
+	require.NoError(t, unreserved.Err, "an unreserved row must not refuse the fact")
+	require.NoError(t, frozenOp.Err, "a freeze must not refuse the fact")
+	require.ErrorIs(t, external.Err, &utxostore.NotFoundError{},
+		"a missing row is a genuinely external input: still NotFoundError")
+
+	u := requireRecorded(ops[0], fact)
+	require.Equal(t, "res-other", u.ReservedBy,
+		"the row keeps the reservation it carried; the op's token is never written to it")
+	u = requireRecorded(ops[1], fact)
+	require.Empty(t, u.ReservedBy,
+		"fact mode records the spend, it does not adopt the op's token")
+	u = requireRecorded(frozenOutpoint, fact)
+	require.True(t, u.Frozen, "recording a spend does not lift the freeze")
+
+	// The recorded fact takes the coin out of circulation on every backend: a
+	// spent row is never claimable again, however it was reserved before.
+	//
+	// Load-bearing, not decoration: row 1 was the only row still IN the claim
+	// index when the fact landed (the others were reserved or frozen, so their
+	// index entry was already gone), which makes this the one assertion that
+	// pins aerostore's fact-mode claimKey removal. It is also the only probe
+	// whose answer must be empty, so keep it unambiguous: 200 sats sits alone
+	// in aerospike's bucket 7 (128..255), and adding another 128..255-sat coin
+	// to the mint list above could let a bounded best-of-sample probe miss a
+	// leftover key and pass a regression.
+	reclaim, err := store.ClaimExact(ctx, sc, "res-after", 200, 1)
+	require.NoError(t, err)
+	require.Empty(t, reclaim, "a fact-spent row must leave the claimable pool")
+
+	// Row 3 (400): the spent_by arbiter is unchanged in fact mode.
+	arb := claimOne("res-arb", 400)
+	first := &utxostore.SpendOp{Outpoint: arb, Reservation: "res-arb", SpendingTxID: fact}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{first}, true))
+	require.NoError(t, first.Err)
+
+	replay := &utxostore.SpendOp{Outpoint: arb, Reservation: "res-gone", SpendingTxID: fact}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{replay}, true),
+		"same-spender replay is idempotent in fact mode too")
+	require.NoError(t, replay.Err)
+
+	rival := &utxostore.SpendOp{Outpoint: arb, Reservation: "res-arb", SpendingTxID: NewTxID("spend-fact-rival")}
+	err = store.Spend(ctx, []*utxostore.SpendOp{rival}, true)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	require.ErrorIs(t, rival.Err, &utxostore.SpentError{},
+		"two spend facts cannot both hold: a different spender must still fail")
+	var spent *utxostore.SpentError
+	require.ErrorAs(t, rival.Err, &spent)
+	require.Equal(t, fact, spent.Winner)
+	requireRecorded(arb, fact)
+
+	// Row 4 (500): a PINNED row, force-spent under a foreign token — the pin
+	// was protecting this very broadcast, and goes with the coin it protected.
+	pinnedOutpoint := claimOne("res-pin", 500)
+	n, err := store.Pin(ctx, user, "res-pin")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.True(t, getPinChecked(ctx, t, store, pinnedOutpoint).Pinned)
+
+	pinnedOp := &utxostore.SpendOp{Outpoint: pinnedOutpoint, Reservation: "res-stale", SpendingTxID: fact}
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{pinnedOp}, true))
+	require.NoError(t, pinnedOp.Err)
+	requireRecorded(pinnedOutpoint, fact)
+
+	// Guarded mode is UNCHANGED by the new parameter: the two guards fact mode
+	// drops still refuse without force. A distinct spender keeps these refusals
+	// from being confused with the fact-mode spends above.
+	guarded := NewTxID("spend-fact-guarded")
+
+	// Row 5 (600): frozen, spent under its OWN token — only the freeze refuses.
+	guardFrozen := claimOne("res-gf", 600)
+	require.NoError(t, store.Freeze(ctx, []utxostore.Outpoint{guardFrozen}))
+	gf := &utxostore.SpendOp{Outpoint: guardFrozen, Reservation: "res-gf", SpendingTxID: guarded}
+	err = store.Spend(ctx, []*utxostore.SpendOp{gf}, false)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	require.ErrorIs(t, gf.Err, &utxostore.FrozenError{}, "without force a freeze still refuses")
+
+	// Row 6 (700): unfrozen, spent under a FOREIGN token — only the guard refuses.
+	guardHeld := claimOne("res-gh", 700)
+	gh := &utxostore.SpendOp{Outpoint: guardHeld, Reservation: "res-thief", SpendingTxID: guarded}
+	err = store.Spend(ctx, []*utxostore.SpendOp{gh}, false)
+	require.ErrorIs(t, err, utxostore.ErrBatch)
+	var held *utxostore.ReservedError
+	require.ErrorAs(t, gh.Err, &held, "without force a foreign reservation still refuses")
+	require.Equal(t, "res-gh", held.HeldBy)
+
+	for _, op := range []utxostore.Outpoint{guardFrozen, guardHeld} {
+		require.Nil(t, getPinChecked(ctx, t, store, op).SpentBy,
+			"a refused guarded spend must not record anything on %s", op)
+	}
 }
 
 func (s *suite) unspend(t *testing.T, store utxostore.Store) {
@@ -1054,7 +1211,7 @@ func (s *suite) unspend(t *testing.T, store utxostore.Store) {
 		require.NoError(t, err)
 		require.Len(t, claimed, 1)
 		sp := &utxostore.SpendOp{Outpoint: claimed[0].Outpoint, Reservation: "res-1", SpendingTxID: spender}
-		require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+		require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 		ops = append(ops, claimed[0].Outpoint)
 	}
 
@@ -1190,7 +1347,7 @@ func (s *suite) freezeUnfreeze(t *testing.T, store utxostore.Store) {
 	// A freeze placed AFTER a reservation refuses Spend with FrozenError.
 	require.NoError(t, store.Freeze(ctx, ops[:1]))
 	sp := &utxostore.SpendOp{Outpoint: ops[0], Reservation: "res-2", SpendingTxID: NewTxID("freeze-spender")}
-	err = store.Spend(ctx, []*utxostore.SpendOp{sp})
+	err = store.Spend(ctx, []*utxostore.SpendOp{sp}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	require.ErrorIs(t, sp.Err, &utxostore.FrozenError{})
 	var frozen *utxostore.FrozenError
@@ -1213,7 +1370,7 @@ func (s *suite) freezeUnfreeze(t *testing.T, store utxostore.Store) {
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 	sp = &utxostore.SpendOp{Outpoint: ops[0], Reservation: "res-3", SpendingTxID: NewTxID("freeze-spender")}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 
 	// Missing outpoints: per-item NotFoundError under ErrBatch; present rows
 	// in the same batch are still frozen.
@@ -1271,7 +1428,7 @@ func (s *suite) remove(t *testing.T, store utxostore.Store) {
 	require.Len(t, claimed, 1)
 	winner := NewTxID("remove-spender")
 	sp := &utxostore.SpendOp{Outpoint: spentOp, Reservation: "res-spend", SpendingTxID: winner}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	err = store.Remove(ctx, []utxostore.Outpoint{spentOp}, false)
 	require.ErrorIs(t, err, utxostore.ErrBatch)
 	var spentErr *utxostore.SpentError
@@ -1320,7 +1477,7 @@ func (s *suite) removeByMintTx(t *testing.T, store utxostore.Store) {
 		require.NoError(t, err)
 		require.Len(t, c, 1)
 		sp := &utxostore.SpendOp{Outpoint: c[0].Outpoint, Reservation: "res-child", SpendingTxID: childTx}
-		require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+		require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	}
 
 	// frozenOp: frozen but unreserved — a phantom coin, still removed.
@@ -1378,7 +1535,7 @@ func (s *suite) removeSpentBy(t *testing.T, store utxostore.Store) {
 		require.Len(t, claimed, 1)
 		require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{
 			{Outpoint: claimed[0].Outpoint, Reservation: "res", SpendingTxID: spender},
-		}))
+		}, false))
 		return claimed[0].Outpoint
 	}
 	// 100 + 200 spent by A; 300 spent by a different tx B.
@@ -1436,7 +1593,7 @@ func (s *suite) balance(t *testing.T, store utxostore.Store) {
 	require.NoError(t, err)
 	require.Len(t, spent, 1)
 	sp := &utxostore.SpendOp{Outpoint: spent[0].Outpoint, Reservation: "res-bal-spent", SpendingTxID: NewTxID("bal-spender")}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 
 	b, err := store.Balance(ctx, user, basket)
 	require.NoError(t, err)
@@ -1546,7 +1703,7 @@ func (s *suite) findStaleReservations(t *testing.T) {
 
 	// Spent rows drop out: a fully spent reservation is no longer stale work.
 	sp := &utxostore.SpendOp{Outpoint: resB[0].Outpoint, Reservation: "res-b", SpendingTxID: NewTxID("stale-spender")}
-	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}))
+	require.NoError(t, store.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 	refs, err = store.FindStaleReservations(ctx, future, 10)
 	require.NoError(t, err)
 	require.Len(t, refs, 1)

@@ -15,7 +15,9 @@ import (
 // idempotent for the same spender, [utxostore.SpentError] for a different one.
 // Guard precedence matches the interface: an already-recorded spend is checked
 // BEFORE the freeze, so a same-spender replay on a since-frozen row succeeds.
-func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp) error {
+// With force it records a spend the network has already accepted, skipping the
+// reservation and freeze guards (see [utxostore.Store.Spend]).
+func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp, force bool) error {
 	if s.isClosed() {
 		return errClosed
 	}
@@ -24,7 +26,7 @@ func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp) error {
 	err := s.withTx(ctx, func(x queryer) error {
 		failed = 0
 		for _, sp := range spends {
-			itemErr, fatal := s.spendOne(ctx, x, sp)
+			itemErr, fatal := s.spendOne(ctx, x, sp, force)
 			if fatal != nil {
 				return fatal
 			}
@@ -44,7 +46,7 @@ func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp) error {
 	return nil
 }
 
-func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp) (itemErr, fatal error) {
+func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp, force bool) (itemErr, fatal error) {
 	if sp.Reservation == "" {
 		return fmt.Errorf("sqlstore: spend %s: reservation must be non-empty", sp.Outpoint), nil
 	}
@@ -63,7 +65,8 @@ func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp) 
 		return nil, err
 	}
 
-	// Precedence: recorded spend wins over freeze.
+	// Precedence: recorded spend wins over freeze. The spent_by arbiter runs in
+	// BOTH modes — two spend facts cannot both hold.
 	if len(spentBy) > 0 {
 		w, herr := decodeHash(spentBy)
 		if herr != nil {
@@ -74,11 +77,15 @@ func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp) 
 		}
 		return &utxostore.SpentError{Op: sp.Outpoint, Winner: *w}, nil
 	}
-	if s.boolGet(frozen) {
-		return &utxostore.FrozenError{Op: sp.Outpoint}, nil
-	}
-	if reservedBy.String != sp.Reservation {
-		return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: reservedBy.String}, nil
+	// Fact mode skips exactly these two guards: the spend is already on the
+	// network, so neither a freeze nor a stale reservation can un-happen it.
+	if !force {
+		if s.boolGet(frozen) {
+			return &utxostore.FrozenError{Op: sp.Outpoint}, nil
+		}
+		if reservedBy.String != sp.Reservation {
+			return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: reservedBy.String}, nil
+		}
 	}
 
 	// The spend consumes the coin, so the pre-broadcast pin it may have carried

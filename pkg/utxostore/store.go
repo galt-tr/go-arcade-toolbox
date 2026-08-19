@@ -21,12 +21,14 @@ import (
 //  3. Guards are exact-match state preconditions carried in the op; a failed
 //     guard is per-item data, not corruption.
 //  4. Idempotency: Mint (same data = no-op success), Spend (same spender =
-//     success), Unspend (guard mismatch = skip), Release (already free =
-//     skip), Remove (missing = no-op), Promote (already there = counts as
-//     unchanged), Pin/Unpin (already in that state = uncounted skip). Every op
-//     a crash-recovery outbox replays is idempotent by construction.
-//  5. Frozen rows are invisible to claims and refuse Spend ([FrozenError]),
-//     but Release, Unspend, and Promote still apply to them.
+//     success, in either mode), Unspend (guard mismatch = skip), Release
+//     (already free = skip), Remove (missing = no-op), Promote (already there
+//     = counts as unchanged), Pin/Unpin (already in that state = uncounted
+//     skip). Every op a crash-recovery outbox replays is idempotent by
+//     construction.
+//  5. Frozen rows are invisible to claims and refuse a GUARDED Spend
+//     ([FrozenError]), but Release, Unspend, Promote, and a forced
+//     (fact-mode) Spend still apply to them.
 //  6. Pinned rows are reserved rows that no janitor may free: they are
 //     invisible to FindStaleReservations and untouched by ReleaseReservation.
 //     pinned = TRUE implies reserved and unspent, always. See [Store.Pin].
@@ -126,23 +128,52 @@ type Store interface {
 
 	// --- spend lifecycle ---
 
-	// Spend transitions rows reserved(op.Reservation) → spent(op.SpendingTxID).
-	// Guards, per item: the row must exist ([NotFoundError]), must not be
-	// frozen ([FrozenError]), and must be reserved by exactly op.Reservation
-	// ([ReservedError] with HeldBy naming the actual holder, "" when
-	// unreserved). Idempotent: a row already spent by the SAME SpendingTxID
-	// succeeds; a row spent by a different transaction fails with
-	// [SpentError] carrying the winner.
+	// Spend marks rows spent by op.SpendingTxID. force selects between two
+	// modes that differ ONLY in which preconditions they enforce; both write
+	// the same row state.
 	//
-	// Precedence: an already-recorded spend wins over a freeze — the
-	// spent-state check comes BEFORE the frozen check, so a same-spender
+	// Guarded mode (force=false) is a state TRANSITION
+	// reserved(op.Reservation) → spent(op.SpendingTxID), for a spend the
+	// wallet is still authoring. Guards, per item: the row must exist
+	// ([NotFoundError]), must not be frozen ([FrozenError]), and must be
+	// reserved by exactly op.Reservation ([ReservedError] with HeldBy naming
+	// the actual holder — HeldBy == "" means the row IS in the inventory but
+	// currently UNRESERVED, never that the input is external). Idempotent: a
+	// row already spent by the SAME SpendingTxID succeeds; a row spent by a
+	// different transaction fails with [SpentError] carrying the winner.
+	//
+	// Fact mode (force=true) RECORDS a spend that has already happened on the
+	// network — the broadcast was accepted, so no local state may un-happen
+	// it. Per item: a MISSING row still fails with [NotFoundError] (a
+	// genuinely external input, and the ONLY error a caller may skip); a row
+	// already spent by the SAME SpendingTxID is an idempotent success; a row
+	// spent by a DIFFERENT transaction still fails with [SpentError], because
+	// two spend facts cannot both hold and the caller must alert rather than
+	// overwrite. No row STATE refuses a fact: reserved by another token,
+	// unreserved, or frozen, it is RECORDED ANYWAY.
+	//
+	// Beyond those two, a fact-mode item can still fail for reasons that are
+	// not row state: an empty op.Reservation (a programmer error) and
+	// transient backend errors — an optimistic backend may report
+	// [ErrContention], which is retryable, not skippable and not a double
+	// spend.
+	//
+	// Precedence (both modes): an already-recorded spend wins over a freeze —
+	// the spent-state check comes BEFORE the frozen check, so a same-spender
 	// replay (e.g. an outbox replaying after a crash) on a since-frozen row
 	// is an idempotent success, and a different spender receives
 	// [SpentError], never [FrozenError].
 	//
+	// In both modes a recorded spend clears the pin — the coin is consumed,
+	// not in flight — and leaves ReservedBy/ReservedAt untouched: neither mode
+	// writes op.Reservation onto the row. After a guarded spend that is
+	// provenance (the guard proved the token spent the coin); after a forced
+	// one it is only whatever the row last carried, possibly a foreign token
+	// and possibly none.
+	//
 	// Failures are reported per item via SpendOp.Err plus a top-level error
 	// matching [ErrBatch].
-	Spend(ctx context.Context, spends []*SpendOp) error
+	Spend(ctx context.Context, spends []*SpendOp, force bool) error
 
 	// Unspend reverses recorded spends: for each op whose row has SpentBy ==
 	// spendingTxID, it clears the spend AND the reservation, returning the

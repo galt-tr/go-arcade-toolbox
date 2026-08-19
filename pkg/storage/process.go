@@ -497,7 +497,7 @@ func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Tran
 	if len(ops) == 0 {
 		return nil
 	}
-	if err := p.utxo.Spend(ctx, ops); err != nil {
+	if err := p.utxo.Spend(ctx, ops, false); err != nil {
 		// Tolerate not-found (external inputs) and unreserved rows; surface any
 		// spent-by-another (real double spend) or other hard failures.
 		for _, op := range ops {
@@ -509,6 +509,10 @@ func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Tran
 			}
 			var re *utxostore.ReservedError
 			if errors.As(op.Err, &re) && re.HeldBy == "" {
+				// KNOWN BUG (audit P0-2): HeldBy == "" means "in the inventory,
+				// currently unreserved", NOT "external" — swallowing it turns a
+				// release race into a silent double spend. Rewired to fact mode
+				// (force=true) in a follow-up task.
 				continue // not our reserved coin (external input)
 			}
 			return fmt.Errorf("storage: spend input %s: %w", op.Outpoint, op.Err)

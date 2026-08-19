@@ -14,14 +14,16 @@ import (
 // Spend implements [utxostore.Store]: reserved(reservation) → spent(txid) as a
 // single-record CAS. On a guard failure it classifies per the taxonomy — an
 // already-recorded spend takes precedence over a freeze; a same-spender replay
-// is an idempotent success.
-func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
+// is an idempotent success. With force it records a spend the network has
+// already accepted, dropping the reservation and freeze conjuncts from the CAS
+// (see [utxostore.Store.Spend]).
+func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp, force bool) error {
 	if s.closed.Load() {
 		return errClosed
 	}
 	failed := 0
 	for _, sp := range spends {
-		sp.Err = s.spendOne(sp)
+		sp.Err = s.spendOne(sp, force)
 		if sp.Err != nil {
 			failed++
 		}
@@ -29,7 +31,7 @@ func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
 	return batchCountErr(failed, len(spends))
 }
 
-func (s *Store) spendOne(sp *utxostore.SpendOp) error {
+func (s *Store) spendOne(sp *utxostore.SpendOp, force bool) error {
 	if sp.Reservation == "" {
 		return fmt.Errorf("aerostore: spend %s: reservation must be non-empty", sp.Outpoint)
 	}
@@ -38,32 +40,58 @@ func (s *Store) spendOne(sp *utxostore.SpendOp) error {
 		return err
 	}
 
-	// The CAS guard: reserved by exactly this token, not yet spent, not frozen.
 	wp := as.NewWritePolicy(0, 0)
 	wp.RecordExistsAction = as.UPDATE_ONLY
-	wp.FilterExpression = as.ExpAnd(
-		as.ExpEq(as.ExpStringBin(binResBy), as.ExpStringVal(sp.Reservation)),
-		as.ExpNot(as.ExpBinExists(binSpentBy)),
-		as.ExpNot(as.ExpBinExists(binFrozen)),
-	)
+	if force {
+		// Fact mode: the only surviving precondition is the spent_by arbiter —
+		// unspent, or already spent by this very transaction (an idempotent
+		// replay). The reservation and freeze conjuncts are gone: the spend is
+		// already on the network and neither can un-happen it. The second arm
+		// is safe on an unspent row because comparing an absent bin yields
+		// false, as the guarded resBy filter already relies on.
+		wp.FilterExpression = as.ExpOr(
+			as.ExpNot(as.ExpBinExists(binSpentBy)),
+			as.ExpEq(as.ExpBlobBin(binSpentBy), as.ExpBlobVal(sp.SpendingTxID[:])),
+		)
+	} else {
+		// Guarded: reserved by exactly this token, not yet spent, not frozen.
+		wp.FilterExpression = as.ExpAnd(
+			as.ExpEq(as.ExpStringBin(binResBy), as.ExpStringVal(sp.Reservation)),
+			as.ExpNot(as.ExpBinExists(binSpentBy)),
+			as.ExpNot(as.ExpBinExists(binFrozen)),
+		)
+	}
+
+	// The spend consumes the coin, so any pre-broadcast pin goes with it.
+	ops := []*as.Operation{
+		as.PutOp(as.NewBin(binSpentBy, sp.SpendingTxID[:])),
+		removeBinOp(binInvKey),
+		removeBinOp(binPinned),
+	}
+	if force {
+		// A guarded spend only ever lands on a reserved row, whose claimKey is
+		// already gone, so the guarded op set never needed this. A fact-mode
+		// spend CAN land on a still-claimable row (unreserved, or
+		// frozen-then-thawed), and the claim path has no spentBy conjunct
+		// anywhere: reserve's CAS guards ONLY claimKey equality. So a leftover
+		// claimKey means the next claimer WINS the row and hands an
+		// already-spent coin to a second transaction — precisely the double
+		// spend this mode exists to prevent. Removing an absent bin is a no-op,
+		// which is why the same op is harmless on rows that never had one.
+		ops = append(ops, removeBinOp(binClaimKey))
+	}
 
 	// Two attempts: the guard-failure classification can, under a concurrent
 	// release+re-reserve, observe a state that is spendable again; retry once.
 	for attempt := 0; attempt < 2; attempt++ {
-		// The spend consumes the coin, so any pre-broadcast pin goes with it.
-		_, aerr := s.client.Operate(
-			wp, key,
-			as.PutOp(as.NewBin(binSpentBy, sp.SpendingTxID[:])),
-			removeBinOp(binInvKey),
-			removeBinOp(binPinned),
-		)
+		_, aerr := s.client.Operate(wp, key, ops...)
 		if aerr == nil {
 			return nil // spent
 		}
 		if !aerr.Matches(types.FILTERED_OUT) && !aerr.Matches(types.KEY_NOT_FOUND_ERROR) {
 			return fmt.Errorf("aerostore: spend %s: %w", sp.Outpoint, aerr)
 		}
-		classified, retry, cerr := s.classifySpendFailure(sp)
+		classified, retry, cerr := s.classifySpendFailure(sp, force)
 		if cerr != nil {
 			return cerr
 		}
@@ -71,15 +99,16 @@ func (s *Store) spendOne(sp *utxostore.SpendOp) error {
 			return classified
 		}
 	}
-	// Persistent ambiguity under contention: report as a reservation-guard
-	// failure naming the current holder (best effort).
-	return s.spendGuardError(sp)
+	// Persistent ambiguity under contention.
+	return s.spendFallbackError(sp, force)
 }
 
 // classifySpendFailure inspects the row after a failed spend CAS and returns the
 // per-item error (or nil for an idempotent same-spender replay). retry is true
 // when the row appears spendable again (a race) and the caller should re-CAS.
-func (s *Store) classifySpendFailure(sp *utxostore.SpendOp) (err error, retry bool, fatal error) {
+// force selects the mode: the missing-row and spent-by classifications hold in
+// both, while the freeze and reservation refusals exist only under a guard.
+func (s *Store) classifySpendFailure(sp *utxostore.SpendOp, force bool) (err error, retry bool, fatal error) {
 	rec, found, ferr := s.getRecord(sp.Outpoint)
 	if ferr != nil {
 		return nil, false, ferr
@@ -97,24 +126,31 @@ func (s *Store) classifySpendFailure(sp *utxostore.SpendOp) (err error, retry bo
 			return nil, false, nil // idempotent: same spender
 		}
 		return &utxostore.SpentError{Op: sp.Outpoint, Winner: *u.SpentBy}, false, nil
-	case u.Frozen:
+	case !force && u.Frozen:
 		return &utxostore.FrozenError{Op: sp.Outpoint}, false, nil
-	case u.ReservedBy != sp.Reservation:
+	case !force && u.ReservedBy != sp.Reservation:
 		return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: u.ReservedBy}, false, nil
 	default:
-		// Row looks spendable again — a concurrent release+re-reserve raced the
-		// CAS. Signal a retry.
+		// Row looks spendable again — a concurrent release+re-reserve (or, in
+		// fact mode, a concurrent Unspend) raced the CAS. Signal a retry.
 		return nil, true, nil
 	}
 }
 
-func (s *Store) spendGuardError(sp *utxostore.SpendOp) error {
+// spendFallbackError is the best-effort report for a spend whose CAS kept
+// failing while the row kept looking spendable — pure contention. Guarded mode
+// names the current holder; fact mode reports the contention itself, since a
+// reservation is not a refusal there.
+func (s *Store) spendFallbackError(sp *utxostore.SpendOp, force bool) error {
 	rec, found, err := s.getRecord(sp.Outpoint)
 	if err != nil {
 		return err
 	}
 	if !found {
 		return &utxostore.NotFoundError{Op: sp.Outpoint}
+	}
+	if force {
+		return fmt.Errorf("aerostore: spend %s: %w", sp.Outpoint, utxostore.ErrContention)
 	}
 	u, cerr := recordToUTXO(rec)
 	if cerr != nil {

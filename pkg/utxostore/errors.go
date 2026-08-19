@@ -63,9 +63,11 @@ func (e *AlreadyExistsError) Is(target error) bool {
 }
 
 // ReservedError reports a reservation-guard failure. HeldBy names the
-// reservation currently holding the row; HeldBy == "" means the row is not
-// reserved at all (e.g. Spend of an unreserved row). It is also the refusal
-// returned by Remove (without force) for a reserved row.
+// reservation currently holding the row; HeldBy == "" means the row IS in the
+// inventory but is currently unreserved (e.g. a GUARDED Spend of a released
+// row). It never means the outpoint is external — only [NotFoundError] means
+// that. It is also the refusal returned by Remove (without force) for a
+// reserved row.
 //
 // errors.Is(err, &ReservedError{}) matches any ReservedError; use errors.As
 // to extract the outpoint and holder.
@@ -89,9 +91,10 @@ func (e *ReservedError) Is(target error) bool {
 }
 
 // SpentError reports that a row is already spent. Winner is the transaction
-// that spent it — on a Spend guard failure it identifies the competing
-// spender; a Spend replay by the SAME spender is an idempotent success, not
-// this error.
+// that spent it — on a Spend refusal in either mode it identifies the
+// competing spender; a Spend replay by the SAME spender is an idempotent
+// success, not this error. It is the one state refusal a forced (fact-mode)
+// Spend keeps: two spend facts cannot both hold.
 //
 // errors.Is(err, &SpentError{}) matches any SpentError; use errors.As to
 // extract the outpoint and winner.
@@ -112,7 +115,8 @@ func (e *SpentError) Is(target error) bool {
 }
 
 // FrozenError reports that a row is frozen: it refuses Spend and Remove
-// (without force) while the hold is in place.
+// without force while the hold is in place. A forced Spend records the coin as
+// spent and a forced Remove deletes it; neither lifts the freeze itself.
 //
 // errors.Is(err, &FrozenError{}) matches any FrozenError; use errors.As to
 // extract the outpoint.

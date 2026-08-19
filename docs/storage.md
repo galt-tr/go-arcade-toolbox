@@ -132,10 +132,11 @@ ClaimExact(ctx, s Scope, reservation string, denomination uint64, count int) ([]
 It reserves up to `count` claimable coins of exactly `denomination` in one atomic
 round trip; `len(result) < count` signals pool underflow and is not an error.
 
-Five atomicity contracts are the core of the interface (every method is atomic
+Six atomicity contracts are the core of the interface (every method is atomic
 per item, claims are single-round-trip transitions, guards are exact-match
-preconditions, every replayed op is idempotent, and frozen rows are invisible to
-claims). The conformance suite enforces all five.
+preconditions, every replayed op is idempotent, frozen rows are invisible to
+claims and refuse `Spend` without force, and pinned rows are reserved rows no
+janitor may free). The conformance suite enforces all six.
 
 There is **no TTL- or height-based deletion, ever.** A node can rebuild its UTXO
 set from the chain; a wallet cannot, so silently expiring a row is
