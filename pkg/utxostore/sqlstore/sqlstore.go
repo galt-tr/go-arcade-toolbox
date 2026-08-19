@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -182,6 +183,27 @@ func newStore(ctx context.Context, db *sql.DB, engine Engine, ownsDB bool, opts 
 			return nil, fmt.Errorf("sqlstore: a shared SQLite handle must be pinned to one connection "+
 				"(db.SetMaxOpenConns(1)); got MaxOpenConnections=%d", n)
 		}
+	}
+	// The other half of "the pool is the caller's": on PostgreSQL there is
+	// nothing to validate, but the ceiling is still not this store's. In Mode A
+	// the handle is typically the metastore's, sized for metadata work (its
+	// defaults are 10/5, against this package's own 25/10), and the claim hot
+	// path silently inherits it — claims past the ceiling queue inside
+	// database/sql before a statement ever reaches the server, so the wait shows
+	// up as store latency and in no query plan. Log the number once at
+	// construction rather than resize somebody else's pool.
+	//
+	// PostgreSQL only: a shared SQLite handle was just proven to be exactly 1,
+	// so logging it would say nothing the branch above did not already require.
+	//
+	// TODO: this is the package's only log line, so it takes slog.Default()
+	// rather than introduce a logger to a store that has none. If a second one
+	// ever appears, follow aerostore's precedent and add a WithLogger option
+	// defaulting to slog.Default() instead of growing more package-level calls.
+	if !ownsDB && engine == EnginePostgres {
+		slog.Default().DebugContext(ctx, "sqlstore: using a caller-supplied connection pool",
+			slog.String("engine", string(engine)),
+			slog.Int("max_open_conns", db.Stats().MaxOpenConnections))
 	}
 	s := &Store{db: db, engine: engine, ownsDB: ownsDB, now: time.Now}
 	for _, opt := range opts {

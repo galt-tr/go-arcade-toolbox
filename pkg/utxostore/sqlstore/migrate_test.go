@@ -16,20 +16,33 @@ import (
 )
 
 // TestMigrationsRollBack exercises the SQLite Down path of every migration.
-// The pinned migration is the reason this exists: SQLite refuses to drop a
-// column a partial index still references, so 00002's Down must drop
-// idx_utxos_reserved_at, recreate it without the pin predicate, and only then
-// drop the column — an ordering nothing else in the build would catch.
+// The pinned column is the reason this exists: SQLite refuses to drop a column
+// an index still references, so every migration that puts `pinned` into an
+// index has to retire that reference in its OWN Down — 00002 for
+// idx_utxos_reserved_at, 00003 for idx_utxos_reserved — and both must do so
+// BEFORE 00002's Down reaches the DROP COLUMN. That ordering is invisible to
+// the rest of the build, and it only breaks in the direction nobody runs by
+// hand.
 func TestMigrationsRollBack(t *testing.T) {
 	ctx := context.Background()
 	db := openSQLiteDB(t)
 
 	require.NoError(t, migrate(ctx, db, EngineSQLite))
 	require.True(t, hasColumn(t, db, "pinned"), "migrating up must add the pinned column")
+	require.Contains(t, indexSQL(t, db, "idx_utxos_reserved"), "spent_by IS NULL",
+		"00003 must evict spent rows from the holder index")
 
 	down := func() error {
 		return sqlkit.MigrateDown(ctx, db, migrationsFS, EngineSQLite, versionTable)
 	}
+
+	// Down 00003: the holder index returns to 00001's two-column form —
+	// which is also what frees the pinned column for 00002's Down below.
+	require.NoError(t, down())
+	require.NotContains(t, indexSQL(t, db, "idx_utxos_reserved"), "pinned",
+		"rolling back 00003 must give up the covering columns, pinned included")
+	require.NotContains(t, indexSQL(t, db, "idx_utxos_reserved"), "spent_by")
+	require.True(t, hasColumn(t, db, "pinned"), "00003's Down touches indexes only")
 
 	// Down 00002: the pin column and its index predicate go, the table stays.
 	require.NoError(t, down())
@@ -44,6 +57,8 @@ func TestMigrationsRollBack(t *testing.T) {
 	require.True(t, hasColumn(t, db, "pinned"))
 	require.Contains(t, indexSQL(t, db, "idx_utxos_reserved_at"), notPinned,
 		"the stale-scan index predicate must be the same text the sweep's queries use")
+	require.Contains(t, indexSQL(t, db, "idx_utxos_reserved"), "reserved_at",
+		"the holder index must come back covering")
 }
 
 // TestStaleScanIsIndexDriven plans the EXACT production stale-reservation
@@ -58,10 +73,32 @@ func TestMigrationsRollBack(t *testing.T) {
 //     SQLite refuses the statement with "no query solution" instead of
 //     quietly planning something else.
 //
-// The planner's actual choice for the grouped scan is idx_utxos_reserved
-// (reserved_by, user_id): the staleness filter is a HAVING over
-// MIN(reserved_at), not a WHERE range, so there is no reserved_at term to seek
-// on. That is why (1) asserts "index-driven" rather than naming one index.
+// The planner's actual choice for the grouped scan is idx_utxos_reserved: the
+// staleness filter is a HAVING over MIN(reserved_at), not a WHERE range, so
+// there is no reserved_at term to seek on. That is why (1) asserts
+// "index-driven" rather than naming one index.
+//
+// Since the 00003 migration made that index covering, (1) has a third clause
+// asserting the IMPROVEMENT rather than merely tolerating it: the grouped scan
+// is now a COVERING index search, so it reads no table rows at all. The plan
+// line moved from
+//
+//	SEARCH utxos USING INDEX idx_utxos_reserved (reserved_by>?)
+//
+// to
+//
+//	SEARCH utxos USING COVERING INDEX idx_utxos_reserved (reserved_by>?)
+//
+// which is worth pinning because it is fragile in a way peculiar to SQLite:
+// unlike PostgreSQL, SQLite does not discharge the query's "spent_by IS NULL"
+// against the partial index's identical predicate, so it re-reads that column
+// per row and only the presence of spent_by IN the index keeps the scan off
+// the table. Drop that column from 00003 believing it redundant — it is
+// redundant on PostgreSQL — and this assertion is what says otherwise.
+//
+// The OUTER expansion is deliberately NOT covering: it projects u.txid and
+// u.vout, which 00003 leaves out on purpose (see its comment), so its line
+// stays a plain "USING INDEX".
 func TestStaleScanIsIndexDriven(t *testing.T) {
 	ctx := context.Background()
 	s, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "plan.db"))
@@ -74,12 +111,17 @@ func TestStaleScanIsIndexDriven(t *testing.T) {
 
 	cutoff := s.encTime(time.Now())
 	plan := explainQueryPlan(t, s, s.staleReservationsSQL(), cutoff, 10)
+	t.Logf("stale scan plan:\n%s", strings.Join(plan, "\n"))
 	for _, step := range plan {
 		require.NotContains(t, step, "SCAN utxos",
 			"the stale scan must never table-scan the pool; plan:\n%s", strings.Join(plan, "\n"))
 	}
 	require.Contains(t, strings.Join(plan, "\n"), "USING INDEX",
 		"the stale scan must resolve through an index")
+	require.Contains(t, strings.Join(plan, "\n"), "USING COVERING INDEX idx_utxos_reserved",
+		"the grouped scan must read the whole live hold set from idx_utxos_reserved alone; "+
+			"losing 'covering' means 00003's trailing spent_by went missing and every row "+
+			"costs a table read again. plan:\n%s", strings.Join(plan, "\n"))
 
 	probe := `SELECT reserved_at FROM utxos INDEXED BY idx_utxos_reserved_at
 		WHERE reserved_by IS NOT NULL AND spent_by IS NULL AND ` + notPinned + ` AND reserved_at < ?`

@@ -597,6 +597,20 @@ func sortedDistinct(ops []utxostore.Outpoint) []utxostore.Outpoint {
 	return out
 }
 
+// releaseReservationSQL is the whole-reservation release statement, bound to
+// two parameters: the user id and the reservation token, in that order.
+//
+// It is a builder rather than an inlined string for the same reason
+// [Store.staleReservationsSQL] is: so a test can plan the EXACT production
+// text. Its WHERE is the shape idx_utxos_reserved is designed around —
+// (reserved_by, user_id) as the seek, spent_by IS NULL as the index's own
+// partial predicate, and NOT pinned answered from the covering columns — and
+// sweep_explain_test.go fails if the release ever stops resolving through it.
+func (s *Store) releaseReservationSQL() string {
+	return s.rebind(`UPDATE utxos SET reserved_by=NULL, reserved_at=NULL
+		WHERE user_id=? AND reserved_by=? AND spent_by IS NULL AND ` + notPinned)
+}
+
 // ReleaseReservation implements [utxostore.Store]: frees every unspent,
 // UNPINNED row held by (userID, reservation). Idempotent; never touches spent
 // rows, and never frees the inputs of an in-flight send (see [Store.Pin]).
@@ -610,10 +624,7 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 
 	var released int
 	err := s.withTx(ctx, func(x queryer) error {
-		res, err := x.ExecContext(ctx, s.rebind(
-			`UPDATE utxos SET reserved_by=NULL, reserved_at=NULL
-			 WHERE user_id=? AND reserved_by=? AND spent_by IS NULL AND `+notPinned),
-			userID, reservation)
+		res, err := x.ExecContext(ctx, s.releaseReservationSQL(), userID, reservation)
 		if err != nil {
 			return err
 		}
@@ -721,6 +732,13 @@ func (s *Store) setPinned(ctx context.Context, userID int64, reservation string,
 // partial WHERE must stay in step — SQLite matches partial indexes by predicate
 // text — and TestStaleScanIsIndexDriven fails if they ever drift far enough to
 // cost the sweep a table scan.
+//
+// The INNER aggregate is what the 00003 migration's covering index is shaped
+// for: every utxos column it touches — user_id, reserved_by, reserved_at, seq,
+// pinned, and spent_by as the index's own partial predicate — lives in
+// idx_utxos_reserved, so on PostgreSQL it runs index-only and never visits the
+// heap. Adding a column to it that the index does not carry silently demotes
+// the sweep to a heap scan per tick; sweep_explain_test.go is that guard.
 //
 // The subquery picks the oldest `limit` stale reservation groups; the outer
 // join expands each to its unspent, unpinned reserved outpoints, ordered so a

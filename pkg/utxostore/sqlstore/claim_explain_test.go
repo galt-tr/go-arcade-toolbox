@@ -4,7 +4,6 @@ package sqlstore_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -59,23 +58,14 @@ func TestClaimUsesPartialIndex(t *testing.T) {
 
 	for _, shape := range shapes {
 		t.Run(shape.name, func(t *testing.T) {
-			var raw []byte
-			err := s.DB().QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+shape.sql, shape.args...).Scan(&raw)
-			require.NoError(t, err)
-			t.Logf("%s claim plan:\n%s", shape.name, raw)
+			plan := explainJSON(t, s, shape.sql, shape.args...)
+			t.Logf("%s claim plan:\n%s", shape.name, plan.raw)
 
-			var plans []struct {
-				Plan map[string]any `json:"Plan"`
-			}
-			require.NoError(t, json.Unmarshal(raw, &plans))
-			require.Len(t, plans, 1)
-
-			nodeTypes, indexes := walkPlan(plans[0].Plan)
-
-			require.Contains(t, indexes, "idx_utxos_claim",
-				"%s claim must scan the partial index idx_utxos_claim; node types seen: %v", shape.name, nodeTypes)
-			for _, nt := range nodeTypes {
-				require.NotEqual(t, "Seq Scan", nt, "%s claim must not sequential-scan the pool", shape.name)
+			require.Contains(t, plan.indexes, "idx_utxos_claim",
+				"%s claim must scan the partial index idx_utxos_claim; node types seen: %v",
+				shape.name, plan.nodeTypes)
+			requireNoSeqScan(t, plan, shape.name+" claim must not sequential-scan the pool")
+			for _, nt := range plan.nodeTypes {
 				require.NotContains(t, nt, "Sort", "%s claim must be a pure ordered index walk (no sort node)", shape.name)
 			}
 		})
@@ -103,25 +93,13 @@ func TestClaimableProbeUsesPartialIndex(t *testing.T) {
 	_, err := s.DB().ExecContext(ctx, "ANALYZE utxos")
 	require.NoError(t, err)
 
-	var raw []byte
-	err = s.DB().QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+sqlstore.ClaimableProbePGSQL,
-		sc.UserID, sc.Basket, int64(sc.Tier), benchSats+1).Scan(&raw)
-	require.NoError(t, err)
-	t.Logf("claimable probe plan:\n%s", raw)
+	plan := explainJSON(t, s, sqlstore.ClaimableProbePGSQL,
+		sc.UserID, sc.Basket, int64(sc.Tier), benchSats+1)
+	t.Logf("claimable probe plan:\n%s", plan.raw)
 
-	var plans []struct {
-		Plan map[string]any `json:"Plan"`
-	}
-	require.NoError(t, json.Unmarshal(raw, &plans))
-	require.Len(t, plans, 1)
-
-	nodeTypes, indexes := walkPlan(plans[0].Plan)
-	require.Contains(t, indexes, "idx_utxos_claim",
-		"the claimable probe must scan the partial index; node types seen: %v", nodeTypes)
-	for _, nt := range nodeTypes {
-		require.NotEqual(t, "Seq Scan", nt,
-			"the claimable probe must not sequential-scan the pool to prove a negative")
-	}
+	require.Contains(t, plan.indexes, "idx_utxos_claim",
+		"the claimable probe must scan the partial index; node types seen: %v", plan.nodeTypes)
+	requireNoSeqScan(t, plan, "the claimable probe must not sequential-scan the pool to prove a negative")
 
 	// And it must answer that negative correctly, not just cheaply.
 	exists, err := s.ClaimableExists(ctx, sc, benchSats+1)
@@ -133,23 +111,7 @@ func TestClaimableProbeUsesPartialIndex(t *testing.T) {
 	require.True(t, exists, "every coin in the pool is claimable, so the any-coin probe must say so")
 }
 
-// walkPlan recursively collects every node's "Node Type" and "Index Name" from
-// an EXPLAIN (FORMAT JSON) plan tree.
-func walkPlan(node map[string]any) (nodeTypes []string, indexes []string) {
-	if nt, ok := node["Node Type"].(string); ok {
-		nodeTypes = append(nodeTypes, nt)
-	}
-	if idx, ok := node["Index Name"].(string); ok {
-		indexes = append(indexes, idx)
-	}
-	if children, ok := node["Plans"].([]any); ok {
-		for _, c := range children {
-			if cm, ok := c.(map[string]any); ok {
-				nt, ix := walkPlan(cm)
-				nodeTypes = append(nodeTypes, nt...)
-				indexes = append(indexes, ix...)
-			}
-		}
-	}
-	return nodeTypes, indexes
-}
+// The EXPLAIN plumbing these guards share with sweep_explain_test.go —
+// explainJSON, explainedPlan and requireNoSeqScan — lives there, next to the
+// index-only assertion that needs a node's type and its index name kept
+// together.

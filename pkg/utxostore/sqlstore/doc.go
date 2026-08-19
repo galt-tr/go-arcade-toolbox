@@ -139,6 +139,43 @@
 //     SQLite pool buys no write parallelism SQLite can use; it only converts
 //     serialization into SQLITE_BUSY.
 //
+//     The PostgreSQL counterpart cannot be validated, only reported: a pool
+//     this store did not open carries whoever sized it, and in Mode A that is
+//     the metastore's metadata-shaped pool (defaults 10/5) rather than this
+//     package's claim-shaped one (defaultPool, 25/10). Claims past the ceiling
+//     queue inside database/sql, so the wait appears as store latency and in no
+//     query plan; [New] therefore logs MaxOpenConnections at Debug on
+//     construction. An owned pool is sized from [WithConnPool] over defaultPool.
+//
+//   - Recommended PostgreSQL lock_timeout: about 2s. Set it on the ROLE
+//     (ALTER ROLE ... SET lock_timeout = '2s'), which is the only route the
+//     config-driven constructors offer — [sqlkit.PostgresDSN] renders a fixed
+//     set of connection fields and cannot express it, so a per-connection
+//     setting means hand-building a DSN (options=-c%20lock_timeout%3D2s) and
+//     passing it to [OpenPostgres] directly.
+//
+//     Every guarded mutation WAITS on its row lock by design — it names a
+//     fixed outpoint or a whole reservation, so there is nothing to skip to —
+//     which means a pathological holder (a stuck Mode A CreateAction, a long
+//     ad-hoc transaction) parks those statements indefinitely and, with them, a
+//     pool connection each. A lock_timeout converts that unbounded wait into
+//     SQLSTATE 55P03 (lock_not_available), which [sqlkit.WithRetry] already
+//     classifies as a lock error and retries with backoff: the caller gets a
+//     bounded retry against a transient stall, or an honest error, instead of a
+//     hung request. Do NOT confuse it with statement_timeout, which would also
+//     kill the long-running sweep. Claims are unaffected either way — SKIP
+//     LOCKED means they never wait.
+//
+//     One interaction to state rather than discover: a ROLE-level lock_timeout
+//     also applies to the startup migration, which runs on the same role from
+//     newStore -> migrate. Migration 00003 rebuilds idx_utxos_reserved under
+//     ACCESS EXCLUSIVE (see its own comment), so on a busy database that DDL
+//     can be the thing that times out — and goose Up is NOT wrapped in
+//     [sqlkit.WithRetry], so the 55P03 surfaces as a store-CONSTRUCTION
+//     failure rather than a retried statement. Failing to start beats
+//     deadlocking the deploy behind a lock nobody can see, but it is a startup
+//     failure mode worth knowing about before it happens.
+//
 //   - SQLite seq. The primary key is composite (txid, vout), so seq cannot be
 //     an INTEGER-PRIMARY-KEY rowid alias. PostgreSQL uses a GENERATED IDENTITY
 //     column; SQLite draws seq from a single-row counter table (utxo_seq)
@@ -181,9 +218,48 @@
 //     single spelling is what keeps SQLite's literal partial-index matching
 //     working. TestStaleScanIsIndexDriven pins both halves: the production
 //     stale statement never table-scans, and the index still matches the pin
-//     predicate. Note the planner currently satisfies the grouped stale scan
-//     from idx_utxos_reserved instead, because staleness is a HAVING over
-//     MIN(reserved_at) rather than a WHERE range on it.
+//     predicate. Note the planner satisfies the grouped stale scan from
+//     idx_utxos_reserved instead, because staleness is a HAVING over
+//     MIN(reserved_at) rather than a WHERE range on it — which is what the
+//     next note is about.
+//
+//   - idx_utxos_reserved covers the sweep (migration 00003). As first written
+//     it was (reserved_by, user_id) WHERE reserved_by IS NOT NULL, and it had
+//     two faults, both on the sweep rather than the claim. It never shrank: a
+//     Spend leaves reserved_by set as provenance, so every coin ever handed
+//     out stayed in it forever while the live hold set did not — and fact-mode
+//     spends make that the common case. And its predicate had fallen behind
+//     its queries, which all filter spent_by IS NULL AND NOT pinned, so each of
+//     them re-checked both per heap tuple across that dead weight. The grouped
+//     stale scan above paid the worst of it, reading the entire live hold set
+//     every tick: PostgreSQL could not use this index for it at all and fell
+//     back to a hashed aggregate over a bitmap heap scan of ~100k rows, driven
+//     off idx_utxos_reserved_at.
+//
+//     00003 rewrites it as (reserved_by, user_id) INCLUDE (reserved_at, seq,
+//     pinned) WHERE reserved_by IS NOT NULL AND spent_by IS NULL: spent rows
+//     leave the index at Spend time, and the INCLUDEd columns are exactly the
+//     rest of what [Store.staleReservationsSQL]'s inner aggregate reads, so on
+//     PostgreSQL it runs index-only. pinned is INCLUDEd rather than folded into
+//     the predicate — unlike idx_utxos_reserved_at, which only the sweep uses —
+//     because Pin/Unpin look rows up BY their current pin state through this
+//     index, so pinned rows must stay in it and merely be filterable inside it.
+//     txid/vout are left out on purpose: only the sweep's outer expansion
+//     projects them, once per returned group rather than per pool row, and a
+//     32-byte txid per entry would spend the size win.
+//
+//     SQLite has no INCLUDE, so the same columns are trailing key columns
+//     there — plus one PostgreSQL does not need at all: spent_by. Both engines
+//     use spent_by only as the partial predicate, but only PostgreSQL
+//     DISCHARGES it, recognizing that the index's own WHERE already proves the
+//     query's "spent_by IS NULL" and dropping the term. SQLite matches the
+//     partial index and then re-evaluates the term anyway, so without the
+//     column in the index it reads the table row to check a condition that
+//     cannot be false — and the stale scan loses its covering property for
+//     nothing. The column is always NULL for every row in this index, so
+//     carrying it is nearly free. TestStaleScanIsIndexDriven asserts the
+//     resulting "USING COVERING INDEX" line; sweep_explain_test.go is the
+//     PostgreSQL guard, over 100k live holds against 150k spent ones.
 //
 // The in-memory reference implementation is [memstore]; the conformance suite
 // is [utxostoretest]. This package satisfies both.
