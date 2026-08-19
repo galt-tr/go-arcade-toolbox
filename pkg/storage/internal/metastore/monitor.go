@@ -247,27 +247,41 @@ func (r KnownTxRepo) FindUnsent(ctx context.Context, limit int) ([]KnownTx, erro
 }
 
 // FindResendable returns known txs that hold a stored raw tx, were never
-// broadcast (was_broadcast=0), and are re-drivable: the delayed queue (status
-// 'unsent') PLUS txs stranded pre-broadcast (status 'unprocessed') — e.g. a
-// broadcast the arcade circuit breaker short-circuited while open. Only rows
-// older than grace are returned, so a freshly-created 'unprocessed' tx whose
-// own ProcessAction is about to broadcast it is not stolen by the sweep.
-// Oldest first, up to limit. This is the SendWaiting sweep's work list; it
-// makes stranded transactions self-heal once arcade is reachable again.
+// broadcast (was_broadcast=0), and are re-drivable — oldest first, up to limit.
+// This is the SendWaiting sweep's work list; it makes stranded transactions
+// self-heal once arcade is reachable again. There are exactly three arms:
+//
+//   - status 'unsent' — the delayed queue. UNGRACED: these rows were parked
+//     deliberately for the sweep to send, so there is no owner to race.
+//   - status 'unprocessed', graced — a tx stranded before its broadcast ever
+//     started, e.g. one the arcade circuit breaker short-circuited while open.
+//     The grace is what stops the sweep stealing a freshly-created tx whose own
+//     ProcessAction is about to broadcast it.
+//   - status 'sending', graced — crash recovery. A row is only in 'sending'
+//     because [KnownTxRepo.ClaimForSend] put it there, so past the grace the
+//     claimant is presumed dead and the send is re-driven. A duplicate POST of
+//     identical bytes is idempotent-by-txid at arcade, which is what makes
+//     re-driving safe. The caller must take such a row with
+//     [KnownTxRepo.ReclaimStaleSend] before re-POSTing it: that CAS picks one
+//     winner among concurrent sweeps and re-stamps updated_at, which is what
+//     drops the row out of this arm for another full grace instead of
+//     re-selecting it every tick.
+//
+// [KnownTxStatusAborted] is structurally outside every arm — it is in none of
+// the three status predicates, at any age — which is the P0-3 fence: a wallet
+// transaction aborted before broadcast can never be re-POSTed by this sweep,
+// however long it sits.
 func (r KnownTxRepo) FindResendable(ctx context.Context, grace time.Duration, limit int) ([]KnownTx, error) {
 	cutoff := r.s.encTime(r.s.now().Add(-grace))
 	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
-	// The delayed queue ('unsent') sends promptly; the stranded set ('unprocessed')
-	// is gated by grace so a freshly-created tx whose own ProcessAction is about
-	// to broadcast it is not double-sent by the sweep.
 	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
 		"WHERE was_broadcast = ? AND raw_tx IS NOT NULL " +
-		"AND (status = ? OR (status = ? AND updated_at <= ?)) " +
+		"AND (status = ? OR (status IN (?, ?) AND updated_at <= ?)) " +
 		"ORDER BY created_at ASC, txid ASC" + clause)
 	args := append([]any{
 		r.s.boolVal(false),
 		string(wdk.ProvenTxStatusUnsent),
-		string(wdk.ProvenTxStatusUnprocessed), cutoff,
+		string(wdk.ProvenTxStatusUnprocessed), string(wdk.ProvenTxStatusSending), cutoff,
 	}, pageArgs...)
 	return r.queryList(ctx, q, args)
 }

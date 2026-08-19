@@ -28,6 +28,75 @@ const KnownTxStatusSuspectFailed wdk.ProvenTxReqStatus = "suspectFailed"
 // scan, so the reconciler never re-processes it.
 const KnownTxStatusStuck wdk.ProvenTxReqStatus = "stuck"
 
+// KnownTxStatusAborted is an arcade-specific ProvenTxReqStatus marking a known
+// tx whose wallet transaction was aborted BEFORE any broadcast evidence
+// existed. Two fences hold it here unconditionally:
+// [KnownTxRepo.FindResendable] never selects it, and [KnownTxRepo.ClaimForSend]
+// refuses to claim it.
+//
+// The third fence is an OBLIGATION ON CALLERS, not a property of this constant:
+// every requeue-shaped write must pass [KnownTxNeverRequeueStatuses] as its
+// skip set. Until that provider wiring lands, a re-drive can still resurrect an
+// aborted row — an unguarded Upsert or UpdateStatus will happily move it back
+// to 'unsent', from where the sweep would broadcast it.
+const KnownTxStatusAborted wdk.ProvenTxReqStatus = "aborted"
+
+// knownTxPreBroadcastStatuses are the statuses from which a known tx has
+// certainly not been handed to the network yet, and from which the one-row
+// arbiter ([KnownTxRepo.TransitionToAborted] and [KnownTxRepo.ClaimForSend])
+// may still move it. Both halves share this from-set exactly, which is what
+// makes them mutually exclusive.
+//
+// The two CAS TARGETS — 'aborted' and 'sending' — must stay OUTSIDE this set.
+// In particular, do not "simplify" it to [wdk.ProvenTxReqStatus.IsInFlight],
+// which contains 'sending': that would let an abort take a live send.
+//
+// It is exactly the pre-broadcast statuses this codebase writes; a new
+// pre-broadcast writer must extend this set, or its rows are silently neither
+// abortable nor claimable.
+var knownTxPreBroadcastStatuses = []wdk.ProvenTxReqStatus{
+	wdk.ProvenTxStatusUnsent,
+	wdk.ProvenTxStatusUnprocessed,
+	wdk.ProvenTxStatusNoSend,
+}
+
+// KnownTxNeverRequeueStatuses are the known-tx statuses from which a raw tx
+// must never be RE-QUEUED for broadcast: everything past the broadcast stage,
+// plus the fenced/terminal states. The direction is in the name, and it is the
+// whole contract — see the warning below before reaching for this set.
+//
+// It is derived from [wdk.ProvenTxReqBeyondBroadcastStageStatuses], so a future
+// beyond-broadcast status is fenced automatically.
+//
+// USE IT ONLY as the skip set of a BACKWARD transition, i.e. one whose target
+// status would put the bytes back on a broadcast work list ('unsent' or
+// 'unprocessed'): queueDelayed-style UpdateStatus calls and processNewTx's
+// Upsert, so a re-drive or a SendWith batch cannot resurrect an
+// aborted/suspect/terminal row into the delayed queue.
+//
+// NEVER use it as the guard of a FORWARD transition. It contains the very
+// statuses forward progress moves OFF, so it would block that progress and
+// then leave the row where the sweep finds it again. That is why 'sending' is
+// in the set: a re-drive must not regress a row a broadcaster is mid-POST on,
+// but guarding the FORWARD write with this set is the mirror-image bug — a
+// claimed send advances to unconfirmed when its 202/SEEN lands, and refusing
+// that advance would leave the row at 'sending' to be re-POSTed forever. A
+// claimant that genuinely died is recovered by [KnownTxRepo.FindResendable]'s
+// graced 'sending' arm plus [KnownTxRepo.ReclaimStaleSend] — a read-side sweep
+// and a clock re-stamp, never a status regression. The existing forward writers
+// (applyAcceptedBroadcast, applySeen, applySeenBatch) must keep passing
+// [wdk.ProvenTxReqBeyondBroadcastStageStatuses]; only the backward guard in
+// queueDelayed is a candidate for this set.
+var KnownTxNeverRequeueStatuses = append(
+	append([]wdk.ProvenTxReqStatus(nil), wdk.ProvenTxReqBeyondBroadcastStageStatuses...),
+	KnownTxStatusAborted,
+	KnownTxStatusSuspectFailed,
+	KnownTxStatusStuck,
+	wdk.ProvenTxStatusInvalid,
+	wdk.ProvenTxStatusDoubleSpend,
+	wdk.ProvenTxStatusSending,
+)
+
 // KnownTx is the storage-wide record for a transaction the wallet knows about,
 // keyed by txid. It merges the wdk ProvenTxReq processing state, the retained
 // rawtx / input-BEEF / proof material, and arcade-specific broadcast bookkeeping
@@ -499,6 +568,166 @@ func (r KnownTxRepo) TransitionSuspect(ctx context.Context, txid string, newStat
 	}
 	if !exists {
 		return fmt.Errorf("metastore: transition suspect: %s: %w", txid, ErrNotFound)
+	}
+	return ErrStatusUpdateSkipped
+}
+
+// TransitionToAborted is the ABORT half of the one-row broadcast arbiter: it
+// fences a known tx at [KnownTxStatusAborted], applying ONLY while the row is
+// still in one of the three pre-broadcast statuses (unsent / unprocessed /
+// nosend) AND its was_broadcast column is still false.
+//
+// Aborting a wallet transaction used never to touch known_txs at all, so an
+// aborted tx stayed fully broadcastable — [KnownTxRepo.FindResendable] keys on
+// known_txs alone, and would happily re-POST the raw bytes of a transaction the
+// wallet had already released the inputs of. That is the double-spend the audit
+// records as P0-3. Landing the abort on the SAME row the broadcaster claims,
+// with the SAME CAS, makes "aborted but still broadcastable" unrepresentable:
+// a claimed row refuses the abort, and an aborted row refuses the claim.
+//
+// Caller guidance — the two non-nil returns mean different things and must be
+// handled differently:
+//
+//   - [ErrStatusUpdateSkipped] means NOT ABORTABLE: the row is claimed,
+//     broadcast, or already terminal. The abort must FAIL and its transaction
+//     roll back; the caller must NOT re-read the status and treat "already
+//     aborted" as success. That read is not atomic with this CAS — between the
+//     two statements the row can be claimed and the bytes sent, and the caller
+//     would then release inputs for a live transaction, which is the very
+//     double-spend this fence exists to prevent. Losing the arbiter is a
+//     legitimate outcome: the send won, so the abort did not happen.
+//   - [ErrNotFound] is the NORMAL unsigned case, not an error: a transaction
+//     aborted before it was ever signed has no known_txs row at all, so there
+//     are no bytes to fence. The caller proceeds with the rest of the abort.
+//
+// Like [TransitionSuspect], the positive CAS excludes its own target, so
+// re-aborting an already-aborted row reports a skip rather than a second apply.
+func (r KnownTxRepo) TransitionToAborted(ctx context.Context, txid string) error {
+	return r.casFromPreBroadcast(ctx, txid, KnownTxStatusAborted, "transition to aborted")
+}
+
+// ClaimForSend is the SEND half of the same arbiter: it claims a known tx for a
+// broadcast attempt by moving it to [wdk.ProvenTxStatusSending] under exactly
+// the CAS [TransitionToAborted] uses — from {unsent, unprocessed, nosend} and
+// only while was_broadcast is false. Abort and broadcast therefore contend on
+// ONE row, and exactly one of them can win: a claimed row refuses
+// TransitionToAborted, and an aborted row refuses ClaimForSend.
+//
+// 'sending' was previously written nowhere in production (it appeared only as a
+// poll filter), so the claim gives it a precise meaning: a broadcast attempt is
+// in flight for these bytes. A claimant that dies mid-POST leaves the row in
+// 'sending', where [KnownTxRepo.FindResendable]'s graced arm picks it up once
+// the grace has elapsed; the recovery path then takes the row with
+// [KnownTxRepo.ReclaimStaleSend] rather than this method, because the row is
+// already in the fenced state and only needs its clock re-stamped.
+//
+// Returns nil on a successful claim, [ErrStatusUpdateSkipped] when the row
+// exists but is aborted / already claimed / past the broadcast stage, and
+// [ErrNotFound] when the txid is unknown.
+func (r KnownTxRepo) ClaimForSend(ctx context.Context, txid string) error {
+	return r.casFromPreBroadcast(ctx, txid, wdk.ProvenTxStatusSending, "claim for send")
+}
+
+// ReclaimStaleSend re-claims a stranded broadcast attempt: a row still at
+// [wdk.ProvenTxStatusSending] whose updated_at has aged past grace. It takes
+// the same grace [KnownTxRepo.FindResendable] does and derives the cutoff from
+// the SAME store clock, so the selector and the taker cannot disagree about
+// what "stranded" means — pass both the one configured resend grace. The CAS is
+// `status='sending' AND was_broadcast=false AND updated_at <= now-grace`, and
+// it writes only the clock: the status stays 'sending', which is already the
+// fenced state the original claimant put the row in.
+//
+// It is the recovery-path counterpart to [KnownTxRepo.ClaimForSend], and it
+// buys two things. Exactly-one-winner: two sweep instances that both see the
+// same stranded row race this CAS, and only one re-drives it. And a full grace
+// of backoff: the re-stamp pushes updated_at forward, so the row drops out of
+// FindResendable's graced 'sending' arm for another whole grace period instead
+// of being re-POSTed on every tick while it stays stuck.
+//
+// The presumption of death is a PRESUMPTION: a hung claimant that later wakes
+// can still write alongside the re-driver, because nothing revokes its right to
+// proceed. That is tolerable only because the network side is
+// idempotent-by-txid — both POST identical bytes — and because the status they
+// contend over is the same 'sending'. A real fencing token (a claim epoch the
+// stale claimant would fail to match) is deliberately out of scope here.
+//
+// [ErrStatusUpdateSkipped] means the row exists but was not stale-and-sending —
+// it is fresh (another instance just re-drove it, or the original send is still
+// live), or it has already moved on; [ErrNotFound] means the txid is unknown.
+// The abort fence is unaffected: a 'sending' row still refuses
+// [KnownTxRepo.TransitionToAborted] at any age, so re-claiming never opens a
+// window in which the bytes could be both aborted and in flight.
+func (r KnownTxRepo) ReclaimStaleSend(ctx context.Context, txid string, grace time.Duration) error {
+	raw, err := encTxID(txid)
+	if err != nil {
+		return err
+	}
+	now := r.s.now()
+	q := r.s.rebind("UPDATE known_txs SET updated_at = ? WHERE txid = ? AND status = ? " +
+		"AND was_broadcast = ? AND updated_at <= ?")
+	res, err := r.s.execer(ctx).ExecContext(ctx, q,
+		r.s.encTime(now), raw, string(wdk.ProvenTxStatusSending),
+		r.s.boolVal(false), r.s.encTime(now.Add(-grace)))
+	if err != nil {
+		return fmt.Errorf("metastore: reclaim stale send: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	exists, err := r.existsByTxID(ctx, raw)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("metastore: reclaim stale send: %s: %w", txid, ErrNotFound)
+	}
+	return ErrStatusUpdateSkipped
+}
+
+// casFromPreBroadcast is the shared positive CAS behind the abort/claim
+// arbiter: it moves txid to newStatus only from a pre-broadcast status with no
+// broadcast evidence, following [TransitionSuspect]'s zero-rows disambiguation
+// (row missing ⇒ ErrNotFound, row present ⇒ ErrStatusUpdateSkipped).
+//
+// newStatus must NOT be broadcast evidence: unlike [KnownTxRepo.UpdateStatus]
+// this helper does not carry the sticky was_broadcast write, so a
+// broadcast-evidence status routed through here would land with was_broadcast
+// still false and stay eligible for the resend sweep. Both current targets
+// ('aborted', 'sending') are correctly non-evidence.
+func (r KnownTxRepo) casFromPreBroadcast(ctx context.Context, txid string, newStatus wdk.ProvenTxReqStatus, op string) error {
+	raw, err := encTxID(txid)
+	if err != nil {
+		return err
+	}
+	args := []any{string(newStatus), r.s.encTime(r.s.now()), raw}
+	for _, st := range knownTxPreBroadcastStatuses {
+		args = append(args, string(st))
+	}
+	args = append(args, r.s.boolVal(false))
+	q := r.s.rebind("UPDATE known_txs SET status = ?, updated_at = ? WHERE txid = ? " +
+		"AND status IN (" + inPlaceholders(len(knownTxPreBroadcastStatuses)) + ") " +
+		"AND was_broadcast = ?")
+	res, err := r.s.execer(ctx).ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("metastore: %s: %w", op, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	exists, err := r.existsByTxID(ctx, raw)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("metastore: %s: %s: %w", op, txid, ErrNotFound)
 	}
 	return ErrStatusUpdateSkipped
 }
