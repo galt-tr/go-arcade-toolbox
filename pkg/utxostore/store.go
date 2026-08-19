@@ -77,22 +77,34 @@ type Store interface {
 	// frozen), mark them reserved by the given token, and return copies.
 	// reservation must be non-empty and s fully specified (UserID > 0,
 	// Basket != "", valid Tier); violations are plain errors.
+	//
+	// Ties (several claimable coins of the SAME Satoshis) break
+	// deterministically, but NOT in the same direction for all three shapes:
+	// insertion order (oldest first) for ClaimSmallestSufficient and
+	// ClaimExact; REVERSE insertion order (newest first) for
+	// ClaimLargestInsufficient — the order a DESCENDING index walk yields, so
+	// the hot path stays sort-free. The consequence on a pool of identical
+	// coins is that ClaimLargestInsufficient drains it LIFO; that is accepted,
+	// since equal coins are equally spendable. Approximate backends (see
+	// utxostoretest's exact-selection option) are held to none of this.
 
 	// ClaimSmallestSufficient reserves the claimable coin with the smallest
 	// Satoshis >= minSats within s. Returns (nil, nil) when none qualifies.
 	// Selection SHOULD be the true minimum; approximate backends may return
 	// any sufficient claimable coin (see utxostoretest's exact-selection
-	// option). Ties break deterministically (insertion order).
+	// option). Ties break by insertion order (oldest first).
 	ClaimSmallestSufficient(ctx context.Context, s Scope, reservation string, minSats uint64) (*UTXO, error)
 
 	// ClaimLargestInsufficient reserves up to limit claimable coins with
-	// Satoshis < capSats within s, largest first. Returns fewer (possibly
-	// none) when the pool is short; that is not an error. limit <= 0 returns
+	// Satoshis < capSats within s, largest first, ties broken NEWEST first
+	// (reverse insertion order — see above). Returns fewer (possibly none)
+	// when the pool is short; that is not an error. limit <= 0 returns
 	// (nil, nil).
 	ClaimLargestInsufficient(ctx context.Context, s Scope, reservation string, capSats uint64, limit int) ([]*UTXO, error)
 
 	// ClaimExact reserves up to count claimable coins with Satoshis ==
-	// denomination within s. len(result) < count signals pool underflow and
+	// denomination within s, in insertion order (oldest first — every row is
+	// a tie by construction). len(result) < count signals pool underflow and
 	// is NOT an error. count <= 0 returns (nil, nil).
 	ClaimExact(ctx context.Context, s Scope, reservation string, denomination uint64, count int) ([]*UTXO, error)
 

@@ -22,6 +22,14 @@ import (
 // fit FOR UPDATE SKIP LOCKED and the outer UPDATE reserves it in the same round
 // trip. The claim's WHERE and ORDER BY mirror the index's columns so it is a
 // pure ordered index walk with no sort.
+//
+// That is also why the three statements do not break satoshi ties the same
+// way: seq ASC for the two ascending walks, seq DESC for the descending one.
+// A descending walk that asked for seq ASC could not be served by
+// idx_utxos_claim without a sort node — on an equal-value fuel pool that is a
+// sort of the WHOLE pool per claim — so the tie direction follows the index,
+// and [utxostore.Store] documents it that way (memstore matches this, not the
+// reverse).
 const (
 	claimSmallestSufficientPG = `WITH candidate AS (
 	SELECT txid, vout FROM utxos
@@ -52,8 +60,10 @@ RETURNING ` + utxoColsU
 )
 
 // claimedRow pairs a claimed coin with its seq, so the returned slice can be
-// ordered to match the memstore reference (largest-first / insertion-order)
-// even though RETURNING itself is unordered.
+// restored to the order the candidate CTE selected in — RETURNING itself is
+// unordered — and thereby match the ordering [utxostore.Store] documents:
+// largest-first with NEWEST-first ties for ClaimLargestInsufficient,
+// insertion order for the other two.
 type claimedRow struct {
 	u   *utxostore.UTXO
 	seq int64
@@ -162,7 +172,8 @@ func (s *Store) ClaimSmallestSufficient(ctx context.Context, sc utxostore.Scope,
 }
 
 // ClaimLargestInsufficient implements [utxostore.Store]: up to limit claimable
-// coins with Satoshis < capSats, largest first (ties by insertion order).
+// coins with Satoshis < capSats, largest first, ties broken NEWEST first
+// (reverse insertion order) — the direction the descending index walk yields.
 func (s *Store) ClaimLargestInsufficient(ctx context.Context, sc utxostore.Scope, reservation string, capSats uint64, limit int) ([]*utxostore.UTXO, error) {
 	if s.isClosed() {
 		return nil, errClosed
@@ -197,7 +208,8 @@ func (s *Store) ClaimLargestInsufficient(ctx context.Context, sc utxostore.Scope
 	if err != nil {
 		return nil, err
 	}
-	// RETURNING is unordered; restore largest-first (ties by insertion order).
+	// RETURNING is unordered; restore what the CTE selected — largest first,
+	// ties NEWEST first, mirroring the ORDER BY satoshis DESC, seq DESC above.
 	sort.Slice(claimed, func(i, j int) bool {
 		if claimed[i].u.Satoshis != claimed[j].u.Satoshis {
 			return claimed[i].u.Satoshis > claimed[j].u.Satoshis

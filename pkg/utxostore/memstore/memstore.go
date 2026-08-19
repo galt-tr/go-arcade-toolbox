@@ -256,7 +256,8 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 
 // ClaimLargestInsufficient implements [utxostore.Store]: up to limit
 // claimable coins with Satoshis < capSats, largest first, ties broken by
-// insertion order.
+// REVERSE insertion order (newest first) — the opposite direction from the
+// other two claim shapes. See the comparator below for why.
 func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, reservation string, capSats uint64, limit int) ([]*utxostore.UTXO, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -280,7 +281,22 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 		if c := cmp.Compare(b.utxo.Satoshis, a.utxo.Satoshis); c != 0 {
 			return c // largest first
 		}
-		return cmp.Compare(a.seq, b.seq)
+		// Ties: NEWEST first, unlike ClaimSmallestSufficient/ClaimExact.
+		// This shape is the one that scans DESCENDING, and a descending walk
+		// of a (satoshis, seq) index yields the newest of an equal-value run
+		// first. sqlstore is the reference here rather than the other way
+		// round: asking SQL for (satoshis DESC, seq ASC) cannot be served by
+		// the partial claim index without a sort node, which would cost the
+		// 1000-TPS hot path an O(pool) sort on exactly the equal-value fuel
+		// pool this ordering matters for. So the reference implementation
+		// matches the index instead, and the interface documents it.
+		//
+		// Accepted tradeoff: on a pool of identical coins the tie-break is
+		// LIFO, so the oldest coins sit at the bottom until the pool drains
+		// below them. Cosmetic — every coin is equally spendable — and the
+		// FIFO shapes (ClaimSmallestSufficient, ClaimExact) still drain from
+		// the front.
+		return cmp.Compare(b.seq, a.seq)
 	})
 	candidates = candidates[:min(limit, len(candidates))]
 

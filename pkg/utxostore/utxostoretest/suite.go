@@ -97,6 +97,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"ClaimSmallestSufficient", std(s.claimSmallestSufficient)},
 		{"ClaimLargestInsufficient", std(s.claimLargestInsufficient)},
 		{"ClaimExact", std(s.claimExact)},
+		{"ClaimTieBreak", std(s.claimTieBreak)},
 		{"ClaimScopeIsolation", std(s.claimScopeIsolation)},
 		{"ClaimExclusivityConcurrent", std(s.claimExclusivityConcurrent)},
 		{"ReserveOutpointsExclusivity", std(s.reserveOutpointsExclusivity)},
@@ -463,6 +464,77 @@ func (s *suite) claimExact(t *testing.T, store utxostore.Store) {
 	got, err = store.ClaimExact(ctx, sc, "res-3", 7, 3)
 	require.NoError(t, err)
 	require.Empty(t, got)
+}
+
+// claimTieBreak pins the tie-break DIRECTION every exact backend must agree
+// on when several claimable coins carry the same satoshi value — the common
+// case for a fuel pool of equal-denomination coins, where the value comparator
+// decides nothing and the tie-break decides everything.
+//
+// The directions are deliberately NOT uniform, and that asymmetry is the
+// spec:
+//
+//   - ClaimSmallestSufficient and ClaimExact break ties OLDEST first
+//     (insertion order), so an equal-value pool drains FIFO.
+//   - ClaimLargestInsufficient breaks ties NEWEST first, because its scan runs
+//     the index backwards (satoshis DESC) and a descending walk yields the
+//     newest of an equal-value run first. Demanding oldest-first here would
+//     force a sort node on top of the claim index on the 1000-TPS hot path.
+//
+// Gated on exact selection: approximate backends (bucket-based, e.g.
+// Aerospike) may return any coin satisfying the predicate, so no tie order is
+// defined for them.
+func (s *suite) claimTieBreak(t *testing.T, store utxostore.Store) {
+	if !s.cfg.exactSelection {
+		t.Skip("requires WithExactSelection: tie order is undefined for approximate selection")
+	}
+	ctx := context.Background()
+
+	const tieSats = 7_000
+
+	// Four equal-value coins minted a, b, c, d — one transaction at a time, so
+	// insertion order is unambiguous on every backend (a batch mint would leave
+	// the intra-batch order to the engine). Each claim shape gets its OWN scope
+	// so it sees all four coins unclaimed; identity is the outpoint, since the
+	// satoshi values are indistinguishable by construction.
+	mintTie := func(t *testing.T, basketName string) (utxostore.Scope, []utxostore.Outpoint) {
+		t.Helper()
+		ops := make([]utxostore.Outpoint, 0, 4)
+		for _, coin := range []string{"a", "b", "c", "d"} {
+			minted := MintTx(t, store, basketName+"-"+coin, user, basketName, utxostore.TierMined, tieSats)
+			ops = append(ops, minted[0])
+		}
+		return utxostore.Scope{UserID: user, Basket: basketName, Tier: utxostore.TierMined}, ops
+	}
+
+	// ClaimExact: oldest first, so two coins are a then b.
+	sc, ops := mintTie(t, "tie-exact")
+	exact, err := store.ClaimExact(ctx, sc, "res-exact", tieSats, 2)
+	require.NoError(t, err)
+	for _, u := range exact {
+		requireClaimed(t, u, sc, "res-exact")
+	}
+	require.Equal(t, []utxostore.Outpoint{ops[0], ops[1]}, opsOf(exact),
+		"ClaimExact must break ties oldest-first (insertion order)")
+
+	// ClaimSmallestSufficient: oldest first, so the one coin is a.
+	sc, ops = mintTie(t, "tie-smallest")
+	smallest, err := store.ClaimSmallestSufficient(ctx, sc, "res-smallest", tieSats)
+	require.NoError(t, err)
+	require.NotNil(t, smallest)
+	requireClaimed(t, smallest, sc, "res-smallest")
+	require.Equal(t, ops[0], smallest.Outpoint,
+		"ClaimSmallestSufficient must break ties oldest-first (insertion order)")
+
+	// ClaimLargestInsufficient: NEWEST first, so two coins are d then c.
+	sc, ops = mintTie(t, "tie-largest")
+	largest, err := store.ClaimLargestInsufficient(ctx, sc, "res-largest", tieSats+1, 2)
+	require.NoError(t, err)
+	for _, u := range largest {
+		requireClaimed(t, u, sc, "res-largest")
+	}
+	require.Equal(t, []utxostore.Outpoint{ops[3], ops[2]}, opsOf(largest),
+		"ClaimLargestInsufficient must break ties newest-first (reverse insertion order)")
 }
 
 func (s *suite) claimScopeIsolation(t *testing.T, store utxostore.Store) {
@@ -2138,6 +2210,16 @@ func batchItemErrors(err error) []error {
 	}
 	walk(err)
 	return out
+}
+
+// opsOf projects the outpoints of claimed coins, in order — the identity to
+// assert on when the satoshi values cannot tell the coins apart.
+func opsOf(coins []*utxostore.UTXO) []utxostore.Outpoint {
+	ops := make([]utxostore.Outpoint, len(coins))
+	for i, u := range coins {
+		ops[i] = u.Outpoint
+	}
+	return ops
 }
 
 // satsOf projects the satoshi values of claimed coins, in order.
