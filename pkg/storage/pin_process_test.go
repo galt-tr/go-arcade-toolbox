@@ -162,11 +162,13 @@ func TestProcessNewTx_SameTxIDReplayIsIdempotent(t *testing.T) {
 // mid-POST has been fenced deliberately; a re-drive that silently reset it to
 // 'unsent' would hand those bytes straight back to the send sweep.
 //
-// Its second half is the only executable proof of the Mode B orphan-pin
-// backstop. The refused action rolls its metadata back but NOT its pin — the
-// utxostore is a separate store here and already committed — which is exactly
-// the fail-safe asymmetry processNewTx documents. What makes that acceptable is
-// that the orphan is reclaimable, and AbortAbandoned is what reclaims it.
+// Its second half is the executable proof of the Mode B orphan-pin backstop.
+// The refused action rolls its metadata back but NOT its pin — the utxostore is
+// a separate store here and already committed — which is exactly the fail-safe
+// asymmetry processNewTx documents. What makes that acceptable is that the
+// orphan is reclaimable, and AbortAbandoned is what reclaims it. (The
+// stale-reservation sweep reclaims the same shape on a longer clock; see
+// TestSweepStaleReservations_ReclaimsAnOrphanPin.)
 func TestProcessNewTx_RefusesToResurrectAFencedKnownTx(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
@@ -175,13 +177,7 @@ func TestProcessNewTx_RefusesToResurrectAFencedKnownTx(t *testing.T) {
 	res, signed, coin := h.createAndSign(t, 0x34, 100_000, 40_000)
 	txid := signed.TxID().String()
 
-	// The known tx is fenced before the (late) signer arrives.
-	require.NoError(t, h.meta.KnownTx().Upsert(ctx, metastore.KnownTx{
-		TxID:   txid,
-		Status: metastore.KnownTxStatusAborted,
-	}))
-
-	_, err := h.processDelayed(t, res, signed)
+	err := h.strandAnOrphanPin(t, res, signed)
 	require.Error(t, err, "a fenced known tx must not be re-queued for broadcast")
 	assert.ErrorIs(t, err, metastore.ErrStatusUpdateSkipped)
 	assert.Contains(t, err.Error(), txid)
@@ -217,6 +213,68 @@ func TestProcessNewTx_RefusesToResurrectAFencedKnownTx(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, u.Pinned, "AbortAbandoned reclaimed the orphan pin")
 	assert.Equal(t, "", u.ReservedBy, "and gave the coin back")
+
+	txRow, found, err = h.meta.Transactions().FindByReference(ctx, h.userID, res.Reference)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, wdk.TxStatusAborted, txRow.Status,
+		"and killed the reference, so a late signer cannot re-take the coin it just freed")
+}
+
+// TestSweepStaleReservations_ReclaimsAnOrphanPin is the same Mode B orphan seen
+// by the OTHER janitor. It matters separately because the two reach it from
+// opposite directions: AbortAbandoned scans transactions by age and would find
+// this row whether or not it held a coin, while the sweep scans COINS — and the
+// coin here is pinned, so the sweep only sees it at all through the
+// pinned-inclusive listing.
+//
+// That the sweep is willing to abort a pinned 'unsigned' row is not a hole in
+// the pin: pinned-and-unsigned is unrepresentable except as this orphan. The
+// pin is written inside processNewTx, and the metadata half that follows it is
+// atomic — so either it committed (and the status is no longer 'unsigned') or
+// it rolled back (and no broadcastable bytes exist anywhere). There is nothing
+// for the fence to lose.
+func TestSweepStaleReservations_ReclaimsAnOrphanPin(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	require.False(t, h.p.ModeA(), "the orphan pin only exists for split stores")
+
+	res, signed, coin := h.createAndSign(t, 0x37, 100_000, 40_000)
+	require.Error(t, h.strandAnOrphanPin(t, res, signed))
+
+	u, err := h.utxo.Get(ctx, coin)
+	require.NoError(t, err)
+	require.True(t, u.Pinned)
+
+	stale, err := h.utxo.FindStaleReservations(ctx, time.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, stale, "the orphan is pinned, so the ordinary listing cannot reach it")
+
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	u, err = h.utxo.Get(ctx, coin)
+	require.NoError(t, err)
+	assert.False(t, u.Pinned, "the sweep reclaimed the orphan pin")
+	assert.Equal(t, "", u.ReservedBy, "and gave the coin back")
+
+	txRow, found, err := h.meta.Transactions().FindByReference(ctx, h.userID, res.Reference)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, wdk.TxStatusAborted, txRow.Status, "fence first, release second")
+}
+
+// strandAnOrphanPin drives the one flow that leaves a Mode B pin without its
+// metadata: fence the known tx first, then process, so the pin commits and the
+// metadata half it belongs to rolls back. It returns processDelayed's error,
+// which the caller must assert on.
+func (h *harness) strandAnOrphanPin(t *testing.T, res *wdk.StorageCreateActionResult, signed *transaction.Transaction) error {
+	t.Helper()
+	require.NoError(t, h.meta.KnownTx().Upsert(context.Background(), metastore.KnownTx{
+		TxID:   signed.TxID().String(),
+		Status: metastore.KnownTxStatusAborted,
+	}))
+	_, err := h.processDelayed(t, res, signed)
+	return err
 }
 
 // TestProcessAction_AcceptedBroadcastClearsThePin: the pin is a pre-broadcast

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -222,28 +223,37 @@ func TestAbortViaOutbox_FenceSurvivesAFailedUtxoHalf(t *testing.T) {
 	assert.Zero(t, rep.Failed)
 }
 
-// TestAbortViaOutbox_ParkedReleaseIsObservable pins the known residual of the
-// two-phase abort, and the gauge that makes it visible.
+// TestAbortViaOutbox_ParkedReleaseIsHealedByTheSweep pins the known residual of
+// the two-phase abort, the gauge that makes it visible, and — the C4 half — the
+// janitor that finally clears it.
 //
 // The pending outbox row heals a release that failed once. It does not heal one
 // that fails MaxOutboxAttempts times — roughly ten minutes of continuous
 // utxostore unavailability at the drain's cadence — because the row then drops
 // out of FetchPending for good. The transaction stays safely fenced, so this is
-// never a double spend, but the coins stay pinned and reserved with no
-// automated healer (the stale sweep excludes pinned reservations; re-aborting
-// loses the CAS). C4's fence-first sweep is what will reclaim them.
+// never a double spend, but the coins are left PINNED and reserved: invisible
+// to the ordinary stale sweep by design (a pin is what stops a janitor freeing
+// an in-flight send's inputs), and un-abortable a second time because the
+// transactions CAS refuses an already-aborted row. Nothing reclaimed them.
 //
-// Until then the only defense is that an operator can SEE it, which is what
-// ParkedTotal is for: every per-pass counter reads zero once a row has parked,
-// so a standing backlog was previously indistinguishable from an empty outbox.
-func TestAbortViaOutbox_ParkedReleaseIsObservable(t *testing.T) {
+// The fence-first sweep does, through the one listing that sees pinned rows.
+// That is safe HERE and nowhere else: the pin is a proxy for "these bytes might
+// still go out", and this transaction's fence already proves they cannot.
+//
+// ParkedTotal remains the operator's view of the interval between the two: every
+// per-pass counter reads zero once a row has parked, so a standing backlog would
+// otherwise be indistinguishable from an empty outbox.
+func TestAbortViaOutbox_ParkedReleaseIsHealedByTheSweep(t *testing.T) {
 	ctx := context.Background()
 	h, flaky := newFlakyUTXOHarness(t)
 	res, signed, coin := h.createAndSign(t, 0x55, 100_000, 40_000)
 	_, err := h.processDelayed(t, res, signed)
 	require.NoError(t, err)
 
-	flaky.failRelease.Store(true)
+	// The whole utxostore is down, so the abort's unpin fails along with its
+	// release — which is what leaves the residue PINNED rather than merely
+	// reserved.
+	flaky.unavailable()
 	_, err = h.p.AbortAction(ctx, h.auth, wdk.AbortActionArgs{
 		Reference: primitives.Base64String(res.Reference),
 	})
@@ -268,12 +278,88 @@ func TestAbortViaOutbox_ParkedReleaseIsObservable(t *testing.T) {
 	assert.Zero(t, rep.Drained, "while every per-pass counter reads empty")
 	assert.Zero(t, rep.Parked)
 
-	// The residual itself: fenced, but the coins are still held.
+	// The residual itself: fenced, but the coins are still held — and pinned.
 	assert.Equal(t, metastore.KnownTxStatusAborted, h.knownTx(t, signed.TxID().String()).Status)
 	u, err := h.utxo.Get(ctx, coin)
 	require.NoError(t, err)
-	assert.Equal(t, res.Reference, u.ReservedBy,
-		"a parked release strands the coins — safe, but stuck until C4's sweep")
+	require.Equal(t, res.Reference, u.ReservedBy, "a parked release strands the coins")
+	require.True(t, u.Pinned, "and leaves them pinned, which is what hides them from every janitor")
+
+	// The store comes back. The intent is still gone — nothing re-enqueues it —
+	// so recovery has to come from the sweep, and the ORDINARY listing cannot
+	// even see the work.
+	flaky.available()
+	stale, err := h.utxo.FindStaleReservations(ctx, time.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, stale, "the pinned residue is invisible to the ordinary stale listing")
+	inclusive, err := h.utxo.FindStaleReservationsIncludingPinned(ctx, time.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, inclusive, 1, "only the pinned-inclusive listing surfaces it")
+	require.Equal(t, res.Reference, inclusive[0].Reservation)
+
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	u, err = h.utxo.Get(ctx, coin)
+	require.NoError(t, err)
+	assert.False(t, u.Pinned, "the sweep lifted the pin of an already-fenced transaction")
+	assert.Equal(t, "", u.ReservedBy, "and gave the coin back")
+
+	parkedN, err = h.meta.Outbox().CountParked(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, parkedN,
+		"the healed intent must be retired, or parked_total alerts on funds that came back")
+
+	// Claimable in practice, not merely unreserved.
+	second, err := h.p.CreateAction(ctx, h.auth, paymentArgs(40_000))
+	require.NoError(t, err)
+	require.NotEmpty(t, second.Inputs)
+	assert.Equal(t, coin.TxID.String(), second.Inputs[0].SourceTxID,
+		"the healed coin funds a new action")
+}
+
+// TestSweepStaleReservations_WillNotCancelAQueuedDelayedSend is the limit on
+// how far the fence-first sweep may go, and it is the reason the sweep's
+// abortable set is narrower than the one AbortAction accepts.
+//
+// A delayed transaction sits at 'unprocessed' with its bytes stored, its inputs
+// pinned, and SendWaiting owning the send. That status IS abortable — a user may
+// call AbortAction on their own delayed payment — but a janitor doing the same
+// thing on a timer is a payment canceled because arcade was slow or the circuit
+// breaker was open for fifteen minutes. The pinned-inclusive listing means the
+// sweep can now SEE these reservations, so the refusal has to be a decision
+// rather than a side effect of the query.
+//
+// The assertion is that the send still happens afterwards: the coins are held,
+// the fence is not set, and the sweep's next tick finds a broadcast instead of a
+// corpse.
+func TestSweepStaleReservations_WillNotCancelAQueuedDelayedSend(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	res, signed, coin := h.createAndSign(t, 0x56, 100_000, 40_000)
+	txid := signed.TxID().String()
+
+	_, err := h.processDelayed(t, res, signed)
+	require.NoError(t, err)
+	u, err := h.utxo.Get(ctx, coin)
+	require.NoError(t, err)
+	require.True(t, u.Pinned, "a stored delayed transaction pins its inputs")
+
+	// Aged far past any reservation TTL, and visible to the sweep's listing.
+	inclusive, err := h.utxo.FindStaleReservationsIncludingPinned(ctx, time.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, inclusive, 1, "the sweep's listing does surface it — refusing is a choice, not luck")
+
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	u, err = h.utxo.Get(ctx, coin)
+	require.NoError(t, err)
+	assert.True(t, u.Pinned, "the sweep must not unpin a transaction SendWaiting still owns")
+	assert.Equal(t, res.Reference, u.ReservedBy, "nor hand its inputs back")
+	assert.Equal(t, wdk.ProvenTxStatusUnsent, h.knownTx(t, txid).Status, "and must not fence its bytes")
+
+	// The payment the janitor did not cancel goes out on the next tick.
+	require.NoError(t, h.p.SendWaitingTransactions(ctx, 100))
+	assert.Equal(t, 1, h.oracle.calls, "the delayed send survived the sweep and was broadcast")
 }
 
 // TestAbortViaOutbox_UnsignedEnqueuesOnlyTheRelease covers the ErrNotFound arm
@@ -349,13 +435,23 @@ func (h *harness) pendingOutbox(t *testing.T) []metastore.OutboxEntry {
 	return rows
 }
 
-// flakyUTXO wraps a utxostore and can be told to refuse ReleaseReservation, so
-// a test can drive the crash-consistency half of the Mode B abort without a
-// real crash. Embedding the INTERFACE (not the concrete memstore) also keeps
-// the provider out of Mode A, which is what the outbox path requires.
+// flakyUTXO wraps a utxostore and can be told to refuse the two writes an
+// abort's utxo half makes, so a test can drive the crash-consistency half of
+// the Mode B abort without a real crash. Embedding the INTERFACE (not the
+// concrete memstore) also keeps the provider out of Mode A, which is what the
+// outbox path requires.
+//
+// The two switches are separate because they produce DIFFERENT residues, and
+// the difference is the whole subject of the parked-row tests. Failing the
+// release alone leaves coins reserved-but-UNPINNED (the unpin got through), a
+// state the ordinary stale sweep can still see. A store that is properly
+// unavailable fails both, and the residue is then pinned AND reserved — which
+// no ordinary sweep can see at all, and which is what
+// [Provider.SweepStaleReservations]' aborted arm exists to heal.
 type flakyUTXO struct {
 	utxostore.Store
 	failRelease atomic.Bool
+	failUnpin   atomic.Bool
 }
 
 func (f *flakyUTXO) ReleaseReservation(ctx context.Context, userID int64, reservation string) (int, error) {
@@ -363,6 +459,26 @@ func (f *flakyUTXO) ReleaseReservation(ctx context.Context, userID int64, reserv
 		return 0, errors.New("utxostore unavailable")
 	}
 	return f.Store.ReleaseReservation(ctx, userID, reservation)
+}
+
+func (f *flakyUTXO) Unpin(ctx context.Context, userID int64, reservation string) (int, error) {
+	if f.failUnpin.Load() {
+		return 0, errors.New("utxostore unavailable")
+	}
+	return f.Store.Unpin(ctx, userID, reservation)
+}
+
+// unavailable / available toggle the whole utxo half at once, which is the
+// realistic shape: an outbox row parks after ~ten minutes of a store being
+// down, not after ten selective failures of one method.
+func (f *flakyUTXO) unavailable() {
+	f.failUnpin.Store(true)
+	f.failRelease.Store(true)
+}
+
+func (f *flakyUTXO) available() {
+	f.failUnpin.Store(false)
+	f.failRelease.Store(false)
 }
 
 // newFlakyUTXOHarness is [newHarness] with the utxostore wrapped in

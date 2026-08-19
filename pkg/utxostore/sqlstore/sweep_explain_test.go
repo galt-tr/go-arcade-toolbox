@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +94,23 @@ func TestSweepUsesReservedIndex(t *testing.T) {
 				"(reserved_at/seq/pinned are INCLUDEd for that); nodes seen: %v", plan.nodes)
 	})
 
+	// The pinned-INCLUSIVE twin the fence-first sweep reads (C4). It is the
+	// same statement minus the pin filter, planned separately because "same
+	// statement minus a filter" is exactly the kind of change that silently
+	// loses an index: pinned is an INCLUDEd column, so a plan that stopped
+	// being index-only would mean the aggregate had started visiting the heap
+	// for columns it no longer even reads.
+	t.Run("StaleReservationsIncludingPinned", func(t *testing.T) {
+		plan := explainJSON(t, s, sqlstore.StaleReservationsPinnedPGSQL, cutoff, 10)
+		t.Logf("pinned-inclusive sweep plan:\n%s", plan.raw)
+
+		require.Contains(t, plan.indexes, "idx_utxos_reserved",
+			"the inclusive aggregate must resolve through idx_utxos_reserved too; node types seen: %v", plan.nodeTypes)
+		requireNoSeqScan(t, plan, "the inclusive sweep must not scan the utxo pool once per tick")
+		require.True(t, plan.hasNode("Index Only Scan", "idx_utxos_reserved"),
+			"dropping the pin filter must not cost the aggregate its index-only scan; nodes seen: %v", plan.nodes)
+	})
+
 	t.Run("ReleaseReservation", func(t *testing.T) {
 		plan := explainJSON(t, s, sqlstore.ReleaseReservationPGSQL, sweepUserID, sweepToken(0))
 		t.Logf("release plan:\n%s", plan.raw)
@@ -124,6 +142,22 @@ func TestSweepUsesReservedIndex(t *testing.T) {
 			require.NotContains(t, ref.Reservation, "pin-", "a pinned hold is never swept")
 			require.NotContains(t, ref.Reservation, "spent-", "a spent row's provenance token is never swept")
 		}
+
+		// The inclusive twin sees exactly what the sweep hides. Pinned holds are
+		// dated at baseTime like sweep-000 and sort behind it on min_seq, so a
+		// page of five reaches them.
+		refs, ferr = s.FindStaleReservationsIncludingPinned(ctx, cutoff, 5)
+		require.NoError(t, ferr)
+		require.Len(t, refs, 5)
+		var pinned int
+		for _, ref := range refs {
+			if strings.HasPrefix(ref.Reservation, "pin-") {
+				pinned++
+			}
+			require.NotContains(t, ref.Reservation, "spent-",
+				"including pinned rows must not resurrect spent provenance tokens")
+		}
+		require.NotZero(t, pinned, "the inclusive listing must surface the holds the sweep hides")
 
 		released, rerr := s.ReleaseReservation(ctx, sweepUserID, sweepToken(0))
 		require.NoError(t, rerr)

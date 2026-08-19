@@ -152,7 +152,7 @@ ClaimSmallestSufficient, ClaimLargestInsufficient, ClaimExact
 ReleaseReservation, ReleaseOutpoints
 Spend, Unspend, Promote
 Freeze, Unfreeze
-Balance, FindStaleReservations
+Balance, FindStaleReservations, FindStaleReservationsIncludingPinned
 Close
 ```
 

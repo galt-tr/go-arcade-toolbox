@@ -35,6 +35,9 @@ import (
 //  6. Pinned rows are reserved rows that no janitor may free: they are
 //     invisible to FindStaleReservations and untouched by ReleaseReservation.
 //     pinned = TRUE implies reserved and unspent, always. See [Store.Pin].
+//     The one listing that does see them is the opt-in
+//     [Store.FindStaleReservationsIncludingPinned], for callers that have
+//     fenced the owning transaction first.
 //  7. FOUR operations create a reservation — the three claim shapes and
 //     [Store.ReserveOutpoints] — and they all produce the SAME thing: a row
 //     held by (userID, reservation), unpinned, sweepable, released by token.
@@ -158,7 +161,9 @@ type Store interface {
 	// reservation) and refuse claims exactly as reserved rows do; what a pin
 	// changes is the RELEASE side: ReleaseReservation and FindStaleReservations
 	// skip pinned rows entirely, so no janitor can free the inputs of an
-	// in-flight send. Only the transaction's own lifecycle clears a pin:
+	// in-flight send — the sole listing that reports them is the opt-in
+	// FindStaleReservationsIncludingPinned, which still frees nothing. Only
+	// the transaction's own lifecycle clears a pin:
 	// Spend, Unspend, ReleaseOutpoints (the funder's own rollback or the
 	// reconciler's verified-dead release), Unpin (an abort that has already
 	// fenced the raw tx), or row deletion.
@@ -286,6 +291,27 @@ type Store interface {
 	// in-flight send (see [Store.Pin]). SHOULD return oldest first; approximate
 	// backends may relax ordering. limit <= 0 returns (nil, nil).
 	FindStaleReservations(ctx context.Context, olderThan time.Time, limit int) ([]ReservationRef, error)
+
+	// FindStaleReservationsIncludingPinned is FindStaleReservations WITHOUT the
+	// pin filter: same grouping, same dating, same ordering and limit
+	// semantics, but pinned rows count both as a reason a reservation is
+	// reported and as members of a reported ref's Outpoints.
+	//
+	// It exists because the pin filter above is a PROXY. What a reaper must
+	// never do is free the inputs of a transaction that can still be
+	// broadcast; "unpinned" is a cheap store-side stand-in for that, chosen
+	// because the store cannot see a transaction's status. A caller that has
+	// established the real property some other way — by fencing the
+	// transaction first, so the bytes are provably unbroadcastable — is
+	// entitled to the rows the proxy hides, and needs them: a pinned
+	// reservation whose owning transaction is already aborted is otherwise
+	// invisible to every janitor and its coins are held forever.
+	//
+	// It is therefore a DANGEROUS listing and a deliberately awkward name.
+	// Only fence-first callers may use it, and they must re-derive each ref's
+	// disposition from its transaction rather than releasing what they are
+	// handed. Everything else wants FindStaleReservations.
+	FindStaleReservationsIncludingPinned(ctx context.Context, olderThan time.Time, limit int) ([]ReservationRef, error)
 
 	// Close releases the store's resources. Idempotent. After Close, all
 	// other methods return errors.

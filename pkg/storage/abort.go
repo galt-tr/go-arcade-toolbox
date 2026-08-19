@@ -78,8 +78,11 @@ func (p *Provider) AbortAction(ctx context.Context, auth wdk.AuthID, args wdk.Ab
 }
 
 // abortTxRow is the transactional core of aborting a pre-broadcast transaction,
-// shared by [Provider.AbortAction] (user-initiated) and the monitor's
-// AbortAbandoned sweep. It returns [wdk.ErrNotAbortableAction] when either arm
+// shared by [Provider.AbortAction] (user-initiated), the monitor's
+// AbortAbandoned sweep and [Provider.SweepStaleReservations] (which aborts the
+// transaction before it reclaims a stale reservation, so a swept action dies
+// exactly the way an aborted one does). It returns [wdk.ErrNotAbortableAction]
+// when either arm
 // of the fence finds the transaction already past a pre-broadcast state (a
 // concurrent transition, or a broadcaster, won).
 //
@@ -90,9 +93,10 @@ func (p *Provider) AbortAction(ctx context.Context, auth wdk.AuthID, args wdk.Ab
 // ordered and committed — see [Provider.abortDirect] and
 // [Provider.abortViaOutbox].
 //
-// CALLER INVARIANT: call this OUTSIDE any ambient [metastore.Store.Do]. Both
-// current callers do (AbortAction and AbortAbandoned enter with no transaction
-// on the context), and C4's fence-first sweep must too. The reason is not
+// CALLER INVARIANT: call this OUTSIDE any ambient [metastore.Store.Do]. All
+// three callers do — AbortAction, AbortAbandoned and the fence-first
+// [Provider.SweepStaleReservations] enter with no transaction on the context,
+// and the sweep holds no unit of work across its refs. The reason is not
 // hygiene: metastore.Do JOINS an ambient transaction instead of opening its own
 // (see uow.go), so an outer Do would collapse abortViaOutbox's two phases into
 // one — the enqueue would no longer be durable before the inline execution ran,
@@ -269,31 +273,29 @@ func (p *Provider) abortDirect(ctx context.Context, userID int, txRow *wdk.Table
 //   - A crash between the Unpin and the ReleaseReservation inside one op leaves
 //     the rows reserved-but-unpinned. The pending outbox row is what recovers
 //     that: the next drain re-runs both (the Unpin idempotently) and completes
-//     the release. The stale-reservation sweep is NOT the backstop here —
-//     [Provider.reservationResendable] still reports an aborted-but-fenced row
-//     as resendable and so skips it (C4 removes that method) — which is another
-//     reason the durable intent, rather than a janitor, is what closes this.
+//     the release. [Provider.SweepStaleReservations] is a second backstop rather
+//     than the first one — it reclaims on the stale-reservation TTL, minutes
+//     later, where the drain runs on the next tick — but it does now cover this
+//     residue, through its aborted-status arm.
 //   - RemoveByMintTx skips change that is already gone.
 //
-// KNOWN RESIDUAL — a PARKED row has no automated healer. The recovery above is
-// the pending outbox row, and a row stops being pending once it crosses
-// [metastore.MaxOutboxAttempts]: ten failures at the drain's 60s cadence, i.e.
-// roughly ten minutes of continuous utxostore unavailability, and the release
-// intent drops out of FetchPending for good. Nothing else picks it up. The
-// transaction is safely fenced — this never becomes a double spend — but its
-// coins stay pinned AND reserved indefinitely, and the stale-reservation sweep
-// cannot reclaim them because it excludes pinned reservations by design (that
-// exclusion is what stops a janitor freeing the inputs of an in-flight send).
-// Re-aborting does not help either: the transactions CAS refuses an
-// already-aborted row, so the abort never reaches phase 1 to re-enqueue.
+// A PARKED row outlives the recovery above. The pending outbox row stops being
+// pending once it crosses [metastore.MaxOutboxAttempts]: ten failures at the
+// drain's 60s cadence, i.e. roughly ten minutes of continuous utxostore
+// unavailability, and the release intent drops out of FetchPending for good.
+// The transaction is safely fenced — this never becomes a double spend — but
+// its coins are left pinned AND reserved, and re-aborting cannot help because
+// the transactions CAS refuses an already-aborted row, so the abort never
+// reaches phase 1 to re-enqueue.
 //
-// Recovery is assigned to C4, whose fence-first sweep gets a pinned-INCLUSIVE
-// listing for the aborted-status arm specifically — safe there precisely
-// because the fence has already proved those bytes can never be broadcast,
-// which is the one condition under which lifting a pin without its owning
-// transaction's consent is legitimate. Until that lands, a parked
-// ABORT_RELEASE row is an operator-visible stuck reservation; it is surfaced by
-// the parked_total gauge on the reconciler's drain log line.
+// [Provider.SweepStaleReservations] is what finally clears it. Its aborted-
+// status arm reads a pinned-INCLUSIVE stale listing and, for a transaction
+// already at 'aborted', runs [Provider.doAbortRelease] directly. Lifting a pin
+// without its owning transaction's consent is legitimate in exactly that one
+// condition: the fence has already proved those bytes can never be broadcast.
+// Recovery is therefore on the stale-reservation TTL rather than the drain's
+// tick, and until it runs the parked row remains operator-visible through the
+// parked_total gauge on the reconciler's drain log line.
 func (p *Provider) abortViaOutbox(ctx context.Context, userID int, txRow *wdk.TableTransaction) error {
 	txid := abortTxID(txRow)
 	reference := string(txRow.Reference)

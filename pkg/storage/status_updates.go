@@ -1052,60 +1052,315 @@ func (p *Provider) SendWaitingTransactions(ctx context.Context, limit int) error
 // SweepStaleReservations reclaims funding reservations older than olderThan
 // whose transaction can no longer be sent — inputs leaked by never-completed
 // CreateActions (failed fuel fan-outs, or payments built but never broadcast
-// because the circuit breaker was open). It deliberately SKIPS reservations
-// whose tx is still re-drivable (a stored raw tx that SendWaiting will retry),
-// so it never frees inputs out from under an in-flight re-broadcast. Releasing
-// is idempotent, so a racing completion is harmless.
+// because the circuit breaker was open), plus the residue of aborts whose utxo
+// half never completed.
+//
+// It is FENCE-FIRST, and that is audit P0-4's completion. The sweep used to
+// release the reservation and leave the transaction row exactly where it found
+// it — typically at 'unsigned', which is a status ProcessAction ADMITS. A
+// signer arriving a second later would then be handed a live reference whose
+// inputs the funder had already re-lent, and storage would happily store its
+// bytes as broadcastable: a double spend the wallet authored itself, caused by
+// its own janitor. The old guard against that — a "is this transaction still
+// resendable" check, deleted with this change — could not close it, because it
+// only asked whether broadcastable bytes ALREADY existed; the late signer's do
+// not exist yet. (It was also a hand-rolled re-encoding of FindResendable that
+// had drifted strictly broader, which pinned the inputs of terminal rows
+// forever: audit P2-10.)
+//
+// So nothing is released until the transaction has been killed. Per ref, the
+// disposition comes from the transaction row, not from the coin:
+//
+//   - NO transaction row — a funder-internal reservation (a fan-out that died
+//     before any action existed). Nothing broadcastable can exist without a
+//     row, so a direct release is safe and is the whole job.
+//   - an ABANDONED status ([sweepAbortableStatuses]) — [Provider.abortTxRow],
+//     the same fence-first core AbortAction and AbortAbandoned use: CAS to
+//     'aborted' and fence the raw tx in ONE metadata commit, then unpin and
+//     release. Losing that CAS ([wdk.ErrNotAbortableAction]) means a live
+//     transition got there first, and skipping is then the correct outcome.
+//   - already ABORTED — the healer arm (see below).
+//   - anything else (unprocessed / nonfinal / sending / unproven / completed /
+//     failed) — never touched. Those have network evidence or belong to another
+//     owner: SendWaiting sends the delayed ones, the reconciler releases
+//     provably-dead suspects, and the send path releases on rejection.
+//
+// The abortTxRow calls are made OUTSIDE any [metastore.Store.Do], which is that
+// function's documented caller invariant — an ambient transaction would collapse
+// its two phases and re-open P0-5 from the outside. This loop therefore holds no
+// unit of work across iterations, which also keeps one bad ref from failing the
+// batch.
+//
+// The listing is the pinned-INCLUSIVE one, and it has to be. A pinned
+// reservation is one the store believes is in flight, and hiding those from
+// janitors is what makes an ordinary sweep safe — but "pinned" is a PROXY for
+// "still broadcastable" and this sweep establishes the real property itself, by
+// fencing before it touches a coin. Without the inclusive listing the aborted
+// arm below would be unreachable: those coins are pinned by definition, so the
+// ordinary listing hides precisely the rows that need healing.
 func (p *Provider) SweepStaleReservations(ctx context.Context, olderThan time.Time, limit int) error {
 	if limit <= 0 {
 		limit = defaultMonitorBatchLimit
 	}
-	refs, err := p.utxo.FindStaleReservations(ctx, olderThan, limit)
+	refs, err := p.utxo.FindStaleReservationsIncludingPinned(ctx, olderThan, limit)
 	if err != nil {
 		return fmt.Errorf("storage: find stale reservations: %w", err)
 	}
+	// HEAD-OF-LINE NOTE. The listing is one oldest-first PAGE, and the inclusive
+	// listing put rows in it that the ordinary one filtered out — pinned holds
+	// belonging to live transactions, which this sweep skips on every tick and
+	// will keep skipping. They are therefore capable of filling the page and
+	// starving the work behind them: during an arcade outage longer than the
+	// reservation TTL, more than `limit` queued delayed sends all age past the
+	// cutoff, sort ahead of everything younger, and a funder orphan or a parked
+	// abort residue created afterwards is not reached until they drain. This is
+	// a NEW failure mode of the inclusive listing — the pin filter used to
+	// remove those rows before the LIMIT applied.
+	//
+	// It is left as an observable condition rather than a pagination redesign,
+	// on three grounds: it is self-healing (SendWaiting drains the queue and the
+	// rows leave the listing by being spent), it costs availability only (the
+	// starved work is coins coming back late, never a coin freed wrongly), and
+	// the fix would be a cursor over a set that mutates under it. What the
+	// summary below gives an operator is the number that distinguishes "quiet
+	// tick" from "the page is full of work I am not allowed to do":
+	// skipped_in_flight at or near the page limit, tick after tick, is this
+	// condition.
+	var fenced, healed, orphans, inFlight int
 	for i := range refs {
 		ref := &refs[i]
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		resendable, err := p.reservationResendable(ctx, int(ref.UserID), ref.Reservation)
-		if err != nil {
-			p.logger.WarnContext(ctx, "sweep stale reservations: resendable check failed",
-				slog.String("reservation", ref.Reservation), slog.String("error", err.Error()))
-			continue
+		switch outcome, err := p.sweepStaleReservation(ctx, ref); {
+		case err != nil:
+			p.logger.WarnContext(ctx, "sweep stale reservations: reclaim failed",
+				slog.String("reservation", ref.Reservation),
+				slog.Int64("user_id", ref.UserID), slog.String("error", err.Error()))
+		case outcome == sweptByAbort:
+			fenced++
+		case outcome == sweptByHeal:
+			healed++
+		case outcome == sweptOrphan:
+			orphans++
+		case outcome == sweptSkippedInFlight:
+			inFlight++
 		}
-		if resendable {
-			continue // SendWaiting owns it; do not free its inputs
-		}
-		if _, err := p.utxo.ReleaseReservation(ctx, ref.UserID, ref.Reservation); err != nil {
-			p.logger.WarnContext(ctx, "sweep stale reservations: release failed",
-				slog.String("reservation", ref.Reservation), slog.String("error", err.Error()))
-			continue
-		}
+	}
+	// Reported when the page held ANY of the four, in-flight skips included: a
+	// tick that reclaimed nothing because every slot was occupied by a live
+	// transaction is precisely the tick worth seeing, and it would otherwise be
+	// silent.
+	if fenced+healed+orphans+inFlight > 0 {
+		p.logger.DebugContext(ctx, "sweep stale reservations complete",
+			slog.Int("scanned", len(refs)), slog.Int("limit", limit),
+			slog.Int("aborted", fenced), slog.Int("healed", healed),
+			slog.Int("funder_orphans", orphans), slog.Int("skipped_in_flight", inFlight))
 	}
 	return nil
 }
 
-// reservationResendable reports whether the transaction holding this reservation
-// still has a stored raw tx and was never broadcast — i.e. SendWaiting will
-// re-drive it, so the reservation must NOT be swept.
-func (p *Provider) reservationResendable(ctx context.Context, userID int, reference string) (bool, error) {
-	txRow, found, err := p.meta.Transactions().FindByReference(ctx, userID, reference)
+// sweepAbortableStatuses are the transaction statuses the stale-reservation
+// sweep may kill: the ones with NO other owner. It is deliberately narrower
+// than [abortableStatuses], which is what a USER may abort — a user aborting
+// their own delayed payment is a decision, while a janitor doing it on a timer
+// is a canceled payment nobody asked for.
+//
+// It is exactly the set [metastore.TransactionsRepo.FindAbandonedBefore]
+// selects, so the two janitors agree on what "abandoned" means and only differ
+// in the side they approach it from (a transaction's age there, a coin's hold
+// here) and in how long they wait. The two statuses it leaves out of the
+// abortable four are both owned elsewhere at any age:
+//
+//   - 'unprocessed' is a DELAYED send. Its bytes are stored and SendWaiting
+//     re-drives them, so a slow send — an open circuit breaker, an arcade
+//     outage — must outlive the reservation TTL rather than be canceled by it.
+//   - 'nonfinal' is waiting on an nLockTime it cannot control.
+//
+// Their coins are pinned, which is what kept them out of the ordinary listing;
+// with the pinned-inclusive listing the sweep SEES them, so the refusal has to
+// be explicit here instead of a side effect of the query.
+var sweepAbortableStatuses = map[wdk.TxStatus]bool{
+	wdk.TxStatusUnsigned: true,
+	wdk.TxStatusNoSend:   true,
+}
+
+// sweepOutcome names what one stale ref cost the sweep, for the batch counters.
+type sweepOutcome int
+
+const (
+	sweptSkipped         sweepOutcome = iota // left alone: terminal, unreadable, or lost a race
+	sweptByAbort                             // fenced and released via abortTxRow
+	sweptByHeal                              // already-fenced residue, unpinned and released
+	sweptOrphan                              // no transaction row: released directly
+	sweptSkippedInFlight                     // owned by a live transaction: the head-of-line population
+)
+
+// sweepStaleReservation reclaims ONE stale reservation, choosing its arm from
+// the transaction that holds it. See [Provider.SweepStaleReservations] for why
+// the transaction, and not the coin, is the thing consulted.
+func (p *Provider) sweepStaleReservation(ctx context.Context, ref *utxostore.ReservationRef) (sweepOutcome, error) {
+	userID := int(ref.UserID)
+	txRow, found, err := p.meta.Transactions().FindByReference(ctx, userID, ref.Reservation)
 	if err != nil {
-		return false, err
+		return sweptSkipped, fmt.Errorf("storage: find transaction for reservation: %w", err)
 	}
-	if !found || txRow.TxID == nil {
-		return false, nil
+
+	switch {
+	case !found:
+		// A reservation with no transaction row cannot back anything
+		// broadcastable: the only path that stores sendable bytes is
+		// processNewTx, and it starts by resolving this very reference to a row.
+		// So this is a funder-internal hold whose action never came into
+		// existence, and a plain release is both safe and sufficient.
+		//
+		// Except when it is PINNED, which is unrepresentable by the same
+		// argument — the pin is written inside processNewTx, after the row was
+		// found. Seeing one means the two stores disagree about a transaction
+		// that exists on neither side of the disagreement, so the sweep reports
+		// it and touches nothing: a stuck coin is recoverable by hand, a coin
+		// freed on a false premise is not.
+		switch state := p.refPinState(ctx, ref); state {
+		case refPinned:
+			p.logger.ErrorContext(ctx, "sweep stale reservations: pinned reservation has no transaction row",
+				slog.String("reservation", ref.Reservation), slog.Int64("user_id", ref.UserID),
+				slog.Int("outpoints", len(ref.Outpoints)))
+			return sweptSkipped, nil
+		case refPinUnreadable:
+			// Could not establish either way. Leave it: the next tick re-reads,
+			// and the reservation is not going anywhere in the meantime.
+			p.logger.WarnContext(ctx, "sweep stale reservations: could not read the pin state of an orphan hold",
+				slog.String("reservation", ref.Reservation), slog.Int64("user_id", ref.UserID))
+			return sweptSkipped, nil
+		case refUnpinned:
+		}
+		if _, rerr := p.utxo.ReleaseReservation(ctx, ref.UserID, ref.Reservation); rerr != nil {
+			return sweptSkipped, fmt.Errorf("storage: release orphan reservation: %w", rerr)
+		}
+		return sweptOrphan, nil
+
+	case sweepAbortableStatuses[txRow.Status]:
+		// The fence. abortTxRow is shared with AbortAction and AbortAbandoned, so
+		// a swept action dies exactly the way a user-aborted one does — including
+		// the known-tx fence, which is what stops a late signer or a queued
+		// broadcaster from using the coins this is about to hand back.
+		if aerr := p.abortTxRow(ctx, userID, txRow); aerr != nil {
+			if errors.Is(aerr, wdk.ErrNotAbortableAction) {
+				// Lost to a live transition: a signer, a broadcaster's claim, or
+				// another janitor. Whoever won owns the coins now.
+				return sweptSkipped, nil
+			}
+			return sweptSkipped, fmt.Errorf("storage: abort stale reservation: %w", aerr)
+		}
+		return sweptByAbort, nil
+
+	case txRow.Status == wdk.TxStatusAborted:
+		// The healer, and the closure of abortViaOutbox's KNOWN RESIDUAL: an
+		// abort whose utxo half never landed (a parked ABORT_RELEASE row, or a
+		// crash between the unpin and the release) leaves coins pinned and
+		// reserved behind a transaction that is already fenced. Nothing else
+		// reclaims them — the outbox row is past MaxOutboxAttempts, and
+		// re-aborting cannot help because the CAS refuses an aborted row.
+		//
+		// This runs DIRECTLY in both modes, and the Mode B reasoning is worth
+		// stating because P0-5 makes direct utxo writes look suspect: what P0-5
+		// forbids is committing a utxo write while the METADATA half it belongs
+		// to is still provisional. There is no metadata half here. The fence is
+		// already durable — it is why this arm was chosen — and doAbortRelease
+		// writes nothing but the utxostore, so there is no atomicity to lose and
+		// nothing an outbox row could make safer. Both of its ops are
+		// token-guarded and idempotent, so a partial failure simply comes back
+		// on the next tick.
+		if rerr := p.doAbortRelease(ctx, ref.UserID, ref.Reservation); rerr != nil {
+			return sweptSkipped, fmt.Errorf("storage: heal aborted reservation: %w", rerr)
+		}
+		// Retire the intent this just carried out, if there is one. The op has
+		// been performed, which is precisely what MarkDone records, and doing it
+		// AFTER the release means a failure above leaves the row exactly where it
+		// was. Two reasons it matters beyond tidiness: a PENDING row would
+		// otherwise replay the same two ops on the next drain for nothing, and a
+		// PARKED one would keep the parked_total gauge reporting stranded funds
+		// that are no longer stranded — an alert with no way to clear. Mode A has
+		// no outbox row at all, so this is a no-op there.
+		if derr := p.meta.Outbox().MarkDone(ctx, abortOutboxKey(ref.Reservation), opAbortRelease, 0); derr != nil {
+			p.logger.WarnContext(ctx, "sweep stale reservations: could not retire the healed abort intent",
+				slog.String("reservation", ref.Reservation), slog.String("error", derr.Error()))
+		}
+		p.logger.InfoContext(ctx, "sweep stale reservations: reclaimed the residue of an aborted action",
+			slog.String("reservation", ref.Reservation), slog.Int64("user_id", ref.UserID),
+			slog.Int("outpoints", len(ref.Outpoints)))
+		return sweptByHeal, nil
+
+	case txRow.Status == wdk.TxStatusCompleted:
+		// A completed transaction's inputs are SPENT, so they should not be
+		// holding a live reservation at all. Reaching here means a spend was
+		// recorded against the wallet ledger but never against these coins (audit
+		// P1-3's shape) — they are stuck, and the sweep is the wrong tool: their
+		// transaction is on the network, so releasing them would offer the funder
+		// coins that are already gone. Loudly, because nothing else will say it.
+		p.logger.WarnContext(ctx, "sweep stale reservations: completed transaction still holds a live reservation",
+			slog.String("reservation", ref.Reservation), slog.Int64("user_id", ref.UserID),
+			slog.Int("outpoints", len(ref.Outpoints)))
+		return sweptSkipped, nil
+
+	default:
+		// unprocessed / nonfinal / sending / unproven / failed: either the
+		// network has the bytes, or a work list does, or another owner (the
+		// reconciler, the send path) is responsible for the release. Never this
+		// sweep — see [sweepAbortableStatuses] for why the delayed ones are on
+		// this side of the line even though a user could abort them.
+		//
+		// This is also the arm that can crowd a page out; it is counted
+		// separately for that reason (see the head-of-line note on the caller).
+		p.logger.DebugContext(ctx, "sweep stale reservations: reservation belongs to a live transaction",
+			slog.String("reservation", ref.Reservation), slog.String("status", string(txRow.Status)))
+		return sweptSkippedInFlight, nil
 	}
-	kt, found, err := p.meta.KnownTx().FindByTxID(ctx, *txRow.TxID)
-	if err != nil {
-		return false, err
+}
+
+// refPinState is what [Provider.refPinState] could establish about a ref's
+// rows. The third value is not a detail: the caller acts on this, and "I could
+// not tell" must not be spelled the same way as either answer.
+type refPinState int
+
+const (
+	refUnpinned      refPinState = iota // every row read, none pinned
+	refPinned                           // at least one row is pinned
+	refPinUnreadable                    // a row could not be read; nothing may be concluded
+)
+
+// refPinState reports whether any outpoint of the ref is pinned. It exists only
+// for the impossible-orphan check in [Provider.sweepStaleReservation] and runs
+// only on that arm, which is rare (a create that died between the funder's
+// claim and its metadata) and holds a handful of outpoints.
+//
+// A MISSING row is benign and does not stop the release. Between the listing
+// and this read the row can legitimately have gone: RemoveByMintTx, a mined
+// tx's RemoveSpentBy, or an operator Remove. A vanished coin is not a pinned
+// coin, and it is not evidence of the corruption the caller is looking for — so
+// it is skipped rather than counted as a reason to refuse. The release that
+// follows is idempotent and simply will not find it either.
+//
+// Any OTHER read error is unreadable, not unpinned: the caller must leave the
+// coin alone when the store cannot say what state it is in.
+func (p *Provider) refPinState(ctx context.Context, ref *utxostore.ReservationRef) refPinState {
+	for _, op := range ref.Outpoints {
+		u, err := p.utxo.Get(ctx, op)
+		switch {
+		case errors.Is(err, &utxostore.NotFoundError{}):
+			p.logger.DebugContext(ctx, "sweep stale reservations: orphan hold row already gone",
+				slog.String("reservation", ref.Reservation), slog.String("outpoint", op.String()))
+			continue
+		case err != nil:
+			p.logger.WarnContext(ctx, "sweep stale reservations: pin read failed",
+				slog.String("reservation", ref.Reservation), slog.String("outpoint", op.String()),
+				slog.String("error", err.Error()))
+			return refPinUnreadable
+		case u.Pinned:
+			return refPinned
+		}
 	}
-	if !found {
-		return false, nil
-	}
-	return len(kt.RawTx) > 0 && !kt.WasBroadcast, nil
+	return refUnpinned
 }
 
 // sendOneWaiting EF-encodes and broadcasts one delayed tx, then commits the

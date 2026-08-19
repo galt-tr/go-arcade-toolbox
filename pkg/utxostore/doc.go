@@ -215,6 +215,10 @@
 //  6. Pinned rows are reserved rows no janitor may free: ReleaseReservation
 //     leaves them alone and FindStaleReservations never reports them (see the
 //     pre-broadcast pin above). Pinned always implies reserved and unspent.
+//     The single exception is the opt-in FindStaleReservationsIncludingPinned
+//     listing, which reports them and nothing more — it frees nothing, and
+//     exists for a sweep that fences a transaction before it touches its
+//     coins, i.e. one that has established what the pin is only a proxy for.
 //  7. FOUR operations create a reservation — the three claim shapes and
 //     ReserveOutpoints — and every one of them produces the same, unpinned,
 //     sweepable, token-released hold. No downstream operation asks which one

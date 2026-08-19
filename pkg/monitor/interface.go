@@ -54,8 +54,10 @@ type MonitoredStorage interface {
 	AbortAbandoned(ctx context.Context, olderThan time.Time, limit int) error
 
 	// SweepStaleReservations reclaims funding reservations older than olderThan
-	// whose transaction can no longer be sent (leaked inputs), skipping any that
-	// SendWaitingTransactions will still re-drive.
+	// whose transaction can no longer be sent (leaked inputs). It is
+	// fence-first: an action whose reservation it takes back is ABORTED, so
+	// nothing can sign or broadcast it afterwards. Reservations belonging to a
+	// live transaction are left alone whatever their age.
 	SweepStaleReservations(ctx context.Context, olderThan time.Time, limit int) error
 
 	// SynchronizeTransactionStatuses is the poll fallback: it re-polls stale

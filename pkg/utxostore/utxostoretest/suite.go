@@ -120,6 +120,7 @@ func RunStoreSuite(t *testing.T, newStore func(t *testing.T) utxostore.Store, op
 		{"Balance", std(s.balance)},
 		{"FindStaleReservations", s.findStaleReservations},
 		{"FindStaleReservationsSkipsPinned", s.findStaleReservationsSkipsPinned},
+		{"FindStaleReservationsIncludingPinned", s.findStaleReservationsIncludingPinned},
 		{"StaleReservationDating", s.staleReservationDating},
 		{"Close", std(s.closeStore)},
 	} {
@@ -2127,6 +2128,70 @@ func (s *suite) findStaleReservationsSkipsPinned(t *testing.T) {
 	refs, err = store.FindStaleReservations(ctx, future, 10)
 	require.NoError(t, err)
 	require.Len(t, refs, 2, "an unpinned stale reservation is visible again")
+}
+
+// findStaleReservationsIncludingPinned is the opt-in twin's contract: the SAME
+// listing, minus the pin filter. It is the escape hatch a fence-first sweep
+// needs, because "unpinned" is only a proxy for "not broadcastable" and a
+// caller that has established the real property must be able to reach the rows
+// the proxy hides — otherwise a pinned reservation whose transaction is already
+// dead is invisible to every janitor and its coins are held forever.
+//
+// The pinned ref must come back WHOLE (its pinned outpoints listed, not
+// silently dropped), or a caller would fence a transaction and then be handed
+// half of its coins.
+func (s *suite) findStaleReservationsIncludingPinned(t *testing.T) {
+	ctx := context.Background()
+	sc := scope(utxostore.TierMined)
+
+	store, advance := s.clockedStore(t)
+
+	MintTx(t, store, "pin-stale-incl", user, basket, utxostore.TierMined, 10, 10, 20)
+
+	pinned, err := store.ClaimExact(ctx, sc, "res-pinned", 10, 2)
+	require.NoError(t, err)
+	require.Len(t, pinned, 2)
+	advance(time.Minute)
+	plain, err := store.ClaimExact(ctx, sc, "res-plain", 20, 1)
+	require.NoError(t, err)
+	require.Len(t, plain, 1)
+
+	n, err := store.Pin(ctx, user, "res-pinned")
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	future := plain[0].ReservedAt.Add(time.Hour)
+
+	// The ordinary listing hides it; the inclusive one does not.
+	refs, err := store.FindStaleReservations(ctx, future, 10)
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	require.Equal(t, "res-plain", refs[0].Reservation)
+
+	refs, err = store.FindStaleReservationsIncludingPinned(ctx, future, 10)
+	require.NoError(t, err)
+	require.Len(t, refs, 2, "the inclusive listing must surface the pinned reservation too")
+	byToken := map[string]utxostore.ReservationRef{}
+	for _, ref := range refs {
+		require.Equal(t, user, ref.UserID)
+		byToken[ref.Reservation] = ref
+	}
+	require.Contains(t, byToken, "res-pinned")
+	require.ElementsMatch(t,
+		[]utxostore.Outpoint{pinned[0].Outpoint, pinned[1].Outpoint},
+		byToken["res-pinned"].Outpoints,
+		"a pinned ref must list its WHOLE membership, not a filtered part of it")
+	require.ElementsMatch(t, []utxostore.Outpoint{plain[0].Outpoint}, byToken["res-plain"].Outpoints)
+
+	// Everything else about the listing is unchanged: staleness still gates it,
+	// and the rows it reports are still merely reported — nothing is released.
+	refs, err = store.FindStaleReservationsIncludingPinned(ctx, pinned[0].ReservedAt.Add(-time.Hour), 10)
+	require.NoError(t, err)
+	require.Empty(t, refs, "the pin filter is the only difference; the cutoff still applies")
+
+	held := getPinChecked(ctx, t, store, pinned[0].Outpoint)
+	require.True(t, held.Pinned, "listing a pinned reservation must not unpin it")
+	require.Equal(t, "res-pinned", held.ReservedBy)
 }
 
 // staleReservationDating pins that a reservation is dated by its OLDEST row:

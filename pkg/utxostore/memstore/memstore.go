@@ -763,6 +763,17 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 // first. Pinned rows are excluded entirely — the reaper must never see the
 // inputs of an in-flight send.
 func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStale(olderThan, limit, false)
+}
+
+// FindStaleReservationsIncludingPinned implements [utxostore.Store]: the same
+// listing with pinned rows counted in, for a caller that has already fenced
+// the transactions holding them.
+func (s *Store) FindStaleReservationsIncludingPinned(_ context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStale(olderThan, limit, true)
+}
+
+func (s *Store) findStale(olderThan time.Time, limit int, includePinned bool) ([]utxostore.ReservationRef, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -784,8 +795,11 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 
 	for _, r := range s.rows {
 		u := &r.utxo
-		if u.ReservedBy == "" || u.SpentBy != nil || u.Pinned {
-			continue // pinned rows are in flight, never stale work
+		if u.ReservedBy == "" || u.SpentBy != nil {
+			continue
+		}
+		if u.Pinned && !includePinned {
+			continue // pinned rows are in flight, never ordinary stale work
 		}
 		k := key{userID: u.UserID, token: u.ReservedBy}
 		g, ok := groups[k]

@@ -110,18 +110,27 @@ func TestStaleScanIsIndexDriven(t *testing.T) {
 	require.NoError(t, err)
 
 	cutoff := s.encTime(time.Now())
-	plan := explainQueryPlan(t, s, s.staleReservationsSQL(), cutoff, 10)
-	t.Logf("stale scan plan:\n%s", strings.Join(plan, "\n"))
-	for _, step := range plan {
-		require.NotContains(t, step, "SCAN utxos",
-			"the stale scan must never table-scan the pool; plan:\n%s", strings.Join(plan, "\n"))
+	// Both shapes: the ordinary sweep's and the fence-first sweep's
+	// pinned-INCLUSIVE twin (C4). The inclusive one drops `NOT pinned` and
+	// nothing else, so it must plan identically — pinned is a trailing key
+	// column of idx_utxos_reserved, not the reason the scan is covering.
+	for _, tc := range []struct {
+		name          string
+		includePinned bool
+	}{{"excluding pinned", false}, {"including pinned", true}} {
+		plan := explainQueryPlan(t, s, s.staleReservationsSQL(tc.includePinned), cutoff, 10)
+		t.Logf("stale scan plan (%s):\n%s", tc.name, strings.Join(plan, "\n"))
+		for _, step := range plan {
+			require.NotContains(t, step, "SCAN utxos",
+				"the stale scan (%s) must never table-scan the pool; plan:\n%s", tc.name, strings.Join(plan, "\n"))
+		}
+		require.Contains(t, strings.Join(plan, "\n"), "USING INDEX",
+			"the stale scan (%s) must resolve through an index", tc.name)
+		require.Contains(t, strings.Join(plan, "\n"), "USING COVERING INDEX idx_utxos_reserved",
+			"the grouped scan (%s) must read the whole live hold set from idx_utxos_reserved alone; "+
+				"losing 'covering' means 00003's trailing spent_by went missing and every row "+
+				"costs a table read again. plan:\n%s", tc.name, strings.Join(plan, "\n"))
 	}
-	require.Contains(t, strings.Join(plan, "\n"), "USING INDEX",
-		"the stale scan must resolve through an index")
-	require.Contains(t, strings.Join(plan, "\n"), "USING COVERING INDEX idx_utxos_reserved",
-		"the grouped scan must read the whole live hold set from idx_utxos_reserved alone; "+
-			"losing 'covering' means 00003's trailing spent_by went missing and every row "+
-			"costs a table read again. plan:\n%s", strings.Join(plan, "\n"))
 
 	probe := `SELECT reserved_at FROM utxos INDEXED BY idx_utxos_reserved_at
 		WHERE reserved_by IS NOT NULL AND spent_by IS NULL AND ` + notPinned + ` AND reserved_at < ?`

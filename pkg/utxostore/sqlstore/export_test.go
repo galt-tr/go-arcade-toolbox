@@ -23,7 +23,12 @@ var ClaimableProbePGSQL = (&Store{engine: EnginePostgres}).claimCandidateExistsS
 var (
 	// StaleReservationsPGSQL is [Store.FindStaleReservations]' statement,
 	// bound to (cutoff, group limit).
-	StaleReservationsPGSQL = (&Store{engine: EnginePostgres}).staleReservationsSQL()
+	StaleReservationsPGSQL = (&Store{engine: EnginePostgres}).staleReservationsSQL(false)
+	// StaleReservationsPinnedPGSQL is the same for the pinned-INCLUSIVE twin
+	// [Store.FindStaleReservationsIncludingPinned]. It runs on the same tick
+	// as the statement above, over the same pool, so it gets the same guard:
+	// dropping the pin filter must not cost the aggregate its index-only scan.
+	StaleReservationsPinnedPGSQL = (&Store{engine: EnginePostgres}).staleReservationsSQL(true)
 	// ReleaseReservationPGSQL is [Store.ReleaseReservation]'s statement,
 	// bound to (user id, reservation token).
 	ReleaseReservationPGSQL = (&Store{engine: EnginePostgres}).releaseReservationSQL()

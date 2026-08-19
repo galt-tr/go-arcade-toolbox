@@ -750,44 +750,131 @@ func trueScript() *script.Script {
 }
 
 // TestSweepStaleReservations_ReleasesStuckReservation verifies the recovery
-// sweep reclaims a funding reservation whose transaction can no longer be sent
-// (no stored raw tx — a payment stranded pre-broadcast), so the leaked inputs
-// become spendable again instead of permanently locking the wallet.
+// sweep reclaims a funding reservation whose transaction nobody will ever send
+// (a no-send action, abandoned by its client), so the leaked inputs become
+// spendable again instead of permanently locking the wallet — and that it
+// FENCES that transaction on the way out rather than leaving a signable row
+// behind its freed coins (audit P0-4).
 func TestSweepStaleReservations_ReleasesStuckReservation(t *testing.T) {
 	ctx := context.Background()
 	h := newHookStack(t)
 
 	txid := fmt.Sprintf("%064x", 0x7a)
-	h.seedChangeTx(txid, wdk.TxStatusSending, wdk.ProvenTxStatusUnprocessed, 5000, utxostore.TierSending)
-	rows, err := h.meta.Transactions().FindByTxIDAllUsers(ctx, txid)
-	require.NoError(t, err)
-	reservation := string(rows[0].Reference)
+	h.seedChangeTx(txid, wdk.TxStatusNoSend, wdk.ProvenTxStatusNoSend, 5000, utxostore.TierSending)
+	reservation := h.reservationFor(txid)
 
 	// Mint a funding coin and reserve it under the tx reference (as a real
-	// CreateAction would); the tx then strands — no raw tx, never broadcast.
-	var src chainhash.Hash
-	src[0] = 0x55
-	require.NoError(t, h.utxo.Mint(ctx, []*utxostore.Mint{{
-		Outpoint: utxostore.Outpoint{TxID: src, Vout: 0}, UserID: int64(h.userID),
-		Basket: "funding", Satoshis: 9000, InputSize: 107, Tier: utxostore.TierMined,
-	}}))
-	_, err = h.utxo.ClaimSmallestSufficient(ctx, utxostore.Scope{
-		UserID: int64(h.userID), Basket: "funding", Tier: utxostore.TierMined,
-	}, reservation, 1)
-	require.NoError(t, err)
+	// CreateAction would); the tx then strands — never broadcast.
+	h.reserveFunding(0x55, reservation, 9000)
 
 	before, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
 	require.NoError(t, err)
 	require.Equal(t, 1, before.ReservedCount, "coin reserved before the sweep")
 
-	// olderThan in the future ⇒ the reservation qualifies as stale; the tx has no
-	// raw tx so it is not re-drivable and the sweep reclaims it.
+	// olderThan in the future ⇒ the reservation qualifies as stale.
 	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
 
 	after, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
 	require.NoError(t, err)
 	require.Zero(t, after.ReservedCount, "stale reservation released")
 	require.Equal(t, uint64(9000), after.Claimable[utxostore.TierMined], "input claimable again")
+	require.Equal(t, wdk.TxStatusAborted, h.txStatus(txid), "the swept transaction must be aborted")
+	require.Equal(t, metastore.KnownTxStatusAborted, h.knownTx(txid).Status,
+		"and its bytes fenced, or a broadcaster could still send them")
+}
+
+// TestSweepStaleReservations_LeavesALiveTransactionAlone is the other half of
+// the fence-first rule. The sweep may only reclaim what it can first kill, and
+// 'sending' is not abortable: those bytes are with the network, or on their way
+// there. Freeing their inputs on a timer would be the double spend the sweep
+// exists to prevent — the reservation stays, whatever its age.
+func TestSweepStaleReservations_LeavesALiveTransactionAlone(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	txid := fmt.Sprintf("%064x", 0x7b)
+	h.seedChangeTx(txid, wdk.TxStatusSending, wdk.ProvenTxStatusUnprocessed, 5000, utxostore.TierSending)
+	reservation := h.reservationFor(txid)
+	h.reserveFunding(0x56, reservation, 9000)
+
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	after, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
+	require.NoError(t, err)
+	require.Equal(t, 1, after.ReservedCount, "a sending transaction keeps its inputs")
+	require.Equal(t, wdk.TxStatusSending, h.txStatus(txid), "and the sweep does not touch its status")
+}
+
+// TestSweepStaleReservations_ReleasesAFunderOrphan covers the arm with no
+// transaction row at all: a funder-internal hold (a fan-out that died before
+// any action existed). Nothing broadcastable can exist without a row, so the
+// sweep releases it directly.
+func TestSweepStaleReservations_ReleasesAFunderOrphan(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	h.reserveFunding(0x57, "orphan-reservation-with-no-tx-row", 9000)
+
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	after, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
+	require.NoError(t, err)
+	require.Zero(t, after.ReservedCount, "an orphan hold has nothing to fence and is released")
+	require.Equal(t, uint64(9000), after.Claimable[utxostore.TierMined])
+}
+
+// TestSweepStaleReservations_WarnsRatherThanFreeingACompletedSpend is audit
+// P1-3's shape seen from the janitor: a completed transaction whose inputs
+// still carry a live reservation means a spend was recorded in the ledger but
+// never against the coins. They are stuck — but the transaction is ON THE
+// NETWORK, so offering them back to the funder would hand out coins that are
+// already gone. The sweep must report and refuse.
+func TestSweepStaleReservations_WarnsRatherThanFreeingACompletedSpend(t *testing.T) {
+	ctx := context.Background()
+	h := newHookStack(t)
+
+	txid := fmt.Sprintf("%064x", 0x7c)
+	h.seedChangeTx(txid, wdk.TxStatusCompleted, wdk.ProvenTxStatusCompleted, 5000, utxostore.TierMined)
+	reservation := h.reservationFor(txid)
+	h.reserveFunding(0x58, reservation, 9000)
+
+	require.NoError(t, h.p.SweepStaleReservations(ctx, time.Now().Add(time.Hour), 100))
+
+	after, err := h.utxo.Balance(ctx, int64(h.userID), "funding")
+	require.NoError(t, err)
+	require.Equal(t, 1, after.ReservedCount,
+		"a completed transaction's inputs are spent on the network; the sweep must never re-lend them")
+	require.Equal(t, wdk.TxStatusCompleted, h.txStatus(txid))
+}
+
+// reservationFor returns the reference the seeded transaction holds its funding
+// under — which is what a real CreateAction reserves by.
+func (h *hookStack) reservationFor(txid string) string {
+	h.t.Helper()
+	rows, err := h.meta.Transactions().FindByTxIDAllUsers(context.Background(), txid)
+	require.NoError(h.t, err)
+	require.NotEmpty(h.t, rows)
+	return string(rows[0].Reference)
+}
+
+// reserveFunding mints one mined funding coin and claims it under reservation,
+// as a CreateAction's funder would.
+func (h *hookStack) reserveFunding(seed byte, reservation string, sats uint64) utxostore.Outpoint {
+	h.t.Helper()
+	ctx := context.Background()
+	var src chainhash.Hash
+	src[0] = seed
+	op := utxostore.Outpoint{TxID: src, Vout: 0}
+	require.NoError(h.t, h.utxo.Mint(ctx, []*utxostore.Mint{{
+		Outpoint: op, UserID: int64(h.userID),
+		Basket: "funding", Satoshis: sats, InputSize: 107, Tier: utxostore.TierMined,
+	}}))
+	claimed, err := h.utxo.ClaimSmallestSufficient(ctx, utxostore.Scope{
+		UserID: int64(h.userID), Basket: "funding", Tier: utxostore.TierMined,
+	}, reservation, 1)
+	require.NoError(h.t, err)
+	require.NotNil(h.t, claimed)
+	return op
 }
 
 // TestApplyStatusBatch_MinedVerifyDoesNotSerialize pins the fix for a stall that

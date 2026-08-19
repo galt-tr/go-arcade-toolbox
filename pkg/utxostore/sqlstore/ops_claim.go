@@ -741,6 +741,23 @@ func (s *Store) setPinned(ctx context.Context, userID int64, reservation string,
 
 // staleReservationsSQL is the stale-reservation statement, bound to two
 // parameters: the staleness cutoff and the group limit, in that order.
+// includePinned selects the two shapes — the ordinary sweep's (pinned rows
+// excluded, the [utxostore.Store.FindStaleReservations] contract) and the
+// fence-first sweep's (pinned rows included, see
+// [Store.FindStaleReservationsIncludingPinned]).
+//
+// Only the pin terms differ, so the two are ONE builder rather than two
+// statements: the grouping, the dating, the ordering and the outer expansion
+// have to stay identical or the inclusive listing would be a second sweep
+// semantics to reason about instead of the same one with a wider input set.
+//
+// Dropping `NOT pinned` costs the plan nothing on either engine, which is why
+// there is no separate index. On PostgreSQL every remaining term is
+// idx_utxos_reserved's own partial predicate or a covered column, so the inner
+// aggregate stays INDEX-ONLY (pinned is in INCLUDE, and not reading it is
+// strictly less work). On SQLite pinned is a trailing key column of the same
+// index, so the grouped scan stays COVERING. Both shapes are planned by tests:
+// TestStaleScanIsIndexDriven here and TestSweepUsesReservedIndex on PostgreSQL.
 //
 // It is a method rather than an inlined string for the same reason the three
 // claim statements are package constants: so a test can plan the EXACT
@@ -757,22 +774,27 @@ func (s *Store) setPinned(ctx context.Context, userID int64, reservation string,
 // the sweep to a heap scan per tick; sweep_explain_test.go is that guard.
 //
 // The subquery picks the oldest `limit` stale reservation groups; the outer
-// join expands each to its unspent, unpinned reserved outpoints, ordered so a
-// group's rows are contiguous and dated by their minimum reserved_at.
-func (s *Store) staleReservationsSQL() string {
+// join expands each to its unspent reserved outpoints (unpinned ones only,
+// unless includePinned), ordered so a group's rows are contiguous and dated by
+// their minimum reserved_at.
+func (s *Store) staleReservationsSQL(includePinned bool) string {
+	inner, outer := " AND "+notPinned, " AND "+notPinnedOn("u")
+	if includePinned {
+		inner, outer = "", ""
+	}
 	return s.rebind(`
 		SELECT u.user_id, u.reserved_by, g.oldest, u.txid, u.vout
 		FROM utxos u
 		JOIN (
 			SELECT user_id, reserved_by, MIN(reserved_at) AS oldest, MIN(seq) AS min_seq
 			FROM utxos
-			WHERE reserved_by IS NOT NULL AND spent_by IS NULL AND ` + notPinned + `
+			WHERE reserved_by IS NOT NULL AND spent_by IS NULL` + inner + `
 			GROUP BY user_id, reserved_by
 			HAVING MIN(reserved_at) < ?
 			ORDER BY oldest, min_seq
 			LIMIT ?
 		) g ON u.user_id = g.user_id AND u.reserved_by = g.reserved_by
-		WHERE u.reserved_by IS NOT NULL AND u.spent_by IS NULL AND ` + notPinnedOn("u") + `
+		WHERE u.reserved_by IS NOT NULL AND u.spent_by IS NULL` + outer + `
 		ORDER BY g.oldest, g.min_seq, u.seq`)
 }
 
@@ -784,6 +806,19 @@ func (s *Store) staleReservationsSQL() string {
 // same notPinned text the 00002 migrations declare idx_utxos_reserved_at with,
 // so the scan stays index-driven (see [Store.staleReservationsSQL]).
 func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStaleReservations(ctx, olderThan, limit, false)
+}
+
+// FindStaleReservationsIncludingPinned implements [utxostore.Store]: the same
+// listing with the pin filter dropped from both the grouping and the
+// expansion, for the fence-first sweep. See the interface doc for who may call
+// it — it hands out the inputs of transactions the store believes are in
+// flight, and only a caller that has already fenced them knows better.
+func (s *Store) FindStaleReservationsIncludingPinned(ctx context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStaleReservations(ctx, olderThan, limit, true)
+}
+
+func (s *Store) findStaleReservations(ctx context.Context, olderThan time.Time, limit int, includePinned bool) ([]utxostore.ReservationRef, error) {
 	if s.isClosed() {
 		return nil, errClosed
 	}
@@ -791,7 +826,7 @@ func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, 
 		return nil, nil
 	}
 
-	rows, err := s.execer(ctx).QueryContext(ctx, s.staleReservationsSQL(), s.encTime(olderThan), limit)
+	rows, err := s.execer(ctx).QueryContext(ctx, s.staleReservationsSQL(includePinned), s.encTime(olderThan), limit)
 	if err != nil {
 		return nil, err
 	}

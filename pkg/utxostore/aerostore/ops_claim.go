@@ -682,9 +682,10 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 //   - The caller re-runs Pin, idempotently, until it succeeds before it
 //     broadcasts. The exposure is therefore the client's retry gap, not the
 //     broadcast round trip the pin exists to cover.
-//   - The provider fences the transaction row before releasing anything —
-//     today through the resendable check in SweepStaleReservations, which is
-//     being hardened onto the pin itself in a later task.
+//   - The provider fences the transaction row before releasing anything: its
+//     sweep aborts the owning transaction (CAS to 'aborted' plus the known-tx
+//     fence) and only then touches a coin, so a straggler this backend still
+//     reports is a coin whose transaction is already unbroadcastable.
 //
 // A deployment that needs this atomic rather than bounded wants a SQL backend,
 // where one UPDATE pins the whole membership or none of it.
