@@ -28,6 +28,25 @@ Consequences you must design for:
   point-in-time skew between them is healed by the transactional outbox +
   reconciler, but a *lost* store is not recoverable.
 - The keys alone are **not** a backup. There is no rescan to rebuild balances.
+- **A synced or restored store is not automatically writable.** The storage
+  manager refuses every write unless the store it is bound to is the one the
+  user's `users.active_storage` row names — otherwise the same coin could be
+  spent from two storages at once. A store populated by `ProcessSyncChunk` does
+  **not** declare itself active (deliberately: that is what would create the
+  two-active-stores condition), so after a restore or a sync-based migration you
+  must cut over explicitly with `SetActive`. Until you do, writes fail with:
+
+  ```
+  storage: writes disabled: store is not the user's active storage: this store
+  is "<store-key>", the user's active storage is "<other-key>" — call SetActive
+  to cut over
+  ```
+
+  The error wraps the exported sentinel `storage.ErrStorageNotActive`, so
+  callers can match it with `errors.Is`. Reads are never gated — a non-active
+  store can always be inspected. See the
+  [spendability seam on the wire](storage.md#the-seam-on-the-wire-sync) for what
+  a sync does and does not rebuild.
 
 ### Per-backend backup / restore
 

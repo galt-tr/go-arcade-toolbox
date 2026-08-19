@@ -37,12 +37,20 @@ var DefaultListOutputsStatuses = []wdk.TxStatus{
 
 // NewOutput is the input to [OutputsRepo.Insert].
 type NewOutput struct {
-	UserID             int
-	TransactionID      uint
-	Vout               uint32
-	Satoshis           int64
-	LockingScript      []byte
-	Basket             *string // basket NAME; nil = not in a basket
+	UserID        int
+	TransactionID uint
+	Vout          uint32
+	Satoshis      int64
+	LockingScript []byte
+	Basket        *string // basket NAME; nil = not in a basket
+	// SpentBy is the spending transaction's id, when the row is inserted
+	// already-spent. Normal wallet flow leaves this nil and records the spend
+	// later via MarkSpent; sync carries a source row's spend history forward at
+	// insert time, so the target never sees the coin as unspent. Its position
+	// here (between Basket and Change) mirrors the schema, outputCols and the
+	// INSERT column list — keeping all four in one order is the defense against
+	// a misaligned bind.
+	SpentBy            *uint
 	Change             bool
 	Type               string
 	ProvidedBy         string
@@ -145,15 +153,17 @@ func (r OutputsRepo) Insert(ctx context.Context, o NewOutput) (uint, error) {
 		}
 		q := r.s.rebind(
 			`INSERT INTO outputs
-			 (user_id, transaction_id, vout, satoshis, locking_script, basket, change,
+			 (user_id, transaction_id, vout, satoshis, locking_script, basket, spent_by, change,
 			  output_type, provided_by, purpose, description,
 			  derivation_prefix, derivation_suffix, sender_identity_key, custom_instructions,
 			  created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 RETURNING output_id`)
 		var got int64
 		if err := r.s.execer(ctx).QueryRowContext(ctx, q,
-			o.UserID, o.TransactionID, o.Vout, o.Satoshis, locking, strPtrArg(o.Basket),
+			// spent_by is a nullable FK into transactions: nil binds SQL NULL
+			// (the normal, not-yet-spent case).
+			o.UserID, o.TransactionID, o.Vout, o.Satoshis, locking, strPtrArg(o.Basket), uintPtrArg(o.SpentBy),
 			r.s.boolVal(o.Change), o.Type, o.ProvidedBy, o.Purpose, o.Description,
 			strPtrArg(o.DerivationPrefix), strPtrArg(o.DerivationSuffix),
 			strPtrArg(o.SenderIdentityKey), strPtrArg(o.CustomInstructions), now, now,

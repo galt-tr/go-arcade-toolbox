@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	stdslices "slices"
@@ -15,6 +16,17 @@ import (
 )
 
 var _ wdk.WalletStorage = (*WalletStorageManager)(nil)
+
+// ErrStorageNotActive is returned by every write the manager exposes when the
+// store it is bound to is not the one the user has selected as their active
+// storage. Callers recover with [WalletStorageManager.SetActive].
+var ErrStorageNotActive = errors.New("storage: writes disabled: store is not the user's active storage")
+
+// ErrNoActiveStorageConfigured is returned when the manager has no storage
+// provider to route a call to at all — both by the write gate and by
+// MakeAvailable, so the auth-first wrappers (which reach MakeAvailable through
+// GetAuth before they ever reach the gate) surface the same sentinel.
+var ErrNoActiveStorageConfigured = errors.New("storage: no active storage provider configured")
 
 // WalletStorageManager binds a single active [wdk.WalletStorageProvider] to a
 // user identity key and exposes the auth-bound [wdk.WalletStorage] interface the
@@ -79,20 +91,30 @@ func (m *WalletStorageManager) AddWalletStorageProvider(ctx context.Context, pro
 }
 
 // IsActiveEnabled reports whether the active storage is "enabled": its
-// storageIdentityKey matches the user's currently selected activeStorage.
+// storageIdentityKey matches the user's currently selected activeStorage. It is
+// false (never a panic) while Settings/User are still unpopulated —
+// ThinksItIsActive folds in the IsAvailable nil-guard.
 func (m *WalletStorageManager) IsActiveEnabled() bool {
-	return m.activeStorage != nil &&
-		m.activeStorage.Settings.StorageIdentityKey == m.activeStorage.User.ActiveStorage
+	return m.activeStorage != nil && m.activeStorage.ThinksItIsActive()
 }
 
 // MakeAvailable makes the storage available for the user.
+//
+// Like SetActive, it is annotated @Write on [wdk.WalletStorageProvider] but is
+// deliberately NOT routed through [WalletStorageManager.getActiveWriter]: it is
+// what ESTABLISHES the user selection the gate compares against (it loads
+// Settings and the user row), so gating it would be circular.
 func (m *WalletStorageManager) MakeAvailable(ctx context.Context) (*wdk.TableSettings, error) {
 	if m.isAvailable {
 		return m.activeStorage.Settings, nil
 	}
 
 	if len(m.stores) == 0 {
-		return nil, fmt.Errorf("no storage providers configured")
+		// The same sentinel the write gate returns: the auth-first wrappers
+		// reach MakeAvailable (via GetAuth) before they reach the gate, so
+		// without this an empty manager's CreateAction would fail an
+		// errors.Is(err, ErrNoActiveStorageConfigured) check.
+		return nil, ErrNoActiveStorageConfigured
 	}
 
 	m.activeStorage = m.stores[0] // first storage is the active storage candidate
@@ -123,6 +145,12 @@ func (m *WalletStorageManager) GetAuth(ctx context.Context) (wdk.AuthID, error) 
 // SetActive switches to a new active storage provider from among the managed
 // providers. In the single-active-store configuration this validates the target
 // and updates the active-storage selection; it does not perform backup sync.
+//
+// SetActive is deliberately NOT subject to the [WalletStorageManager.getActiveWriter]
+// gate, even though [wdk.WalletStorageProvider] annotates it @Write. It is the
+// sole in-process recovery path out of a manager whose writes are being
+// refused: gating it would make that lockout unrecoverable without a restart,
+// which is exactly the failure the caller is trying to fix.
 func (m *WalletStorageManager) SetActive(ctx context.Context, storageIdentityKey string) error {
 	if is.BlankString(storageIdentityKey) {
 		return fmt.Errorf("storage identity key must be provided and cannot be empty")
@@ -132,16 +160,37 @@ func (m *WalletStorageManager) SetActive(ctx context.Context, storageIdentityKey
 		return fmt.Errorf("failed to make storage available: %w", err)
 	}
 
-	if m.activeStorage != nil && m.activeStorage.Settings.StorageIdentityKey == storageIdentityKey {
-		// already active - persist the selection to be safe and return.
-		return m.activeStorage.SetActive(ctx, m.authID(), storageIdentityKey)
+	// HasStorageIdentityKey folds in the availability check, so a half-made
+	// store cannot nil-deref its Settings here.
+	if m.activeStorage != nil && m.activeStorage.HasStorageIdentityKey(storageIdentityKey) {
+		// Already the active candidate: persist the selection to be safe AND
+		// refresh the cached User rows, exactly as the switch branch below
+		// does. Persisting alone is not enough — IsActiveEnabled compares
+		// Settings.StorageIdentityKey against the CACHED User.ActiveStorage,
+		// so a stale cache would leave the write gate refusing until the next
+		// process start. This path is precisely the escape hatch out of that
+		// refusal, so it must land in memory too.
+		if err := m.activeStorage.SetActive(ctx, m.authID(), storageIdentityKey); err != nil {
+			return fmt.Errorf("failed to set active storage %q: %w", storageIdentityKey, err)
+		}
+		m.refreshCachedActiveStorage(storageIdentityKey)
+		return nil
 	}
 
+	// HasStorageIdentityKey (not a raw Settings compare): a store that was
+	// never made available has no Settings/User at all, and matching it would
+	// nil-deref on the SetActive call below.
 	newActiveIndex := stdslices.IndexFunc(m.stores, func(storage *managed.Storage) bool {
-		return storage.Settings.StorageIdentityKey == storageIdentityKey
+		return storage.HasStorageIdentityKey(storageIdentityKey)
 	})
 	if newActiveIndex == -1 {
-		return fmt.Errorf("storage with identity key %s not found among managed storages", storageIdentityKey)
+		// The hint is a hedge, not a diagnosis: this fires for a mistyped key
+		// just as readily as for a store that was never made available, and
+		// the two are indistinguishable here — an unavailable store has no
+		// identity to compare against in the first place.
+		return fmt.Errorf("storage with identity key %s not found among managed storages "+
+			"(a storage that was never made available has no identity to match, so it cannot be found here "+
+			"— add it via AddWalletStorageProvider)", storageIdentityKey)
 	}
 
 	newActive := m.stores[newActiveIndex]
@@ -149,12 +198,22 @@ func (m *WalletStorageManager) SetActive(ctx context.Context, storageIdentityKey
 		return fmt.Errorf("failed to set active storage %q: %w", storageIdentityKey, err)
 	}
 
-	for _, store := range m.stores {
-		store.User.ActiveStorage = storageIdentityKey
-	}
+	m.refreshCachedActiveStorage(storageIdentityKey)
 
 	m.activeStorage = newActive
 	return nil
+}
+
+// refreshCachedActiveStorage points every managed store's cached user selection
+// at storageIdentityKey, so IsActiveEnabled (and therefore the write gate) sees
+// the switch without waiting for a re-read of the users row.
+func (m *WalletStorageManager) refreshCachedActiveStorage(storageIdentityKey string) {
+	for _, store := range m.stores {
+		if store.User == nil {
+			continue // never made available; nothing cached to refresh
+		}
+		store.User.ActiveStorage = storageIdentityKey
+	}
 }
 
 // GetActive returns the currently active storage provider, or nil if none is set.
@@ -177,6 +236,11 @@ func (m *WalletStorageManager) authID() wdk.AuthID {
 	return wdk.AuthID{IdentityKey: m.identityKey, UserID: to.Ptr(m.activeStorage.User.UserID)}
 }
 
+// getActiveReader returns the provider reads are routed to. It keeps its
+// nil-return (rather than getActiveWriter's error) because every generated
+// read wrapper calls GetAuth first, and GetAuth's MakeAvailable either
+// populates activeStorage or fails the call — so the nil branch is unreachable
+// from them, and only a future direct caller would need the error form.
 func (m *WalletStorageManager) getActiveReader() wdk.WalletStorageProvider {
 	if m.activeStorage == nil {
 		return nil
@@ -184,11 +248,31 @@ func (m *WalletStorageManager) getActiveReader() wdk.WalletStorageProvider {
 	return m.activeStorage
 }
 
-func (m *WalletStorageManager) getActiveWriter() wdk.WalletStorageProvider {
+// getActiveWriter returns the provider every WRITE must go through, refusing
+// with [ErrStorageNotActive] when this manager's store is not the one the user
+// has selected as active.
+//
+// Without the check a manager whose activeStorage is merely stores[0] would
+// happily create actions and mint change in a store the user does not consider
+// active, leaving the same coin spendable in two storages — the double spend
+// audit finding P1-2(c). Readers are deliberately NOT gated: inspecting a
+// non-active (e.g. backup) store is legitimate.
+func (m *WalletStorageManager) getActiveWriter() (wdk.WalletStorageProvider, error) {
 	if m.activeStorage == nil {
-		return nil
+		return nil, ErrNoActiveStorageConfigured
 	}
-	return m.activeStorage
+	// Bootstrap-safe: before MakeAvailable populates Settings/User there is no
+	// user selection to compare against, and the writes that run in that window
+	// (Migrate, FindOrInsertUser) are precisely the ones that establish
+	// availability. Gate only once the store knows who it is — ThinksItIsActive
+	// is false for both "not selected" and "not yet available", so the
+	// IsAvailable term is what separates the two.
+	if m.activeStorage.IsAvailable() && !m.activeStorage.ThinksItIsActive() {
+		return nil, fmt.Errorf("%w: this store is %q, the user's active storage is %q — call SetActive to cut over",
+			ErrStorageNotActive,
+			m.activeStorage.Settings.StorageIdentityKey, m.activeStorage.User.ActiveStorage)
+	}
+	return m.activeStorage, nil
 }
 
 // FindOutputBaskets finds output baskets for the authenticated user based on the provided filters.

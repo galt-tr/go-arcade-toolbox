@@ -24,6 +24,16 @@ func strPtrArg(p *string) any {
 	return *p
 }
 
+// uintPtrArg encodes an optional unsigned id for a bound parameter: NULL for a
+// nil pointer, else the value. Used for nullable FK columns such as
+// outputs.spent_by.
+func uintPtrArg(p *uint) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 // bytesArg encodes an optional byte slice for a bound parameter: NULL for an
 // empty/nil slice, else the bytes.
 func bytesArg(b []byte) any {

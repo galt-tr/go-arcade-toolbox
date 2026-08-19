@@ -73,6 +73,40 @@ So the **utxostore is the single source of spendability truth**. `ListOutputs`
 and `GetBalance` intersect the metastore's descriptive rows with the utxostore's
 live set; the metastore never decides spendability.
 
+### The seam on the wire (sync)
+
+Storage-to-storage sync has to cross that seam, because the receiving storage
+has no way to re-derive it: the chunk carries metastore rows, and the metastore
+is exactly the half that does not know what is spendable. `GetSyncChunk`
+therefore **projects the seam onto the wire** — for every change output it runs
+the same `outpointSpendable` intersection the read path uses and ships the
+result in `TableOutput.Spendable`, alongside the `SpentBy` history the row
+already carried. A coin that is spent, reserved (including the pre-broadcast
+pin), frozen or simply absent from the source's inventory ships as
+non-spendable.
+
+`ProcessSyncChunk` rebuilds inventory only for coins the source reports as
+still live (`Change && TxID != nil && Spendable && SpentBy == nil`). Anything
+else is stored as descriptive history with no utxostore row. Minting a coin the
+source has already committed to a transaction would make the same outpoint
+spendable in two storages — a wallet-inflicted double spend (audit P1-2).
+
+Two consequences worth knowing:
+
+- **Old sources rebuild nothing.** A chunk produced by a storage that predates
+  this projection ships `Spendable=false` for everything, so the target
+  rebuilds no inventory at all. That is fail-closed, which is the right
+  direction for a double-spend guard — but it is *not* self-healing. Re-running
+  the sync into the same target after upgrading the source does not repair it,
+  because `ProcessSyncChunk` skips every output whose parent transaction is
+  already present. The remedy is a resync into a **fresh** target.
+  `ProcessSyncChunk` logs a warning when a chunk carried change outputs and
+  minted none, which is the signature of this case.
+- **The wire carries no tier.** A coin that is `TierSending` or `TierUnproven`
+  at the source is rebuilt as `TierMined` on the target, so an in-flight coin
+  looks fully settled there. This is pre-existing (every synced coin was
+  already minted at `TierMined`); carrying `Tier` on the wire is a follow-up.
+
 ## Mode A vs Mode B consistency
 
 The provider auto-detects its consistency mode from how the two stores are wired
