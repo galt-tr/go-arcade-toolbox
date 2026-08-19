@@ -82,6 +82,57 @@ func TestClaimUsesPartialIndex(t *testing.T) {
 	}
 }
 
+// TestClaimableProbeUsesPartialIndex is the same guard for the claimable probe
+// the funder runs when a funding pass allocated nothing. It is only defensible
+// as an index descent: it runs on the not-enough-funds path, which under Mode A
+// contention is exactly the path a loaded system takes most often.
+//
+// The plan-sensitive case is the FALSE answer — no claimable row matches — where
+// the planner has to walk the index to prove a negative rather than stopping at
+// the first heap tuple it happens to find. So the bound is above every coin in
+// the pool.
+func TestClaimableProbeUsesPartialIndex(t *testing.T) {
+	pg := testenv.StartPostgres(t)
+	s := newPostgresStore(t, pg)
+	ctx := context.Background()
+
+	sc := utxostore.Scope{UserID: 1, Basket: "default", Tier: utxostore.TierMined}
+	const pool = 250_000
+	seedUTXOsPostgres(t, s, sc, benchSats, pool)
+
+	_, err := s.DB().ExecContext(ctx, "ANALYZE utxos")
+	require.NoError(t, err)
+
+	var raw []byte
+	err = s.DB().QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+sqlstore.ClaimableProbePGSQL,
+		sc.UserID, sc.Basket, int64(sc.Tier), benchSats+1).Scan(&raw)
+	require.NoError(t, err)
+	t.Logf("claimable probe plan:\n%s", raw)
+
+	var plans []struct {
+		Plan map[string]any `json:"Plan"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &plans))
+	require.Len(t, plans, 1)
+
+	nodeTypes, indexes := walkPlan(plans[0].Plan)
+	require.Contains(t, indexes, "idx_utxos_claim",
+		"the claimable probe must scan the partial index; node types seen: %v", nodeTypes)
+	for _, nt := range nodeTypes {
+		require.NotEqual(t, "Seq Scan", nt,
+			"the claimable probe must not sequential-scan the pool to prove a negative")
+	}
+
+	// And it must answer that negative correctly, not just cheaply.
+	exists, err := s.ClaimableExists(ctx, sc, benchSats+1)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	exists, err = s.ClaimableExists(ctx, sc, 0)
+	require.NoError(t, err)
+	require.True(t, exists, "every coin in the pool is claimable, so the any-coin probe must say so")
+}
+
 // walkPlan recursively collects every node's "Node Type" and "Index Name" from
 // an EXPLAIN (FORMAT JSON) plan tree.
 func walkPlan(node map[string]any) (nodeTypes []string, indexes []string) {

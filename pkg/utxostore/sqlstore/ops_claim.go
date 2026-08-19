@@ -70,11 +70,12 @@ type claimedRow struct {
 }
 
 // runClaim executes a claim statement that reserves rows in one round trip and
-// scans the RETURNING set. An empty result means no claimable coin matched —
-// or, under SKIP LOCKED, every match was momentarily locked by a concurrent
-// claimer that is reserving it in the same atomic statement; either way the
-// coin is not orphaned, so an empty set is reported as "none" (nil), never
-// ErrContention. See the package doc, "Design notes".
+// scans the RETURNING set. An EMPTY result is reported as "none" (nil): it is
+// ambiguous — no claimable coin matched, or every match was skipped by FOR
+// UPDATE SKIP LOCKED — but resolving that ambiguity costs a second query, and
+// only the caller knows whether the answer still matters. [Store.ClaimableExists]
+// is that second query; the funder runs it ONCE, at the point where it would
+// otherwise report insufficient funds. See the package doc, "Design notes".
 //
 // Retry mirrors [Store.withTx], and for the same reason. Claims used to be the
 // one operation in this package that ran with no lock-error retry at all: every
@@ -131,6 +132,163 @@ func (s *Store) claimOnce(ctx context.Context, query string, args ...any) ([]cla
 	return out, nil
 }
 
+// claimShape carries the ONE part of a claim's candidate predicate that differs
+// between the three claim statements: the satoshi comparison, in both dialects.
+// Pairing the spellings in a single value is what lets [Store.ClaimableExists]
+// ask exactly the question a claim asked, whichever engine ran it.
+//
+// Only the sufficient shape is wired to a caller today (it is the one that
+// answers "is there ANY claimable coin here", which is what the funder needs);
+// the other two exist so claim_predicate_test.go can pin their claim
+// statements' predicates too.
+type claimShape struct {
+	pg     string
+	sqlite string
+}
+
+// The satoshi comparisons themselves are constants so the SQLite claim
+// statements below stay compile-time constant expressions (no per-claim string
+// building on the hot path); the claimShape values just pair them up.
+const (
+	satsSufficientPG       = `satoshis >= $4`
+	satsSufficientSQLite   = `satoshis >= ?`
+	satsInsufficientPG     = `satoshis < $4`
+	satsInsufficientSQLite = `satoshis < ?`
+	satsExactPG            = `satoshis = $4`
+	satsExactSQLite        = `satoshis = ?`
+)
+
+var (
+	shapeSmallestSufficient  = claimShape{pg: satsSufficientPG, sqlite: satsSufficientSQLite}
+	shapeLargestInsufficient = claimShape{pg: satsInsufficientPG, sqlite: satsInsufficientSQLite}
+	shapeExact               = claimShape{pg: satsExactPG, sqlite: satsExactSQLite}
+)
+
+// claimCandidatePG and claimCandidateSQLite are the scope-and-claimability half
+// of a claim's candidate predicate — the claim statements' own words, minus the
+// per-shape satoshi comparison — in each dialect. They are also, verbatim, the
+// terms idx_utxos_claim's partial WHERE is declared with, so the probe below is
+// a lookup that index can answer.
+//
+// The three SQLite claim statements are BUILT from claimCandidateSQLite (see
+// the claim methods below), so on that engine drift is impossible by
+// construction. The three PostgreSQL ones are not: claim_explain_test.go
+// EXPLAINs those constants byte-for-byte through their exported twins, so they
+// stay literal, and claim_predicate_test.go is their drift guard — it slices
+// each statement's WHERE…ORDER BY segment and requires it to EQUAL this
+// predicate plus the shape's comparison, so a term appended anywhere in the
+// clause fails. Drift in either direction breaks the probe: a looser predicate
+// invents contention, a tighter one misses it.
+const (
+	claimCandidatePG     = `user_id=$1 AND basket=$2 AND tier=$3 AND reserved_by IS NULL AND spent_by IS NULL AND NOT frozen`
+	claimCandidateSQLite = `user_id=? AND basket=? AND tier=? AND reserved_by IS NULL AND spent_by IS NULL AND frozen = 0`
+)
+
+// claimCandidateExistsSQL renders the contention probe for one claim shape: the
+// claim's candidate predicate with no ORDER BY, no LIMIT, no UPDATE and no FOR
+// UPDATE. It takes no locks and stops at the first matching row.
+func (s *Store) claimCandidateExistsSQL(shape claimShape) string {
+	if s.engine == EnginePostgres {
+		return `SELECT EXISTS(SELECT 1 FROM utxos WHERE ` + claimCandidatePG + ` AND ` + shape.pg + `)`
+	}
+	return `SELECT EXISTS(SELECT 1 FROM utxos WHERE ` + claimCandidateSQLite + ` AND ` + shape.sqlite + `)`
+}
+
+// ClaimableExists reports whether sc holds at least one CLAIMABLE row
+// (unreserved, unspent, unfrozen) with Satoshis >= minSats — pass 0 to ask
+// "any claimable coin at all". It reserves nothing, takes no locks, and is NOT
+// part of [utxostore.Store]: callers reach it through a type assertion, so
+// backends that cannot answer it simply do not offer it.
+//
+// It exists to answer one question, for one caller: the funder, at the moment
+// it is about to report ErrNotEnoughFunds. Audit finding P2-4 (see the package
+// doc, "Design notes").
+//
+// # Why an empty claim is not proof of an empty pool
+//
+// The old argument — a row skipped by FOR UPDATE SKIP LOCKED is, by
+// construction, being reserved by the peer holding its lock inside that peer's
+// own atomic statement, so no coin is orphaned and "empty" is honest — holds
+// only while a claim's locks live for the length of the claim statement. In
+// Mode A they do not: the claim runs on the caller's ambient transaction, so
+// its locks live until the whole CreateAction commits. A concurrent
+// CreateAction skips those rows for as long as that takes, sees a false-empty
+// pool, and the funder turns it into a user-facing ErrNotEnoughFunds — which it
+// does NOT retry — while the coins are still there and may yet be released by a
+// rollback.
+//
+// # Why this sees what the claim could not
+//
+// It is a plain non-locking read, so under READ COMMITTED — PostgreSQL's
+// default, and this module never overrides it (no store passes TxOptions when
+// it opens a transaction) — it reads the last COMMITTED version of each row: a
+// row a competitor has locked and reserved but not committed still reads as
+// unreserved. That is exactly the row SKIP LOCKED had to skip, and exactly the
+// row that comes back if the competitor rolls back. Under a stricter isolation
+// level (REPEATABLE READ/SERIALIZABLE) the caller's snapshot would predate the
+// competitor's write anyway, so the answer would be the same; only the
+// competitor's COMMIT becoming visible mid-transaction depends on READ
+// COMMITTED.
+//
+// Taking no locks is also what makes it safe to run on the ambient transaction
+// (via execer): it cannot queue behind the very locks it is diagnosing. Running
+// there rather than on a separate connection is load-bearing, not incidental —
+// inside the caller's own transaction its OWN uncommitted reservations read as
+// reserved, so they are correctly excluded. A probe on a separate connection
+// would see the caller's own claims as still claimable and report contention
+// after every failed pass, turning each honest insufficient-funds into the full
+// retry budget.
+//
+// # Why the caller's answer converges
+//
+// A true here means "retry may help", and the funder turns it into
+// [utxostore.ErrContention]: it releases its whole token and retries after a
+// jittered backoff. In Mode A that release unwinds only the caller's own
+// uncommitted claims — it cannot touch the competitor's rows, which are held
+// under a different token. The retried claim is a NEW statement with a NEW
+// snapshot, so it sees whatever the competitor committed: either the coins are
+// free (claim succeeds) or they are genuinely gone (claim empty, probe now
+// false, honest ErrNotEnoughFunds). Persistent contention is bounded by the
+// funder's attempt budget and surfaces as funder.ErrUTXOContention — a
+// retryable answer, which a false insufficient-funds is not.
+func (s *Store) ClaimableExists(ctx context.Context, sc utxostore.Scope, minSats uint64) (bool, error) {
+	if s.isClosed() {
+		return false, errClosed
+	}
+	if err := validateScope(sc); err != nil {
+		return false, err
+	}
+	return s.claimableExists(ctx, sc, shapeSmallestSufficient, minSats)
+}
+
+// claimableExists runs the probe for one claim shape. It is the shape-generic
+// half of [Store.ClaimableExists], kept separate so every claim statement's
+// predicate has a probe twin the drift guard can pin.
+func (s *Store) claimableExists(ctx context.Context, sc utxostore.Scope, shape claimShape, bound uint64) (bool, error) {
+	var exists boolScan
+	err := s.execer(ctx).
+		QueryRowContext(ctx, s.claimCandidateExistsSQL(shape), sc.UserID, sc.Basket, int64(sc.Tier), bound).
+		Scan(s.boolDest(&exists))
+	if err != nil {
+		return false, fmt.Errorf("sqlstore: claimable probe: %w", err)
+	}
+	return s.boolGet(exists), nil
+}
+
+// validateScope rejects an underspecified scope. It is [validateClaim] minus
+// the reservation token, which a probe does not take.
+func validateScope(sc utxostore.Scope) error {
+	switch {
+	case sc.UserID <= 0:
+		return errors.New("sqlstore: scope user id must be positive")
+	case sc.Basket == "":
+		return errors.New("sqlstore: scope basket must be non-empty")
+	case !sc.Tier.Valid():
+		return fmt.Errorf("sqlstore: invalid scope tier %d", sc.Tier)
+	}
+	return nil
+}
+
 // ClaimSmallestSufficient implements [utxostore.Store]: the true minimum
 // Satoshis >= minSats among claimable rows in scope, ties broken by insertion
 // order (seq).
@@ -154,8 +312,7 @@ func (s *Store) ClaimSmallestSufficient(ctx context.Context, sc utxostore.Scope,
 		query = `UPDATE utxos SET reserved_by=?, reserved_at=?
 		WHERE (txid, vout) IN (
 			SELECT txid, vout FROM utxos
-			WHERE user_id=? AND basket=? AND tier=?
-			  AND reserved_by IS NULL AND spent_by IS NULL AND frozen = 0 AND satoshis >= ?
+			WHERE ` + claimCandidateSQLite + ` AND ` + satsSufficientSQLite + `
 			ORDER BY satoshis, seq LIMIT 1)
 		RETURNING ` + utxoCols
 		args = []any{reservation, s.encTime(ts), sc.UserID, sc.Basket, int64(sc.Tier), minSats}
@@ -197,8 +354,7 @@ func (s *Store) ClaimLargestInsufficient(ctx context.Context, sc utxostore.Scope
 		query = `UPDATE utxos SET reserved_by=?, reserved_at=?
 		WHERE (txid, vout) IN (
 			SELECT txid, vout FROM utxos
-			WHERE user_id=? AND basket=? AND tier=?
-			  AND reserved_by IS NULL AND spent_by IS NULL AND frozen = 0 AND satoshis < ?
+			WHERE ` + claimCandidateSQLite + ` AND ` + satsInsufficientSQLite + `
 			ORDER BY satoshis DESC, seq DESC LIMIT ?)
 		RETURNING ` + utxoCols
 		args = []any{reservation, s.encTime(ts), sc.UserID, sc.Basket, int64(sc.Tier), capSats, limit}
@@ -244,8 +400,7 @@ func (s *Store) ClaimExact(ctx context.Context, sc utxostore.Scope, reservation 
 		query = `UPDATE utxos SET reserved_by=?, reserved_at=?
 		WHERE (txid, vout) IN (
 			SELECT txid, vout FROM utxos
-			WHERE user_id=? AND basket=? AND tier=?
-			  AND reserved_by IS NULL AND spent_by IS NULL AND frozen = 0 AND satoshis = ?
+			WHERE ` + claimCandidateSQLite + ` AND ` + satsExactSQLite + `
 			ORDER BY satoshis, seq LIMIT ?)
 		RETURNING ` + utxoCols
 		args = []any{reservation, s.encTime(ts), sc.UserID, sc.Basket, int64(sc.Tier), denomination, count}

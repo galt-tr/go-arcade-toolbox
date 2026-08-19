@@ -8,3 +8,10 @@ const (
 	ClaimLargestInsufficientPGSQL = claimLargestInsufficientPG
 	ClaimExactPGSQL               = claimExactPG
 )
+
+// ClaimableProbePGSQL is the production PostgreSQL text of the claimable probe
+// [Store.ClaimableExists] runs, exposed for the same reason: the EXPLAIN
+// regression test plans the exact statement. It must stay on idx_utxos_claim —
+// the probe's whole justification is that it costs one index descent on a path
+// that was already about to report insufficient funds.
+var ClaimableProbePGSQL = (&Store{engine: EnginePostgres}).claimCandidateExistsSQL(shapeSmallestSufficient)

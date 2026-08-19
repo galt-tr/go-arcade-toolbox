@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/galt-tr/go-arcade-toolbox/internal/sqltx"
 	"github.com/galt-tr/go-arcade-toolbox/internal/testenv"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/defs"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
@@ -42,7 +43,7 @@ func TestIntegration_Funder_SQLite(t *testing.T) {
 // store (one isolated schema per subtest). Skips gracefully with no runtime.
 func TestIntegration_Funder_Postgres(t *testing.T) {
 	pg := testenv.StartPostgres(t)
-	factory := func(t *testing.T) utxostore.Store {
+	newPGStore := func(t *testing.T) *sqlstore.Store {
 		t.Helper()
 		dsn := pg.IsolatedSchemaDSN(t)
 		s, err := sqlstore.OpenPostgres(context.Background(), dsn)
@@ -50,7 +51,48 @@ func TestIntegration_Funder_Postgres(t *testing.T) {
 		t.Cleanup(func() { _ = s.Close(context.Background()) })
 		return s
 	}
-	runFunderIntegration(t, factory)
+	runFunderIntegration(t, func(t *testing.T) utxostore.Store { return newPGStore(t) })
+
+	// The Mode A false-empty, end to end and on real PostgreSQL: everything
+	// below depends on SKIP LOCKED skipping an uncommitted peer's rows, which no
+	// fake reproduces (audit finding P2-4).
+	t.Run("coins locked by an uncommitted peer are contention, not insufficient funds", func(t *testing.T) {
+		ctx := context.Background()
+		store := newPGStore(t)
+		mintCoins(t, store, "tx", utxostore.TierMined, 5000)
+
+		// A competitor claims the pool's only coin on an AMBIENT transaction —
+		// the metastore's CreateAction transaction, in production — and does not
+		// commit. Its row lock now outlives the claim statement.
+		tx, err := store.DB().BeginTx(ctx, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tx.Rollback() })
+		held, err := store.ClaimSmallestSufficient(sqltx.With(ctx, tx, store.DB()),
+			utxostore.Scope{UserID: testUserID, Basket: testBasket, Tier: utxostore.TierMined},
+			"competitor", 1000)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+
+		f := funder.New(testLogger(t), store, defs.FeeModel{Type: defs.SatPerKB, Value: 1},
+			funder.WithBackoffForTest(noBackoff))
+
+		_, err = f.Fund(ctx, baseArgs(1000, 44, 1))
+		require.ErrorIs(t, err, funder.ErrUTXOContention,
+			"every claim came back empty because the coin is LOCKED, not gone. Answering "+
+				"ErrNotEnoughFunds fails the payment for good; contention is retryable and true")
+		require.NotErrorIs(t, err, funder.ErrNotEnoughFunds)
+
+		bal, err := store.Balance(ctx, testUserID, testBasket)
+		require.NoError(t, err)
+		require.Zero(t, bal.Reserved, "the abandoned attempt must leave nothing of its own held")
+
+		// The competitor unwinds; the very same funding now succeeds, which is
+		// what makes the retry worth doing.
+		require.NoError(t, tx.Rollback())
+		result, err := f.Fund(ctx, baseArgs(1000, 44, 1))
+		require.NoError(t, err)
+		require.Equal(t, []uint64{5000}, allocatedSats(result))
+	})
 }
 
 func runFunderIntegration(t *testing.T, newStore storeFactory) {

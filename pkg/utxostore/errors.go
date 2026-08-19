@@ -33,6 +33,16 @@ var (
 	//     the error inside its budget; where it is the reporter it hands
 	//     ErrContention on, and nothing above it retries.
 	//
+	//     A caller can also establish it WITHOUT the store ever raising it. A
+	//     SQL claim answers (nil, nil) on an empty result and says no more,
+	//     because within one statement it cannot tell exhaustion from rows its
+	//     FOR UPDATE SKIP LOCKED had to skip — and in Mode A those rows stay
+	//     skipped for as long as a peer's whole CreateAction runs. So the funder
+	//     asks a second question when a full pass allocated nothing: the store's
+	//     non-locking ClaimableExists probe. Coins claimable but unclaimed means
+	//     they were hidden, and the funder raises ErrContention itself, then
+	//     retries it as the retrier of the case above.
+	//
 	//   - A row that would not hold still. A guarded write — a CAS in aerostore,
 	//     a guard-carrying UPDATE/DELETE in sqlstore — matched nothing, yet the
 	//     classifying read that followed found the row eligible again: a peer is

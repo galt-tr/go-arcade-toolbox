@@ -93,12 +93,33 @@
 //     itself evidence of contention: the candidate SELECT and the reserving
 //     UPDATE are the SAME statement, so any row a claimer skips under SKIP
 //     LOCKED is being reserved by the peer holding its lock — the coin is never
-//     orphaned, and no retry by this claimer would find it. Whether an empty
-//     result is reported as [utxostore.ErrContention] is therefore a question
-//     about what else the store knows, not about the claim statement's
-//     semantics. Today it knows nothing more, so it reports "none" (nil); the
-//     conformance suite's concurrent-exclusivity subtest confirms every coin is
-//     claimed exactly once along that path.
+//     orphaned. Whether an empty result is reported as
+//     [utxostore.ErrContention] is therefore a question about what else the
+//     store knows, not about the claim statement's semantics. The claim itself
+//     still reports "none" (nil) on both engines, and the conformance suite's
+//     concurrent-exclusivity subtest still confirms every coin is claimed
+//     exactly once along that path.
+//
+//     What the store knows how to answer WHEN ASKED is now
+//     [Store.ClaimableExists]: a non-locking SELECT EXISTS over the claim's own
+//     candidate predicate. The "the peer holding the lock is taking it anyway"
+//     argument above is scoped to the life of a claim STATEMENT; in Mode A the
+//     claim runs on the caller's ambient transaction, so its locks live until
+//     that whole CreateAction commits and the peer may yet roll back and hand
+//     the coin back. A concurrent CreateAction that reported ErrNotEnoughFunds
+//     over rows in that state would be lying to the user (audit finding P2-4).
+//
+//     The funder is the only caller, and it asks at exactly one point: after a
+//     whole funding pass has allocated nothing, in place of reporting
+//     insufficient funds. Never on the allocating path — an empty claim
+//     mid-walk is ordinary — and never mid-walk, so locked rows in one tier
+//     cannot pre-empt a fund another tier could cover. idx_utxos_claim's
+//     partial WHERE is exactly the probe's claimability terms, so it answers in
+//     one index descent, and under READ COMMITTED (PostgreSQL's default, which
+//     nothing in this module overrides) it reads the last COMMITTED row
+//     version — precisely why it sees what SKIP LOCKED had to skip.
+//     claim_predicate_test.go pins its predicate to the claim statements' so
+//     the two cannot drift, and claim_explain_test.go pins its plan.
 //
 //     The guarded mutations have their own ErrContention exit, from an
 //     unrelated cause: Spend (both modes) and Remove report it per item when a
