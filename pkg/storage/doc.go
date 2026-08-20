@@ -40,12 +40,16 @@
 // txid is only known once the wallet has SIGNED it — i.e. at ProcessAction, when
 // the signed raw transaction arrives — because for BSV the txid hashes the
 // unlocking scripts too. CreateAction therefore CANNOT mint change inventory: it
-// only reserves the funding inputs (under the transaction Reference as the
-// reservation token) and persists the unsigned metadata (transaction row, change
-// output rows, commission). Change inventory is minted at ProcessAction into the
-// change basket at [utxostore.TierSending] and promoted to
-// [utxostore.TierUnproven] once arcade accepts the broadcast (HTTP 202). The
-// reserved funding inputs stay reserved through the pre-broadcast states
+// only reserves its inputs (under the transaction Reference as the reservation
+// token) and persists the unsigned metadata (transaction row, change output
+// rows, commission). "Its inputs" is BOTH the coins the funder claimed and the
+// wallet-owned coins the caller named explicitly — one token over both, taken
+// before the funder runs so it cannot claim a coin the caller already committed
+// to. An input the wallet does not own is left alone: it has no inventory row,
+// so there is no exclusivity to enforce and none to claim. Change inventory is
+// minted at ProcessAction into the change basket at [utxostore.TierSending] and
+// promoted to [utxostore.TierUnproven] once arcade accepts the broadcast (HTTP
+// 202). Inputs of both kinds stay reserved through the pre-broadcast states
 // (unsigned / nosend / unsent) and transition reserved→spent only on broadcast
 // acceptance. This is what makes AbortAction correct: a pre-broadcast abort
 // releases the reservation by the tx Reference and removes any minted change.

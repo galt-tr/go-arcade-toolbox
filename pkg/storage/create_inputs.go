@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/bsv-blockchain/go-sdk/chainhash"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/metastore"
@@ -18,6 +20,11 @@ type resolvedInput struct {
 	satoshis      int64
 	lockingScript []byte
 	known         bool // the outpoint is also a known local output of this user
+	// op is the parsed outpoint, meaningful only when known. It is the key the
+	// utxostore holds a coin under, and only a wallet-owned coin has a row
+	// there to hold — so this is set on exactly the inputs this provider has
+	// the authority (and the duty) to reserve.
+	op utxostore.Outpoint
 }
 
 // resolveProvidedInputs resolves each caller-provided input's satoshis and
@@ -46,6 +53,15 @@ func (p *Provider) resolveProvidedInputs(ctx context.Context, userID int, inputs
 			ri.satoshis = rows[0].Satoshis
 			ri.lockingScript = rows[0].LockingScript
 			ri.known = true
+			h, herr := chainhash.NewHashFromHex(txid)
+			if herr != nil {
+				// The row was found by this very txid string, so a parse failure
+				// here means the metastore holds something that is not a txid.
+				// Fail loudly rather than silently dropping the coin from the set
+				// that gets reserved.
+				return nil, 0, fmt.Errorf("storage: resolve input %d: parse txid %q: %w", i, txid, herr)
+			}
+			ri.op = utxostore.Outpoint{TxID: *h, Vout: vout}
 		} else if providedBeef != nil {
 			srcTx := providedBeef.FindTransaction(txid)
 			if srcTx != nil && int(vout) < len(srcTx.Outputs) {
@@ -65,6 +81,93 @@ func (p *Provider) resolveProvidedInputs(ctx context.Context, userID int, inputs
 		out = append(out, ri)
 	}
 	return out, total, nil
+}
+
+// walletOwnedOutpoints returns the outpoints of the caller-provided inputs this
+// wallet owns — the ones with a row in the utxostore, and therefore the only
+// ones this provider can (or may) hold exclusively.
+//
+// EXTERNAL inputs are deliberately absent. They have no inventory row, so
+// ReserveOutpoints would refuse them with a [utxostore.NotFoundError] and fail
+// the whole all-or-nothing batch; and refusing them would be wrong anyway,
+// because this wallet has no exclusivity authority over a coin it does not own.
+// Their fate is decided at the accept path instead, which tolerates NotFound on
+// exactly this basis.
+func walletOwnedOutpoints(provided []resolvedInput) []utxostore.Outpoint {
+	ops := make([]utxostore.Outpoint, 0, len(provided))
+	for i := range provided {
+		if provided[i].known {
+			ops = append(ops, provided[i].op)
+		}
+	}
+	return ops
+}
+
+// reserveProvidedInputs holds the caller's own named coins under the action's
+// reference, so a second CreateAction — and the funder of this very one —
+// cannot also take them (audit P0-1).
+//
+// It is a no-op for an empty set: [utxostore.Store.ReserveOutpoints] rejects a
+// zero-op batch as a programmer error ("you asked for an all-or-nothing hold
+// and named nothing to hold"), and the overwhelmingly common action names no
+// inputs at all.
+func (p *Provider) reserveProvidedInputs(ctx context.Context, userID int, reference string, ops []utxostore.Outpoint) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	if err := p.utxo.ReserveOutpoints(ctx, int64(userID), reference, ops); err != nil {
+		return mapProvidedInputError(err)
+	}
+	return nil
+}
+
+// mapProvidedInputError turns a ReserveOutpoints refusal into an error the
+// wallet caller can act on, WITHOUT losing the typed cause: both wraps use %w,
+// so errors.Is finds the sentinel and errors.As still reaches the
+// [utxostore.SpentError] / [utxostore.ReservedError] / [utxostore.FrozenError]
+// / [utxostore.NotFoundError] underneath (see [wdk.ErrInputUnavailable] for why
+// a distinct sentinel and not one of the funding ones).
+//
+// [utxostore.ErrContention] is not a refusal at all — an optimistic backend
+// saying "ask me again" — so it maps to the retryable contention sentinel
+// instead. Nothing was reserved in that case either.
+func mapProvidedInputError(err error) error {
+	if errors.Is(err, utxostore.ErrContention) {
+		return fmt.Errorf("storage: reserve provided inputs: %w: %w", wdk.ErrUTXOContention, err)
+	}
+	op, ok := refusedOutpoint(err)
+	if !ok {
+		// Not a per-item refusal: a closed store, a dead connection, a validation
+		// bug. Nothing about it is the caller's input, so it must not be dressed
+		// up as an unavailable coin.
+		return fmt.Errorf("storage: reserve provided inputs: %w", err)
+	}
+	return fmt.Errorf("storage: provided input %s is unavailable: %w: %w", op, wdk.ErrInputUnavailable, err)
+}
+
+// refusedOutpoint names one coin from a ReserveOutpoints batch error, for the
+// message. The search order is the store's own refusal precedence (spent >
+// reserved > frozen > not found), so when a caller named several coins and
+// several were refused, the message leads with the most final reason rather
+// than with whichever happened to be listed first.
+func refusedOutpoint(err error) (utxostore.Outpoint, bool) {
+	var (
+		spent    *utxostore.SpentError
+		reserved *utxostore.ReservedError
+		frozen   *utxostore.FrozenError
+		missing  *utxostore.NotFoundError
+	)
+	switch {
+	case errors.As(err, &spent):
+		return spent.Op, true
+	case errors.As(err, &reserved):
+		return reserved.Op, true
+	case errors.As(err, &frozen):
+		return frozen.Op, true
+	case errors.As(err, &missing):
+		return missing.Op, true
+	}
+	return utxostore.Outpoint{}, false
 }
 
 // buildResultInputs assembles the signing template's inputs: caller-provided

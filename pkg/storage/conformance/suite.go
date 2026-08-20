@@ -114,6 +114,7 @@ func RunProviderSuite(t *testing.T, newProvider func(t *testing.T) wdk.WalletSto
 	}{
 		{"CreateProcessRoundtrip", s.createProcessRoundtrip},
 		{"ContentionClaim", s.contentionClaim},
+		{"ProvidedInputExclusivity", s.providedInputExclusivity},
 		{"Internalize", s.internalize},
 		{"AbortRestores", s.abortRestores},
 		{"AbortFence", s.abortFence},

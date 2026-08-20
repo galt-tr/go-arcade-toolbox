@@ -128,13 +128,14 @@ type restError struct {
 // the matching sentinel so errors.Is keeps working across the wire; unknown
 // codes surface as a [RemoteError].
 const (
-	CodeNotEnoughFunds  = "ERR_NOT_ENOUGH_FUNDS"
-	CodeUTXOContention  = "ERR_UTXO_CONTENTION"
-	CodeNotFound        = "ERR_NOT_FOUND"
-	CodeAuthorization   = "ERR_AUTHORIZATION"
-	CodeUnauthenticated = "ERR_UNAUTHENTICATED"
-	CodeBadRequest      = "ERR_BAD_REQUEST"
-	CodeInternal        = "ERR_INTERNAL"
+	CodeNotEnoughFunds   = "ERR_NOT_ENOUGH_FUNDS"
+	CodeUTXOContention   = "ERR_UTXO_CONTENTION"
+	CodeInputUnavailable = "ERR_INPUT_UNAVAILABLE"
+	CodeNotFound         = "ERR_NOT_FOUND"
+	CodeAuthorization    = "ERR_AUTHORIZATION"
+	CodeUnauthenticated  = "ERR_UNAUTHENTICATED"
+	CodeBadRequest       = "ERR_BAD_REQUEST"
+	CodeInternal         = "ERR_INTERNAL"
 )
 
 // sentinelMapping ties a wire code + HTTP status to the set of sentinel errors
@@ -155,7 +156,12 @@ type sentinelMapping struct {
 	sentinels []error
 }
 
+// ORDER MATTERS for codeStatusFor, which returns the FIRST mapping the error
+// matches. Provided-input unavailability leads because it is the most specific
+// statement about the failure: only the named-input path produces it, while a
+// funding sentinel could plausibly be alongside it in a wrapped chain.
 var sentinelMappings = []sentinelMapping{
+	{CodeInputUnavailable, http.StatusConflict, []error{wdk.ErrInputUnavailable}},
 	{CodeNotEnoughFunds, http.StatusUnprocessableEntity, []error{funder.ErrNotEnoughFunds, wdk.ErrNotEnoughFunds}},
 	{CodeUTXOContention, http.StatusConflict, []error{funder.ErrUTXOContention, wdk.ErrUTXOContention}},
 	{CodeAuthorization, http.StatusForbidden, []error{ErrAuthorization}},
