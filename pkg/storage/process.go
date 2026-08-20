@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -716,7 +717,7 @@ func (p *Provider) broadcastOne(ctx context.Context, userID int, txid string) (w
 	if res.Rejected {
 		return p.commitRejected(ctx, userID, txid, res)
 	}
-	return p.commitAccepted(ctx, userID, txid, tx)
+	return p.commitAccepted(ctx, txid, tx)
 }
 
 // broadcastWithBackpressure calls the oracle, honoring a single Retry-After on a
@@ -738,57 +739,119 @@ func (p *Provider) broadcastWithBackpressure(ctx context.Context, txid string, e
 }
 
 // commitAccepted commits a 202-accepted broadcast: spend reserved inputs,
-// promote change to TierUnproven, transition statuses.
-func (p *Provider) commitAccepted(ctx context.Context, userID int, txid string, tx *transaction.Transaction) (wdk.SendWithResult, *wdk.ReviewActionResult, error) {
+// transition statuses, record the input spend-history.
+//
+// It does not resolve the transaction row itself. It used to, USER-SCOPED, and
+// that was half of audit P1-3: a SendWith carrying another user's txid found no
+// row under the caller and silently committed the statuses without the spend.
+// [Provider.applyAcceptedBroadcast] owns the resolution now, and does it across
+// users.
+func (p *Provider) commitAccepted(ctx context.Context, txid string, tx *transaction.Transaction) (wdk.SendWithResult, *wdk.ReviewActionResult, error) {
 	swr := wdk.SendWithResult{TxID: primitives.TXIDHexString(txid), Status: wdk.SendWithResultStatusUnproven}
 	rar := &wdk.ReviewActionResult{TxID: primitives.TXIDHexString(txid), Status: wdk.ReviewActionResultStatusSuccess}
 
-	txRow := p.firstTxByTxID(ctx, userID, txid)
-
-	if err := p.applyAcceptedBroadcast(ctx, userID, txid, tx, txRow); err != nil {
+	if err := p.applyAcceptedBroadcast(ctx, txid, tx); err != nil {
 		return swr, nil, err
 	}
 	return swr, rar, nil
 }
 
 // applyAcceptedBroadcast commits the wallet-state transition for a
-// broadcast-accepted transaction, atomically: transaction rows → unproven,
-// known tx → unconfirmed, reserved inputs → spent, change coins → TierUnproven,
-// and the local input spend-history recorded. It is shared by the synchronous
-// broadcast path ([Provider.commitAccepted]) and the monitor's SendWaiting
-// sweep. txRow (the transaction row carrying userID/reference/transaction-id)
-// may be nil, in which case only the status transitions are applied.
-func (p *Provider) applyAcceptedBroadcast(ctx context.Context, userID int, txid string, tx *transaction.Transaction, txRow *wdk.TableTransaction) error {
+// broadcast-accepted transaction: reserved inputs → spent (as a FACT), the
+// transaction rows → unproven, the known tx → unconfirmed, and the local input
+// spend-history recorded. It is shared by the synchronous broadcast path
+// ([Provider.commitAccepted]) and the monitor's SendWaiting sweep
+// ([Provider.sendOneWaiting]); both hand it only a txid and the parsed bytes.
+//
+// It resolves its OWN transaction row, CROSS-USER
+// ([metastore.TransactionsRepo.FindByTxIDAllUsers]), because the monitor works
+// by txid and a SendWith may carry a txid whose row belongs to another user.
+// Two failures that used to be swallowed are now refusals:
+//
+//   - a query ERROR propagates. "The row could not be read" and "there is no
+//     row" are different facts and only one of them is safe to act on.
+//   - ZERO rows is a HARD error, raised BEFORE any status write. The old code
+//     advanced the statuses anyway (stamping was_broadcast sticky) and skipped
+//     the spend entirely, leaving the inputs reserved-and-unspent while the row
+//     moved past the broadcast stage where no sweep re-drives it — audit P1-3,
+//     a permanently lost spend. There is no legitimate flow that broadcasts
+//     bytes with no transaction row behind them, so this is corruption, and
+//     refusing keeps the known tx at 'sending' for the graced re-drive.
+//
+// ORDER INSIDE THE COMMIT: the fact-spend runs FIRST, then the statuses, then
+// the spend-history. In Mode A everything is one transaction and the order is
+// immaterial. In Mode B the utxostore is a different database and its write
+// commits when the statement runs, so the order picks which half a crash can
+// strand — and only one direction converges:
+//
+//   - spend first: a crash before the status commit leaves the known tx at
+//     'sending', which is exactly [metastore.KnownTxRepo.FindResendable]'s
+//     graced recovery arm. The re-drive re-POSTs (arcade is idempotent by
+//     txid) and re-applies; the fact-mode spend of the SAME spender is an
+//     idempotent success, so the second pass completes the statuses.
+//   - statuses first: a crash before the spend leaves the known tx at
+//     'unconfirmed' — beyond the broadcast stage, off every work list — with
+//     its inputs still claimable. Nothing ever comes back for them.
+//
+// The same reasoning makes a returned error safe: the metadata half rolls back,
+// the row stays at 'sending', and the next sweep tick redoes the whole apply.
+func (p *Provider) applyAcceptedBroadcast(ctx context.Context, txid string, tx *transaction.Transaction) error {
+	rows, err := p.meta.Transactions().FindByTxIDAllUsers(ctx, txid)
+	if err != nil {
+		return fmt.Errorf("storage: resolve transaction row for accepted broadcast %s: %w", txid, err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("storage: accepted broadcast for %s has no transaction row; "+
+			"refusing to commit without recording the spend", txid)
+	}
+	// A txid can back several rows — a self-payment is recorded by BOTH sides —
+	// and only the SPENDER's row carries the reservation that funded it and the
+	// transaction-id the spend-history hangs off. Prefer the outgoing row; the
+	// newest (rows are ordered transaction_id DESC) is the fallback when nothing
+	// is marked outgoing.
+	//
+	// Fact mode already makes the reservation half forgiving — it is no longer a
+	// guard there, only a non-empty programmer-error check — but markInputsSpent
+	// is NOT: it looks the input rows up scoped to txRow.UserID, so picking the
+	// recipient's row would silently record no spend-history at all.
+	txRow := &rows[0]
+	for i := range rows {
+		if rows[i].IsOutgoing {
+			txRow = &rows[i]
+			break
+		}
+	}
+
 	return p.meta.Do(ctx, func(ctx context.Context) error {
+		// SPEND FIRST — see the ordering note above.
+		if err := p.spendReservedInputs(ctx, tx, txid, string(txRow.Reference)); err != nil {
+			return err
+		}
 		if err := p.meta.Transactions().UpdateStatusByTxID(ctx, txid, wdk.TxStatusUnproven,
 			wdk.TxStatusSending, wdk.TxStatusNoSend, wdk.TxStatusUnproven, wdk.TxStatusUnprocessed); err != nil &&
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) {
 			return fmt.Errorf("storage: mark unproven: %w", err)
 		}
+		// The skip set stays the beyond-broadcast one and must: the row is at
+		// 'sending' when this runs (the broadcast gate put it there), and
+		// 'sending' is deliberately NOT in that set, so the advance applies. The
+		// wider [metastore.KnownTxNeverRequeueStatuses] is the guard for BACKWARD,
+		// requeue-shaped writes and would block this forward one forever.
 		if err := p.meta.KnownTx().UpdateStatus(ctx, txid, wdk.ProvenTxStatusUnconfirmed,
 			wdk.ProvenTxReqBeyondBroadcastStageStatuses...); err != nil &&
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) && !errors.Is(err, metastore.ErrNotFound) {
 			return fmt.Errorf("storage: mark known tx unconfirmed: %w", err)
 		}
-		// Spend the reserved inputs (reserved→spent).
-		if txRow != nil {
-			if err := p.spendReservedInputs(ctx, tx, txid, string(txRow.Reference)); err != nil {
-				return err
-			}
-			// Change stays at TierSending here and is NOT promoted to claimable
-			// on the 202. A 202 is "accepted for processing", not validated: the
-			// tx can still fail validation, and until arcade has SEEN it a child
-			// that spends this change can reach arcade's validation before the
-			// parent is in its mempool — an unknown-input rejection that cascades
-			// down a self-payment chain. Promotion to TierUnproven happens only on
-			// the actual SEEN status ([Provider.applySeen] / the poll fallback), or
-			// directly to TierMined on proof — so a coin is spendable only once the
-			// network has accepted the tx that created it.
-			if err := p.markInputsSpent(ctx, userID, txRow.TransactionID, tx); err != nil {
-				return err
-			}
-		}
-		return nil
+		// Change stays at TierSending here and is NOT promoted to claimable on
+		// the 202. A 202 is "accepted for processing", not validated: the tx can
+		// still fail validation, and until arcade has SEEN it a child that spends
+		// this change can reach arcade's validation before the parent is in its
+		// mempool — an unknown-input rejection that cascades down a self-payment
+		// chain. Promotion to TierUnproven happens only on the actual SEEN status
+		// ([Provider.applySeen] / the poll fallback), or directly to TierMined on
+		// proof — so a coin is spendable only once the network has accepted the
+		// tx that created it.
+		return p.markInputsSpent(ctx, txRow.UserID, txRow.TransactionID, tx)
 	})
 }
 
@@ -812,12 +875,16 @@ func (p *Provider) commitRejected(ctx context.Context, userID int, txid string, 
 		Errors: wdk.ReviewActionErrors{"arcade": errors.New(res.ExtraInfo)},
 	}
 
-	txRow := p.firstTxByTxID(ctx, userID, txid)
-
-	// Record the reason before anything else: the 4xx body is the only statement
-	// of cause that will ever exist for this transaction, and arcade may have
-	// forgotten the transaction by the time anyone asks it again.
+	// Record the reason before anything else — including before the row lookup
+	// below, which can fail: the 4xx body is the only statement of cause that
+	// will ever exist for this transaction, and arcade may have forgotten the
+	// transaction by the time anyone asks it again.
 	p.logRejection(ctx, txid, string(res.Status), res.ExtraInfo, "broadcast_4xx")
+
+	txRow, terr := p.firstTxByTxID(ctx, userID, txid)
+	if terr != nil {
+		return swr, nil, terr
+	}
 
 	err := p.meta.Do(ctx, func(ctx context.Context) error {
 		if err := p.meta.Transactions().UpdateStatusByTxID(ctx, txid, wdk.TxStatusFailed,
@@ -854,9 +921,55 @@ func (p *Provider) commitRejected(ctx context.Context, userID int, txid string, 
 	return swr, rar, nil
 }
 
-// spendReservedInputs transitions the transaction's own reserved inputs to
-// spent. Inputs not in the utxostore (external) are ignored.
+// spendReservedInputs RECORDS, in FACT MODE, that an accepted broadcast has
+// spent this transaction's inputs.
+//
+// It runs only after arcade has accepted the bytes, and that is what selects
+// the mode. A guarded spend asks "is this coin still reserved by me?", and the
+// honest answer no longer matters: the network has the transaction, so no local
+// row state can un-happen the spend. Fact mode
+// ([utxostore.Store.Spend] with force=true) therefore drops the reservation and
+// freeze guards and keeps exactly one arbiter — spent_by — because two spend
+// facts cannot both hold.
+//
+// The guarded call this replaces is audit P0-2's amplifier. It had to tolerate
+// [utxostore.ReservedError] with HeldBy == "" to work at all, and that error
+// does NOT mean "external input": it means the row IS in the inventory and is
+// currently CLAIMABLE — a reservation lost to a release race. Skipping it left
+// the accepted transaction's own input free for the funder to lend to the next
+// action, which is how one lost reservation became a double spend the wallet
+// authored itself. Fact mode makes that state a recorded spend instead.
+//
+// The tolerance collapses to a single case:
+//
+//   - [utxostore.NotFoundError] — no row at all, so the input is genuinely
+//     external (somebody else's coin funding this transaction). The ONLY skip,
+//     and only when the top-level error is [utxostore.ErrBatch], which is the
+//     store's promise that the per-item verdicts are the WHOLE story. A
+//     top-level error of any other kind is never explained away by them: the
+//     batch may have written nothing (see the switch below).
+//   - [utxostore.ErrContention] — the row would not hold still under the
+//     backend's bounded retries. Transient, and NOT a double-spend alert:
+//     returned as-is so the caller's re-drive retries the whole apply (see
+//     [Provider.applyAcceptedBroadcast] on why the known tx is still 'sending'
+//     when that happens). Both error SHAPES are handled: a per-item verdict
+//     (every backend's Spend reports it on SpendOp.Err) and a whole-call
+//     failure carrying the sentinel directly.
+//   - [utxostore.SpentError] — a DIFFERENT transaction already spent this coin
+//     and the network has now accepted ours too. That is a materialized double
+//     spend, the one thing this function exists to make visible: it logs at
+//     ERROR and fails hard.
+//   - anything else — hard error.
 func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Transaction, txid, reference string) error {
+	// Fact mode still refuses an empty reservation per item, in every backend:
+	// it is a programmer error, not a row state. Every caller resolves the
+	// reference from a transaction row this path has already proven exists, so
+	// an empty one means the row itself is malformed — say that once here rather
+	// than letting the store say it once per input.
+	if reference == "" {
+		return fmt.Errorf("storage: accepted broadcast %s: transaction row carries no reference; "+
+			"refusing to record its spend", txid)
+	}
 	spendingTxID, err := chainhash.NewHashFromHex(txid)
 	if err != nil {
 		return fmt.Errorf("storage: parse spending txid: %w", err)
@@ -875,28 +988,78 @@ func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Tran
 	if len(ops) == 0 {
 		return nil
 	}
-	if err := p.utxo.Spend(ctx, ops, false); err != nil {
-		// Tolerate not-found (external inputs) and unreserved rows; surface any
-		// spent-by-another (real double spend) or other hard failures.
-		for _, op := range ops {
-			if op.Err == nil {
-				continue
+
+	serr := p.utxo.Spend(ctx, ops, true)
+	if serr == nil {
+		return nil
+	}
+
+	// Walk every item before deciding, so each materialized double spend gets
+	// its own ERROR line rather than only the first one being visible.
+	var (
+		failed    int   // items that reported an error
+		tolerated int   // …of which were NotFound, the only skippable one
+		fatal     error // first hard verdict; outranks contention
+		contended error // first retryable verdict
+	)
+	for _, op := range ops {
+		if op.Err == nil {
+			continue
+		}
+		failed++
+		var spent *utxostore.SpentError
+		switch {
+		case errors.Is(op.Err, &utxostore.NotFoundError{}):
+			tolerated++ // genuinely external input: the only skip fact mode allows
+		case errors.As(op.Err, &spent):
+			// THE ALERT BOUNDARY. Two transactions the network accepted spend the
+			// same coin. Nothing local can repair that, so it is said out loud and
+			// the apply fails rather than overwriting the recorded winner.
+			// Both the log and the error name the store's OWN report of the
+			// outpoint and winner, not our re-derivation of them.
+			p.logger.ErrorContext(ctx, "double spend: an accepted broadcast spends a coin another transaction already spent",
+				slog.String("txid", txid),
+				slog.String("outpoint", spent.Op.String()),
+				slog.String("winner", spent.Winner.String()))
+			if fatal == nil {
+				fatal = fmt.Errorf("storage: accepted broadcast %s spends %s, already spent by %s: %w",
+					txid, spent.Op, spent.Winner, op.Err)
 			}
-			if errors.Is(op.Err, &utxostore.NotFoundError{}) {
-				continue
+		case errors.Is(op.Err, utxostore.ErrContention):
+			if contended == nil {
+				contended = fmt.Errorf("storage: record spend of %s for accepted broadcast %s: %w",
+					op.Outpoint, txid, op.Err)
 			}
-			var re *utxostore.ReservedError
-			if errors.As(op.Err, &re) && re.HeldBy == "" {
-				// KNOWN BUG (audit P0-2): HeldBy == "" means "in the inventory,
-				// currently unreserved", NOT "external" — swallowing it turns a
-				// release race into a silent double spend. Rewired to fact mode
-				// (force=true) in a follow-up task.
-				continue // not our reserved coin (external input)
+		default:
+			if fatal == nil {
+				fatal = fmt.Errorf("storage: record spend of %s for accepted broadcast %s: %w",
+					op.Outpoint, txid, op.Err)
 			}
-			return fmt.Errorf("storage: spend input %s: %w", op.Outpoint, op.Err)
 		}
 	}
-	return nil
+	switch {
+	case fatal != nil:
+		return fatal
+	case contended != nil:
+		return contended
+	case errors.Is(serr, utxostore.ErrBatch) && failed > 0 && failed == tolerated:
+		// The ONLY tolerable failure: the store reported per-item verdicts
+		// ([utxostore.ErrBatch] is its promise that the top-level error is exactly
+		// the sum of them) and every one was an external input. Everything the
+		// call could write, it wrote.
+		return nil
+	default:
+		// Anything else means the top-level error is NOT explained by the items,
+		// so the batch may have written nothing at all — sqlstore runs its items
+		// inside one transaction, and a driver error on a LATER item rolls back
+		// the earlier ones while their per-item Err survives in memory. Reading
+		// that residue as "a couple of external inputs, carry on" would commit
+		// the statuses over a spend the store rolled back: reserved-and-unspent
+		// inputs under a row moved past the broadcast stage, which no sweep
+		// re-drives. Wrapping keeps the cause — including
+		// [utxostore.ErrContention] — matchable by the caller.
+		return fmt.Errorf("storage: record spends for accepted broadcast %s: %w", txid, serr)
+	}
 }
 
 // changeOutpoints returns the outpoints of a transaction's change coins.
@@ -1026,13 +1189,25 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// firstTxByTxID returns the first transaction row for txid under userID, or nil.
-func (p *Provider) firstTxByTxID(ctx context.Context, userID int, txid string) *wdk.TableTransaction {
+// firstTxByTxID returns the newest transaction row for txid under userID, or
+// (nil, nil) when the user genuinely has none.
+//
+// The query error is RETURNED, never folded into the nil row. It used to be
+// swallowed, which made "this user has no row for that txid" and "the database
+// did not answer" the same value — and the sole remaining caller,
+// [Provider.commitRejected], reads that value as "there is no change to
+// remove". A blip would therefore leave the phantom change of a finally
+// rejected transaction live and selectable, with no trace that anything was
+// skipped.
+func (p *Provider) firstTxByTxID(ctx context.Context, userID int, txid string) (*wdk.TableTransaction, error) {
 	rows, err := p.meta.Transactions().FindByTxID(ctx, userID, txid)
-	if err != nil || len(rows) == 0 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("storage: resolve transaction row for %s: %w", txid, err)
 	}
-	return &rows[0]
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
 }
 
 // --- small helpers -------------------------------------------------------

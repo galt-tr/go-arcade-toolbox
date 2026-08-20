@@ -95,6 +95,13 @@ var knownTxPreBroadcastStatuses = []wdk.ProvenTxReqStatus{
 // (applyAcceptedBroadcast, applySeen, applySeenBatch) must keep passing
 // [wdk.ProvenTxReqBeyondBroadcastStageStatuses]; only the backward guard in
 // queueDelayed is a candidate for this set.
+//
+// A forward writer MAY still hand-pick individual fenced statuses into its own
+// guard, when advancing off one of them would contradict something already
+// applied to the coins: the SEEN appliers add 'aborted' and 'stuck' (see the
+// provider's seenAdvanceSkipStatuses). That is a narrow addition and not this
+// set — it must never pull in 'sending' or 'suspectFailed', the two statuses
+// forward progress most often moves OFF.
 var KnownTxNeverRequeueStatuses = append(
 	append([]wdk.ProvenTxReqStatus(nil), wdk.ProvenTxReqBeyondBroadcastStageStatuses...),
 	KnownTxStatusAborted,

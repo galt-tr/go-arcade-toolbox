@@ -85,6 +85,79 @@ var unprovenStatuses = []wdk.ProvenTxReqStatus{
 	wdk.ProvenTxStatusCallback,
 }
 
+// seenFencedStatuses are the known-tx statuses a SEEN-class event must NOT
+// advance. Both are states in which the wallet has already ACTED on the
+// transaction being dead, so letting arcade's word walk the row forward would
+// contradict a decision already applied to the coins:
+//
+//   - 'aborted': the raw tx is fenced and the funding coins were unpinned and
+//     handed back. Advancing to unconfirmed would present a transaction as
+//     in-flight whose inputs another action may already have taken.
+//   - 'stuck': the reconciler's terminal escalation for a suspect it could
+//     never resolve. Its inputs are deliberately NEVER auto-released and it is
+//     operator-visible on purpose; a SEEN silently clearing that flag would
+//     retire the escalation without anyone deciding to.
+//
+// 'suspectFailed' is deliberately ABSENT, and that absence is load-bearing. The
+// reject→release reconciler's false-positive branch
+// ([Provider.handleRecovered]) recovers a suspect precisely BY routing the
+// recovered record back through [Provider.ApplyStatusUpdate], whose SEEN arm
+// then advances the row to unconfirmed. Fencing suspectFailed here would strand
+// every false positive the reconciler exists to rescue. The other terminal
+// failures ('invalidTx', 'doubleSpend') need no entry: the callers' own
+// [wdk.ProvenTxReqStatus.IsTerminalFailure] guard already drops those events.
+var seenFencedStatuses = []wdk.ProvenTxReqStatus{
+	metastore.KnownTxStatusAborted,
+	metastore.KnownTxStatusStuck,
+}
+
+// seenAdvanceSkipStatuses is the negative-CAS guard the SEEN appliers pass to
+// the known-tx status write: the beyond-broadcast set they have always carried
+// (a SEEN never regresses a row that is already further along) PLUS the fenced
+// statuses above.
+//
+// It is NOT [metastore.KnownTxNeverRequeueStatuses], which contains 'sending'
+// and 'suspectFailed' and is documented as the guard of BACKWARD, requeue-shaped
+// writes only. A SEEN applier is a FORWARD writer; guarding it with that set
+// would refuse the very advances it exists to make.
+//
+// The classifiers in [Provider.ApplyStatusUpdate] and
+// [Provider.ApplyStatusBatch] already divert fenced rows before they reach an
+// applier, so this guard is not the primary fence — it is the ATOMIC one. Both
+// classifiers read the known-tx row OUTSIDE the write transaction, and an abort
+// landing in that window is an ordinary concurrent event; only a predicate
+// carried in the write itself can refuse it.
+var seenAdvanceSkipStatuses = append(
+	append([]wdk.ProvenTxReqStatus(nil), wdk.ProvenTxReqBeyondBroadcastStageStatuses...),
+	seenFencedStatuses...)
+
+// isSeenFenced reports whether a SEEN-class event must be refused for a row at
+// this status. See [seenFencedStatuses].
+func isSeenFenced(st wdk.ProvenTxReqStatus) bool {
+	for _, fenced := range seenFencedStatuses {
+		if st == fenced {
+			return true
+		}
+	}
+	return false
+}
+
+// logSeenOnFenced reports the irreducible race: the wallet decided this
+// transaction was dead and acted on it, and the network has it anyway.
+//
+// ERROR, not WARN. For an aborted transaction the funding coins were released
+// back to the funder the moment the fence went up, so if a second action has
+// since taken one of them, two transactions the network will see now spend the
+// same coin — and the accepted-broadcast path has already RECORDED the earlier
+// spend as a fact, which is what makes this diagnosable at all. Nothing
+// automatic can repair it; a person has to look.
+func (p *Provider) logSeenOnFenced(ctx context.Context, txid string, st wdk.ProvenTxReqStatus, status arcade.Status) {
+	p.logger.ErrorContext(ctx, "arcade reports a fenced transaction on the network; refusing to advance it",
+		slog.String("txid", txid),
+		slog.String("knownTxStatus", string(st)),
+		slog.String("arcadeStatus", string(status)))
+}
+
 // ApplyStatusUpdate applies one arcade status record to the wallet state. It is
 // the single idempotent entry point the SSE apply pool calls per event (and the
 // polls call per GetTx result). It routes by rec.Status:
@@ -145,6 +218,13 @@ func (p *Provider) ApplyStatusUpdate(ctx context.Context, rec arcade.TxRecord) e
 
 	switch rec.Status {
 	case arcade.StatusSeenOnNetwork, arcade.StatusSeenMultipleNodes, arcade.StatusAcceptedByNetwork:
+		if isSeenFenced(kt.Status) {
+			// The wallet already acted on this transaction being dead. Record what
+			// arcade said — an operator staring at the row needs it — but touch no
+			// wallet state. See [seenFencedStatuses].
+			p.logSeenOnFenced(ctx, rec.TxID, kt.Status, rec.Status)
+			return p.recordArcadeStatus(ctx, rec.TxID, rec.Status)
+		}
 		return p.applySeen(ctx, rec)
 	case arcade.StatusMined, arcade.StatusImmutable:
 		return p.applyMined(ctx, rec)
@@ -163,6 +243,10 @@ func (p *Provider) ApplyStatusUpdate(ctx context.Context, rec arcade.TxRecord) e
 // applySeen advances a broadcast-accepted tx to unproven and makes its change
 // spendable at TierUnproven. Every step is idempotent (guarded transitions skip
 // when already advanced; Promote of an already-TierUnproven coin is a no-op).
+//
+// Its caller diverts fenced rows before they get here; the known-tx write
+// carries [seenAdvanceSkipStatuses] as well, which is the guard that survives an
+// abort landing between that read and this write.
 func (p *Provider) applySeen(ctx context.Context, rec arcade.TxRecord) error {
 	txid := rec.TxID
 	return p.meta.Do(ctx, func(ctx context.Context) error {
@@ -172,7 +256,7 @@ func (p *Provider) applySeen(ctx context.Context, rec arcade.TxRecord) error {
 			return fmt.Errorf("storage: seen: mark unproven: %w", err)
 		}
 		if err := p.meta.KnownTx().UpdateStatus(ctx, txid, wdk.ProvenTxStatusUnconfirmed,
-			wdk.ProvenTxReqBeyondBroadcastStageStatuses...); err != nil &&
+			seenAdvanceSkipStatuses...); err != nil &&
 			!errors.Is(err, metastore.ErrStatusUpdateSkipped) && !errors.Is(err, metastore.ErrNotFound) {
 			return fmt.Errorf("storage: seen: mark unconfirmed: %w", err)
 		}
@@ -502,6 +586,13 @@ func (p *Provider) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord)
 		}
 		switch rec.Status {
 		case arcade.StatusSeenOnNetwork, arcade.StatusSeenMultipleNodes, arcade.StatusAcceptedByNetwork:
+			if isSeenFenced(kt.Status) {
+				// Identical to ApplyStatusUpdate's SEEN arm: log the race, record
+				// arcade's word, advance no wallet state. See [seenFencedStatuses].
+				p.logSeenOnFenced(ctx, txid, kt.Status, rec.Status)
+				arcadeOnly = append(arcadeOnly, rec)
+				continue
+			}
 			seenRecs = append(seenRecs, rec)
 		case arcade.StatusMined, arcade.StatusImmutable:
 			minedRecs = append(minedRecs, rec)
@@ -786,8 +877,8 @@ func (p *Provider) verifyMinedOne(ctx context.Context, rec arcade.TxRecord, veri
 }
 
 // applySeenBatch advances every SEEN-class tx to unproven and promotes all their
-// change to TierUnproven — the batched form of applySeen. Must run inside
-// p.meta.Do.
+// change to TierUnproven — the batched form of applySeen, fenced the same way
+// (see [seenAdvanceSkipStatuses]). Must run inside p.meta.Do.
 func (p *Provider) applySeenBatch(ctx context.Context, recs []arcade.TxRecord) error {
 	if len(recs) == 0 {
 		return nil
@@ -798,7 +889,7 @@ func (p *Provider) applySeenBatch(ctx context.Context, recs []arcade.TxRecord) e
 		return fmt.Errorf("storage: batch seen: mark unproven: %w", err)
 	}
 	if err := p.meta.KnownTx().BulkUpdateStatus(ctx, txids, wdk.ProvenTxStatusUnconfirmed,
-		wdk.ProvenTxReqBeyondBroadcastStageStatuses...); err != nil {
+		seenAdvanceSkipStatuses...); err != nil {
 		return fmt.Errorf("storage: batch seen: mark unconfirmed: %w", err)
 	}
 	ops, err := p.changeOutpointsByTxIDs(ctx, txids)
@@ -1437,17 +1528,12 @@ func (p *Provider) sendOneWaiting(ctx context.Context, kt *metastore.KnownTx, in
 		}
 		return nil
 	}
-	rows, err := p.meta.Transactions().FindByTxIDAllUsers(ctx, txid)
-	if err != nil {
-		return fmt.Errorf("find tx rows %s: %w", txid, err)
-	}
-	var txRow *wdk.TableTransaction
-	var userID int
-	if len(rows) > 0 {
-		txRow = &rows[0]
-		userID = rows[0].UserID
-	}
-	return p.applyAcceptedBroadcast(ctx, userID, txid, tx, txRow)
+	// The apply resolves its own rows (cross-user) and refuses to commit when
+	// there are none. A hard error here is logged by SendWaitingTransactions and
+	// retried next tick: nothing above rolled the status forward, so the known tx
+	// is still at the 'sending' the claim put it in, which is FindResendable's
+	// graced recovery arm.
+	return p.applyAcceptedBroadcast(ctx, txid, tx)
 }
 
 // AbortAbandoned aborts up to limit never-broadcast unsigned/nosend txs created

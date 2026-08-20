@@ -17,6 +17,7 @@ import (
 	"github.com/galt-tr/go-arcade-toolbox/pkg/logging"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
@@ -227,6 +228,35 @@ func TestREST_ErrorMapping_NotEnoughFunds(t *testing.T) {
 	require.ErrorAs(t, err, &re)
 	assert.Equal(t, http.StatusUnprocessableEntity, re.Status)
 	assert.Equal(t, storage.CodeNotEnoughFunds, re.Code)
+}
+
+// TestREST_ErrorMapping_UTXOContention proves a raw utxostore.ErrContention —
+// contention raised OUTSIDE the funder, as the fact-mode Spend on the
+// accepted-broadcast path raises it — maps to 409 rather than 500.
+//
+// funder.ErrUTXOContention is a plain sentinel that does not wrap the utxostore
+// one, so before this mapping existed a contended accept was reported to a
+// remote caller as ERR_INTERNAL: "something is broken here" for a transaction
+// that is merely in flight and whose apply the send sweep re-drives on its own.
+// The client half matters as much as the status — a caller that retries on
+// errors.Is(err, utxostore.ErrContention) has to keep working across the wire.
+func TestREST_ErrorMapping_UTXOContention(t *testing.T) {
+	fake := &fakeProvider{
+		createAction: func(context.Context, wdk.AuthID, wdk.ValidCreateActionArgs) (*wdk.StorageCreateActionResult, error) {
+			return nil, fmt.Errorf("storage: record spends for accepted broadcast abc: %w", utxostore.ErrContention)
+		},
+	}
+	client := newFakeClient(t, fake)
+
+	_, err := client.CreateAction(context.Background(), wdk.AuthID{IdentityKey: "02abc"}, wdk.ValidCreateActionArgs{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, utxostore.ErrContention, "the store sentinel survives the round trip")
+	assert.ErrorIs(t, err, wdk.ErrUTXOContention, "and so does the public equivalent")
+
+	var re *storage.RemoteError
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, http.StatusConflict, re.Status, "contention is 'ask again' (409), not 'broken' (500)")
+	assert.Equal(t, storage.CodeUTXOContention, re.Code)
 }
 
 // TestREST_ErrorMapping_NotFound proves wdk.ErrNotFoundError maps to 404 and

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/galt-tr/go-arcade-toolbox/pkg/storage/internal/funder"
+	"github.com/galt-tr/go-arcade-toolbox/pkg/utxostore"
 	"github.com/galt-tr/go-arcade-toolbox/pkg/wdk"
 )
 
@@ -150,6 +151,14 @@ const (
 // interface-level equivalents a remote caller may check. Mapping both lets a
 // reconstructed client error match either, so errors.Is keeps working across
 // the wire regardless of which sentinel the caller tests against.
+//
+// utxostore.ErrContention is in that set for the same reason and a different
+// path. funder.ErrUTXOContention is a plain sentinel that does NOT wrap it, so
+// contention raised OUTSIDE the funder — most importantly by the fact-mode
+// Spend on the accepted-broadcast path — matched no mapping and left as a 500
+// ERR_INTERNAL. That is the wrong thing to tell a caller about a transaction
+// that is in flight and whose apply the send sweep will simply re-drive: 409 is
+// "ask again", 500 is "something is broken here".
 type sentinelMapping struct {
 	code      string
 	status    int
@@ -163,7 +172,7 @@ type sentinelMapping struct {
 var sentinelMappings = []sentinelMapping{
 	{CodeInputUnavailable, http.StatusConflict, []error{wdk.ErrInputUnavailable}},
 	{CodeNotEnoughFunds, http.StatusUnprocessableEntity, []error{funder.ErrNotEnoughFunds, wdk.ErrNotEnoughFunds}},
-	{CodeUTXOContention, http.StatusConflict, []error{funder.ErrUTXOContention, wdk.ErrUTXOContention}},
+	{CodeUTXOContention, http.StatusConflict, []error{funder.ErrUTXOContention, wdk.ErrUTXOContention, utxostore.ErrContention}},
 	{CodeAuthorization, http.StatusForbidden, []error{ErrAuthorization}},
 	{CodeNotFound, http.StatusNotFound, []error{wdk.ErrNotFoundError}},
 }
