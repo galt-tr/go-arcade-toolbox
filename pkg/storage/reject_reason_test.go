@@ -50,7 +50,8 @@ func TestApplyStatusUpdate_Rejected_PersistsReason(t *testing.T) {
 	h := newHarness(t)
 	res, signed, _ := h.createAndSign(t, 0x32, 100_000, 40_000)
 	txid := signed.TxID().String()
-	require.NoError(t, h.processDelayed(t, res, signed))
+	_, err := h.processDelayed(t, res, signed)
+	require.NoError(t, err)
 
 	const reason = "TX_INVALID (4): script evaluated to false"
 	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{
@@ -72,7 +73,8 @@ func TestApplyStatusUpdate_Rejected_EmptyReasonKeepsEarlierOne(t *testing.T) {
 	h := newHarness(t)
 	res, signed, _ := h.createAndSign(t, 0x33, 100_000, 40_000)
 	txid := signed.TxID().String()
-	require.NoError(t, h.processDelayed(t, res, signed))
+	_, err := h.processDelayed(t, res, signed)
+	require.NoError(t, err)
 
 	const reason = "UTXO_SPENT (70): utxo already spent"
 	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{
@@ -95,7 +97,8 @@ func TestApplyStatusUpdate_Rejected_NoReasonStaysNull(t *testing.T) {
 	h := newHarness(t)
 	res, signed, _ := h.createAndSign(t, 0x34, 100_000, 40_000)
 	txid := signed.TxID().String()
-	require.NoError(t, h.processDelayed(t, res, signed))
+	_, err := h.processDelayed(t, res, signed)
+	require.NoError(t, err)
 
 	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{
 		TxID: txid, Status: arcade.StatusRejected,
@@ -113,7 +116,8 @@ func TestListKnownTxByArcadeStatus_CarriesRejectReason(t *testing.T) {
 	h := newHarness(t)
 	res, signed, _ := h.createAndSign(t, 0x35, 100_000, 40_000)
 	txid := signed.TxID().String()
-	require.NoError(t, h.processDelayed(t, res, signed))
+	_, err := h.processDelayed(t, res, signed)
+	require.NoError(t, err)
 
 	const reason = "PROCESSING (4): failed to validate transaction"
 	require.NoError(t, h.p.ApplyStatusUpdate(ctx, arcade.TxRecord{
@@ -127,16 +131,23 @@ func TestListKnownTxByArcadeStatus_CarriesRejectReason(t *testing.T) {
 	assert.Equal(t, reason, rows[0].RejectReason)
 }
 
-// processDelayed persists a signed transaction without broadcasting, so a test
-// can drive a status event against a known tx that exists.
-func (h *harness) processDelayed(t *testing.T, res *wdk.StorageCreateActionResult, signed *transaction.Transaction) error {
+// processDelayed persists a signed transaction without broadcasting it: the
+// monitor sends it later. Two kinds of test need that.
+//
+// One wants a known tx that exists, so it can drive a status event at it.
+//
+// The other wants the window the pre-broadcast pin exists for — raw tx stored
+// and broadcastable, inputs still reserved and unspent, a janitor able to reach
+// them. The immediate path cannot show that state at all: it spends the inputs
+// inside the same call, so by the time ProcessAction returns the pin has
+// already been lifted and there is nothing left to observe.
+func (h *harness) processDelayed(t *testing.T, res *wdk.StorageCreateActionResult, signed *transaction.Transaction) (*wdk.ProcessActionResult, error) {
 	t.Helper()
-	_, err := h.p.ProcessAction(context.Background(), h.auth, wdk.ProcessActionArgs{
+	return h.p.ProcessAction(context.Background(), h.auth, wdk.ProcessActionArgs{
 		IsNewTx:   true,
 		IsDelayed: true,
 		Reference: strptr(res.Reference),
 		TxID:      txidPtr(signed.TxID().String()),
 		RawTx:     primitives.ExplicitByteArray(signed.Bytes()),
 	})
-	return err
 }

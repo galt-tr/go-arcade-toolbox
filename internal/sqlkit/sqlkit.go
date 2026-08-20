@@ -80,16 +80,16 @@ type SQLExecer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// Execer returns the SQLExecer for a statement: the ambient transaction carried
-// by ctx (Mode A) if present, otherwise db.
+// Execer returns the SQLExecer for a statement: the ambient transaction
+// carried by ctx (Mode A) if it was opened over this exact db, otherwise db
+// itself.
 //
-// Caveat (the SharesDatabase contract): an ambient transaction is honored
-// UNCONDITIONALLY — there is no portable way to prove a *sql.Tx belongs to db
-// from the *sql.Tx alone. The caller is responsible for only ever placing a
-// transaction opened from the same *sql.DB the store runs over (see
-// internal/sqltx and each store's SharesDatabase probe).
-func Execer(ctx context.Context, db SQLExecer) SQLExecer {
-	if tx, ok := sqltx.From(ctx); ok {
+// Ownership is structural, not conventional: sqltx records the *sql.DB each
+// ambient transaction was opened over and matches on pointer equality, so a
+// transaction opened over a different *sql.DB falls through to db's own pool
+// instead of being misrouted. Pass the store's own handle.
+func Execer(ctx context.Context, db *sql.DB) SQLExecer {
+	if tx, ok := sqltx.From(ctx, db); ok {
 		return tx
 	}
 	return db

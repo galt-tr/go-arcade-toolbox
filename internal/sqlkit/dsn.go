@@ -10,19 +10,36 @@ import (
 )
 
 // SQLiteDSN builds a modernc SQLite DSN for path with the concurrency pragmas
-// the stores require. modernc parses these query parameters and applies them on
-// every new connection, so the pool never hands out a connection missing them.
+// the stores require. Every pragma is set through the driver-portable
+// _pragma=name(value) query form — not the driver-specific shorthand keys
+// (_journal_mode=WAL, _busy_timeout=5000, _foreign_keys=on) that some
+// modernc versions parse and others silently drop. _pragma=name(value) is
+// the one form modernc.org/sqlite has honored on every release since
+// v1.14.7, so a future driver version change can't silently regress the
+// concurrency posture. modernc applies these per-connection on every new
+// connection, so the pool never hands out a connection missing them.
 //
-// These pragmas are Mode-A-critical: two stores sharing one SQLite file MUST
+// Caveat: unlike the shorthand keys, which the driver rejects when the
+// connection is opened for a bad value, a _pragma string is executed
+// verbatim — a typo in the pragma name or value fails silently instead of
+// erroring.
+// TestSQLiteDSNAppliedPragmas is the guard: it opens a live connection and
+// reads each pragma back to confirm it actually applied, rather than
+// trusting the DSN string alone.
+//
+// _txlock=immediate is separate from the pragmas: it configures the driver's
+// BEGIN mode, making a write transaction take its RESERVED lock up front
+// rather than deadlocking on upgrade.
+//
+// These settings are Mode-A-critical: two stores sharing one SQLite file MUST
 // open it with the same locking posture (WAL journaling, a busy timeout, and
-// _txlock=immediate so a write transaction takes its RESERVED lock up front
-// rather than deadlocking on upgrade). This is the single canonical set.
+// _txlock=immediate). This is the single canonical set.
 func SQLiteDSN(path string) string {
 	q := url.Values{}
-	q.Set("_journal_mode", "WAL")
-	q.Set("_busy_timeout", "5000")
-	q.Set("_foreign_keys", "on")
 	q.Set("_txlock", "immediate")
+	q.Add("_pragma", "busy_timeout(5000)") // (modernc sorts it first anyway; explicit for clarity)
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "synchronous(NORMAL)")
 	return path + "?" + q.Encode()
 }

@@ -69,11 +69,11 @@ func assertClaimableUnderLiveTierOnly(t *testing.T, s *Store, op utxostore.Outpo
 	minedKey := claimKeyFor(raceUserID, raceBasket, utxostore.TierMined, bucket)
 	sendingKey := claimKeyFor(raceUserID, raceBasket, utxostore.TierSending, bucket)
 
-	minedCands, err := s.probe(minedKey, nil, 100)
+	minedCands, err := s.probe(context.Background(), minedKey, nil, 100)
 	require.NoError(t, err)
 	require.Len(t, minedCands, 1, "coin must be claimable under its LIVE (mined) tier bucket, not stuck claimKey-absent")
 
-	staleCands, err := s.probe(sendingKey, nil, 100)
+	staleCands, err := s.probe(context.Background(), sendingKey, nil, 100)
 	require.NoError(t, err)
 	require.Empty(t, staleCands, "coin must NOT be claimable under the STALE (sending) tier bucket")
 }
@@ -132,7 +132,7 @@ func TestAerostore_PromoteRestoreRace(t *testing.T) {
 				require.NoError(t, err)
 				require.Len(t, got, 1)
 				sp := &utxostore.SpendOp{Outpoint: op, Reservation: "r", SpendingTxID: spendTxID}
-				require.NoError(t, s.Spend(ctx, []*utxostore.SpendOp{sp}))
+				require.NoError(t, s.Spend(ctx, []*utxostore.SpendOp{sp}, false))
 				require.NoError(t, sp.Err)
 			},
 			restore: func(t *testing.T, s *Store, op utxostore.Outpoint) {
@@ -233,11 +233,11 @@ func TestAerostore_PromoteReleaseConcurrent(t *testing.T) {
 		require.Equal(t, utxostore.TierMined, u.Tier)
 		require.Empty(t, u.ReservedBy)
 
-		minedCands, mErr := s.probe(minedKey, nil, 1000)
+		minedCands, mErr := s.probe(ctx, minedKey, nil, 1000)
 		require.NoError(t, mErr)
 		require.Truef(t, containsOutpoint(t, minedCands, op), "iter %d: coin missing from mined bucket", i)
 
-		staleCands, sErr := s.probe(sendingKey, nil, 1000)
+		staleCands, sErr := s.probe(ctx, sendingKey, nil, 1000)
 		require.NoError(t, sErr)
 		require.Falsef(t, containsOutpoint(t, staleCands, op), "iter %d: coin STILL claimable under stale sending bucket", i)
 	}

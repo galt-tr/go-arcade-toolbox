@@ -70,15 +70,125 @@
 // single index walk on every backend. [Store.Promote] moves coins between
 // tiers in both directions: up as evidence arrives, down on reorg.
 //
+// # Pre-broadcast pin
+//
+// A plain reservation is a SOFT hold: the stale-reservation reaper frees one
+// that has aged out. That is right while the wallet is still choosing coins,
+// and wrong the moment it has SIGNED a transaction spending them — freeing
+// those inputs lets a later funding run hand the same coins to a second
+// transaction, and the two race on-chain as a double spend.
+//
+// [Store.Pin] closes that window. It sets a COMMITTED bit, written in the same
+// transaction that stores the signed raw tx, which turns the reservation into a
+// hard hold: pinned rows are reserved rows no janitor may free.
+// [Store.ReleaseReservation] skips them and [Store.FindStaleReservations]
+// cannot see them, so only the transaction's own lifecycle ends a pin —
+// [Store.Spend], [Store.Unspend], a token-guarded [Store.ReleaseOutpoints] (the
+// funder's own rollback and the reconciler's verified-dead release),
+// [Store.Unpin], or row deletion.
+//
+// The invariant every provider upholds: Pinned implies ReservedBy != "" AND
+// SpentBy == nil. Claims are unaffected — a pinned coin is reserved, so it was
+// already invisible to them — which is why pinning costs the hot path nothing.
+//
+// # Spend: a guarded transition and a recorded fact
+//
+// [Store.Spend] serves two callers whose relationship to the network is
+// opposite, and its force parameter says which one is calling.
+//
+// While the wallet is still AUTHORING a spend, the reservation is the
+// authority: the coin may only move to spent if this funding run still holds
+// it. That is the guarded mode (force=false), and every guard failure —
+// frozen, held by another token, held by nobody — is a real refusal that must
+// stop the caller.
+//
+// Once the broadcast has been ACCEPTED, the spend is a fact of the network.
+// The transaction is in mempools; the inputs are consumed whatever the local
+// row says. A reservation that has since been released (a reaper that fired
+// mid-broadcast, an operator release, a crash-recovery path) does not make the
+// spend un-happen — it only means the store's view is stale. Refusing to
+// record the spend there is precisely how a lost reservation becomes a silent
+// double spend: the coin stays claimable, a later funding run hands it to a
+// second transaction, and the two race on-chain. So fact mode (force=true)
+// records the spend over a reservation mismatch and over a freeze: no
+// reservation state and no freeze refuses a fact.
+//
+// Two STATE errors survive fact mode, for opposite reasons:
+//
+//   - [NotFoundError] — there is no row, so the input was never the wallet's
+//     to record (a genuinely external input). This is the ONLY error a
+//     fact-mode caller may skip.
+//   - [SpentError] — a DIFFERENT transaction is already recorded as spending
+//     the coin. Two spend facts cannot both be true; one of them is a real
+//     double spend and the caller must alert, never overwrite. (A replay by
+//     the SAME spender is an idempotent success, as always.)
+//
+// Beyond these two, a fact-mode item can still fail for reasons that are not
+// row state: an empty op.Reservation (a programmer error) and transient
+// backend errors — a backend may report [ErrContention] when a row would not
+// hold still across its bounded retries, regardless of the store's concurrency
+// style, and that is retryable, not skippable and not a double spend. A caller
+// that skips everything except [SpentError] would silently drop those, which is
+// why the skip list is [NotFoundError] alone and not "everything but
+// SpentError".
+//
+// # Reserving coins the caller named
+//
+// The three claim shapes answer "find me a coin"; [Store.ReserveOutpoints]
+// answers "hold THESE coins". A caller that names explicit inputs (BRC-100's
+// CreateAction lets it) needs the same exclusivity a funded coin gets, or two
+// concurrent requests select the same outpoint and the funder can hand it out
+// a third time. So the store has one outpoint-targeted reservation primitive
+// alongside the scope-based ones.
+//
+// What it produces is deliberately indistinguishable from a claim: a row held
+// by (userID, reservation), UNPINNED, visible to the stale reaper, freed by
+// [Store.ReleaseReservation] or a token-guarded [Store.ReleaseOutpoints],
+// hardened by [Store.Pin] when the signed transaction is stored, and consumed
+// by [Store.Spend]. Pinning is not its job — a reservation becomes a pin at
+// the same point for every coin, when a broadcastable transaction exists.
+//
+// Two things separate it from a claim, both forced by "the caller named these
+// rows and no others":
+//
+//   - It is ALL-OR-NOTHING. A claim that finds fewer coins than asked reports
+//     a short result and the caller adapts; a named input set that is only
+//     half reservable is not a transaction, so nothing is left newly reserved
+//     and the per-item causes ([NotFoundError], [ReservedError],
+//     [SpentError], [FrozenError]) are joined under [ErrBatch]. This is the
+//     one documented exception to per-item atomicity below.
+//   - A row belonging to another user reports [NotFoundError], not
+//     [ReservedError]. The caller supplied the outpoint, so the reply must not
+//     confirm that a coin it does not own exists.
+//
+// How far all-or-nothing reaches depends on the backend, and the difference is
+// disclosed rather than papered over. A SQL provider gets it from one
+// transaction. A non-transactional one (Aerospike) enforces it by
+// COMPENSATION — handing back the rows it already won — so a crash on a
+// REFUSED reserve can leave rows under the caller's token until the stale
+// sweep reclaims them. That residue is over-reserved, never over-issued: no
+// second transaction can take those coins meanwhile. A caller that wants the
+// window closed sooner may [Store.ReleaseReservation] on the token as
+// insurance, which is idempotent and costs nothing when there is nothing left
+// to free.
+//
+// Idempotency follows the table: a replay under the SAME token finds its own
+// rows already reserved, counts them satisfied, and re-stamps nothing. A row
+// that is already ours but has since been FROZEN still refuses — the freeze
+// outranks the replay. Duplicate outpoints in one call are collapsed, so a
+// refusal is reported once per distinct outpoint.
+//
 // # Atomicity contracts
 //
-// These five rules are the core of the interface; the conformance suite
+// These seven rules are the core of the interface; the conformance suite
 // enforces them and every provider must honor them:
 //
 //  1. Every method is atomic PER ITEM, never across items. Batch methods may
 //     partially succeed; they report failures per item (via the op's Err
 //     field where one exists, otherwise via typed errors joined into the
-//     returned error) plus the [ErrBatch] sentinel at the top level.
+//     returned error) plus the [ErrBatch] sentinel at the top level. The one
+//     exception is [Store.ReserveOutpoints], which is atomic across its ops
+//     for the reason given above.
 //  2. Claim methods are single-round-trip atomic transitions. No interface
 //     method ever requires the caller to hold a lock across calls — this is
 //     what makes one funder correct on both SQL and Aerospike.
@@ -88,16 +198,31 @@
 //  4. Idempotency table — every operation a crash-recovery outbox replays is
 //     idempotent by construction:
 //     Mint: same data again = no-op success.
-//     Spend: same spender again = success.
+//     Spend: same spender again = success (guarded and fact mode alike).
 //     Unspend: guard mismatch = skip.
 //     Release: already free = skip.
 //     Remove: missing = no-op.
 //     Promote: already at the target tier = counts as unchanged.
-//  5. Frozen rows are invisible to claims and refuse Spend ([FrozenError]),
-//     but Release, Unspend, and Promote still apply to them. Precedence: an
-//     already-recorded spend wins over the freeze — a same-spender Spend
+//     Pin/Unpin: already in that state = uncounted skip.
+//     ReserveOutpoints: rows already held by exactly this token = satisfied,
+//     not re-stamped.
+//  5. Frozen rows are invisible to claims and refuse a GUARDED Spend
+//     ([FrozenError]), but Release, Unspend, Promote, and a forced
+//     (fact-mode) Spend still apply to them. Precedence, in both spend modes:
+//     an already-recorded spend wins over the freeze — a same-spender Spend
 //     replay on a since-frozen row is an idempotent success, and a competing
 //     spender gets [SpentError], not [FrozenError].
+//  6. Pinned rows are reserved rows no janitor may free: ReleaseReservation
+//     leaves them alone and FindStaleReservations never reports them (see the
+//     pre-broadcast pin above). Pinned always implies reserved and unspent.
+//     The single exception is the opt-in FindStaleReservationsIncludingPinned
+//     listing, which reports them and nothing more — it frees nothing, and
+//     exists for a sweep that fences a transaction before it touches its
+//     coins, i.e. one that has established what the pin is only a proxy for.
+//  7. FOUR operations create a reservation — the three claim shapes and
+//     ReserveOutpoints — and every one of them produces the same, unpinned,
+//     sweepable, token-released hold. No downstream operation asks which one
+//     made it.
 //
 // # Design notes
 //
@@ -106,14 +231,23 @@
 //   - ReleaseOutpoints guard mismatch is a per-item SKIP, not an error,
 //     consistent with the idempotency table: releasing something you no
 //     longer hold is a stale intent, and replays must be harmless.
-//   - Spend keeps ReservedBy on the row after the transition. The reservation
-//     is provenance (which funding run spent the coin) and drives the
+//   - Spend keeps ReservedBy on the row after the transition. After a GUARDED
+//     spend that is true provenance — the guard proved the token is the
+//     funding run that spent the coin — and it drives the
 //     AlreadyReserved/AlreadySpentBy classification in [RemoveByMintReport].
-//     Unspend clears both SpentBy and the reservation: the coin returns to
-//     the claimable pool.
+//     In fact mode the kept reservation is simply whatever the row last
+//     carried — possibly a foreign token, possibly none — so it is the row's
+//     last reservation, not necessarily the run that broadcast. Neither mode
+//     writes op.Reservation onto the row. Unspend clears both SpentBy and the
+//     reservation: the coin returns to the claimable pool.
 //   - [ReservedError] is the general reservation-guard failure: HeldBy names
-//     the current holder, and HeldBy == "" means the row is not reserved at
-//     all (e.g. Spend of an unreserved row).
+//     the current holder, and HeldBy == "" means the row is IN the inventory
+//     but not reserved at all (e.g. a guarded Spend of a released row). It
+//     never means "external input" — only [NotFoundError] means that, which
+//     is why fact mode keeps NotFound and drops the reservation guard.
+//   - Spend's force parameter, like Remove's, picks preconditions and not
+//     effects: a forced and a guarded spend that both succeed write exactly
+//     the same row state (spent_by set, pin cleared, reservation kept).
 //   - Mint idempotency compares the immutable coin identity only (UserID,
 //     Basket, Satoshis, InputSize). Tier is a starting state, not identity: a
 //     replayed mint whose row has since been promoted, reserved, or spent is
@@ -123,14 +257,23 @@
 //     RemoveByMintTx, by contrast, removes frozen-but-unreserved rows: if the
 //     minting transaction is invalid the coin is phantom, and a frozen
 //     phantom is strictly worse than no row.
-//   - Batch methods whose ops are plain []Outpoint (Remove, Freeze, Unfreeze)
-//     have no per-item Err slot; they report failures as typed per-item
-//     errors joined into the returned error together with [ErrBatch]
-//     (errors.Is finds ErrBatch, errors.As finds the item errors).
+//   - Batch methods whose ops are plain []Outpoint (Remove, Freeze, Unfreeze,
+//     ReserveOutpoints) have no per-item Err slot; they report failures as
+//     typed per-item errors joined into the returned error together with
+//     [ErrBatch] (errors.Is finds ErrBatch, errors.As finds the item errors).
 //   - Balance buckets: a row is Claimable (per tier) when unspent, unreserved
 //     and not frozen; Reserved when reserved and unspent (frozen or not).
 //     Frozen unreserved rows appear in neither bucket — a freeze removes
 //     value from the spendable balance by design.
+//   - The pin is scoped by (userID, reservation) like ReleaseReservation, not
+//     by outpoint: the caller fences or unfences a send with the token it
+//     already holds. The one release path that OVERRIDES a pin is
+//     ReleaseOutpoints, which is token-guarded — its callers are the funder's
+//     own rollback (whose rows are never pinned) and the reconciler's
+//     verified-dead release, the two parties entitled to declare a transaction
+//     dead. Unpin, by contrast, only lifts the pin: it leaves the rows
+//     reserved, so a crash between Unpin and the release degrades to a stale
+//     reservation the reaper handles, never to a free coin.
 //   - FindStaleReservations dates a reservation by its OLDEST row (the
 //     funder may claim several times under one token) and should return
 //     oldest-first; approximate backends may relax the ordering (the
@@ -141,4 +284,16 @@
 //     empty reservation would make reserved rows indistinguishable from free
 //     ones, so it is rejected as a programmer error (plain error, not part
 //     of the state-outcome taxonomy).
+//   - ReserveOutpoints validates the same way and additionally rejects an
+//     EMPTY op list, where the claim shapes return an empty result. The
+//     difference is that a claim for zero coins is a legitimate degenerate
+//     query, while reserving zero named inputs means the caller lost its
+//     input list — silently succeeding would hand it an all-or-nothing
+//     guarantee over nothing at all.
+//   - Both checks, and the rest of the input contract (mint, spend,
+//     RemoveByMintTx), are implemented ONCE in validate.go and called by every
+//     backend, so no store can drift into answering a malformed call
+//     differently from its peers. [JoinBatch] and [BatchCountErr] are the
+//     matching pair for the batch-error shape. An out-of-tree backend
+//     registered through [Register] should use them too.
 package utxostore

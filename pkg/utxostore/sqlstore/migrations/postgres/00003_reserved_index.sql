@@ -1,0 +1,72 @@
+-- +goose Up
+-- Two defects in 00001's holder index — (reserved_by, user_id) WHERE
+-- reserved_by IS NOT NULL — both of which cost the sweep, not the claim:
+--
+--   1. It NEVER SHRINKS. A Spend leaves reserved_by set as provenance (which
+--      token spent the coin), so every coin the store has ever handed out stays
+--      in this index forever while the LIVE reservation set it exists to serve
+--      stays small. Fact-mode spends make that the common case rather than the
+--      exception, so on a busy wallet the index converges on "one entry per
+--      coin ever spent" and every lookup through it walks that instead.
+--   2. Its predicate stopped matching its queries. ReleaseReservation, Pin and
+--      Unpin all filter "... AND spent_by IS NULL AND NOT pinned", and the
+--      stale sweep's inner aggregate groups (user_id, reserved_by) over the
+--      same live set — none of which this index can express, so each one
+--      re-checks spent_by/pinned per heap tuple over the dead weight from (1).
+--      The aggregate had no usable index at all and full-scanned utxos once per
+--      sweep tick.
+--
+-- The rewrite fixes both: spent_by IS NULL in the partial WHERE evicts a row at
+-- Spend time (the index now tracks live holds only), and INCLUDE covers the
+-- stale scan's aggregate so it can run index-only.
+--
+-- INCLUDE (reserved_at, seq, pinned) is exactly the rest of what
+-- Store.staleReservationsSQL's inner aggregate reads from utxos:
+-- MIN(reserved_at) and MIN(seq) are its output columns, and NOT pinned is its
+-- remaining filter. pinned is in INCLUDE rather than in the partial WHERE on
+-- purpose — Pin/Unpin must still find rows through this index BY their current
+-- pin state, and a pinned row's ReleaseOutpoints still has to resolve, so
+-- pinned rows must stay IN the index and merely be filterable inside it.
+-- (Contrast idx_utxos_reserved_at, which the sweep alone uses and which
+-- therefore folds NOT pinned into its predicate.)
+--
+-- txid/vout are deliberately NOT included: only the sweep's OUTER expansion
+-- projects them, that runs per returned group rather than per pool row, and a
+-- 32-byte txid in every entry would undo the size win the covering index is
+-- for.
+--
+-- DEPLOYMENT CAVEAT — this migration takes ACCESS EXCLUSIVE on utxos for the
+-- whole rebuild, which blocks readers as well as writers. goose runs a
+-- migration inside a transaction, so the lock DROP INDEX takes is held until
+-- COMMIT: the CREATE INDEX below builds under it rather than after it, and
+-- CONCURRENTLY (which cannot run in a transaction) is unavailable. Migrations
+-- run at process start, from newStore -> migrate, so on a shared Mode A handle
+-- this is a stall during deploy, before the store serves anything.
+--
+-- And this is the index where the build is slowest, for precisely the reason
+-- being fixed: PRE-migration it holds an entry per coin ever spent, so its
+-- size is the wallet's whole history rather than its live hold set. The
+-- rebuild reads that, not the (much smaller) result. Post-migration the index
+-- tracks live holds only and any future rebuild is cheap — the cost is paid
+-- once, on the deploy that adopts this.
+--
+-- For a deployment large enough that the stall matters, the escape hatch is to
+-- take the DDL out of the transaction. Either apply it by hand ahead of the
+-- deploy as DROP INDEX CONCURRENTLY + CREATE INDEX CONCURRENTLY and then let
+-- this version run against the result (verify the re-run is a no-op on your
+-- goose version first), or give this file goose's NO TRANSACTION annotation
+-- and spell both statements CONCURRENTLY here. Neither is the default: both
+-- give up the all-or-nothing rollback every other migration in this set has,
+-- and CONCURRENTLY can leave an INVALID index behind on failure.
+--
+-- (Spelling that annotation out in prose is deliberately avoided above —
+-- goose parses EVERY comment line in this file looking for its directives, so
+-- naming one inside a sentence fails the migration at startup.)
+DROP INDEX idx_utxos_reserved;
+CREATE INDEX idx_utxos_reserved ON utxos (reserved_by, user_id) INCLUDE (reserved_at, seq, pinned)
+    WHERE reserved_by IS NOT NULL AND spent_by IS NULL;
+
+-- +goose Down
+DROP INDEX idx_utxos_reserved;
+CREATE INDEX idx_utxos_reserved ON utxos (reserved_by, user_id)
+    WHERE reserved_by IS NOT NULL;

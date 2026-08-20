@@ -28,6 +28,25 @@ Consequences you must design for:
   point-in-time skew between them is healed by the transactional outbox +
   reconciler, but a *lost* store is not recoverable.
 - The keys alone are **not** a backup. There is no rescan to rebuild balances.
+- **A synced or restored store is not automatically writable.** The storage
+  manager refuses every write unless the store it is bound to is the one the
+  user's `users.active_storage` row names — otherwise the same coin could be
+  spent from two storages at once. A store populated by `ProcessSyncChunk` does
+  **not** declare itself active (deliberately: that is what would create the
+  two-active-stores condition), so after a restore or a sync-based migration you
+  must cut over explicitly with `SetActive`. Until you do, writes fail with:
+
+  ```
+  storage: writes disabled: store is not the user's active storage: this store
+  is "<store-key>", the user's active storage is "<other-key>" — call SetActive
+  to cut over
+  ```
+
+  The error wraps the exported sentinel `storage.ErrStorageNotActive`, so
+  callers can match it with `errors.Is`. Reads are never gated — a non-active
+  store can always be inspected. See the
+  [spendability seam on the wire](storage.md#the-seam-on-the-wire-sync) for what
+  a sync does and does not rebuild.
 
 ### Per-backend backup / restore
 
@@ -88,6 +107,27 @@ tasks, and the reject→release reconciler. Watch these signals:
   connection pool isn't starving it behind the write workers.
 - **Circuit-breaker state.** Repeated `ErrCircuitOpen` on broadcast means Arcade
   is unreachable (opaque failures); the breaker probes `GET /health` to recover.
+- **The send sweep, when "my transaction isn't going out."** Before any POST, a
+  broadcaster CLAIMS the transaction's `known_txs` row by moving it to `sending`
+  (this is what stops an aborted transaction being re-broadcast after its inputs
+  were released). Two consequences shape what a stalled send looks like:
+  - **A failed POST backs off a full grace, not a tick.** A transport failure or
+    exhausted backpressure leaves the row at `sending`; the sweep re-drives it
+    only once it has aged past the resend grace (`resendGrace`, 20s), and each
+    re-drive re-stamps the clock. So a transaction failing against a sick Arcade
+    retries roughly every 20s, NOT on every monitor cycle. A row sitting at
+    `sending` for a minute or two is the backoff working, not a stuck send —
+    give it a few grace periods before escalating.
+  - **A row stuck at `sending` cannot be aborted.** The abort CAS deliberately
+    refuses that status at any age, so the claim can never be snatched out from
+    under a POST that may already be on the wire. There is therefore **no
+    operator path that fences a permanently-stuck `sending` row.** It leaves
+    that status only by succeeding (→ `unconfirmed`) or by drawing a tx-level
+    rejection (→ `suspectFailed`), after which the reject→release reconciler
+    owns it and can take it terminal — the reconciler is the only escape.
+    Transactions that have sat at `sending` for hours with no Arcade rejection
+    mean POSTs are failing at the transport layer; fix reachability rather than
+    looking for a way to cancel them.
 
 ## Running `cmd/storage-server`
 

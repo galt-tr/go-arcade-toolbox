@@ -99,6 +99,11 @@ type UTXO struct {
 	// Frozen marks an explicit hold: invisible to claims, refuses Spend.
 	Frozen bool
 
+	// Pinned marks the committed pre-broadcast state: a broadcastable
+	// transaction spends this coin, so no janitor may free it. Always implies
+	// ReservedBy != "" and SpentBy == nil. See [Store.Pin].
+	Pinned bool
+
 	// CreatedAt is when the coin was minted into the store.
 	CreatedAt time.Time
 }
@@ -124,8 +129,11 @@ type Mint struct {
 type SpendOp struct {
 	Outpoint
 
-	// Reservation is the exact-match guard: the row must currently be
-	// reserved by this token. Must be non-empty.
+	// Reservation is the exact-match guard for a GUARDED spend: the row must
+	// currently be reserved by this token. A forced (fact-mode) spend does not
+	// check it — the spend is already on the network — but it must still be
+	// non-empty in either mode, so the caller always names the funding run it
+	// believes it is recording.
 	Reservation string
 	// SpendingTxID is the transaction spending the coin.
 	SpendingTxID chainhash.Hash

@@ -98,4 +98,11 @@ type OutboxDrainReport struct {
 	Drained int
 	Failed  int
 	Parked  int
+	// ParkedTotal is the STANDING backlog of exhausted rows after the pass, not
+	// a per-pass delta like the three above. Without it parking is invisible
+	// between the one line a row logs as it crosses the ceiling and whenever
+	// someone next queries the table by hand: exhausted rows are excluded from
+	// the pending set by construction, so every other counter reads zero while
+	// the backlog grows.
+	ParkedTotal int
 }

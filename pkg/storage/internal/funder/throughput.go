@@ -86,6 +86,9 @@ func (f *Funder) claimExactFastPath(ctx context.Context, args FundArgs, collecto
 		consumed++
 	}
 
+	// Mid-flow, so deliberately on the REQUEST context: a failure here
+	// propagates to Fund, whose detached terminal release frees the whole token
+	// (see Funder.release).
 	if consumed < len(claimed) {
 		return f.releaseOutpoints(ctx, args.Reservation, claimed[consumed:])
 	}

@@ -113,14 +113,29 @@ func (s *Store) Balance(ctx context.Context, userID int64, basket string) (utxos
 	return b, nil
 }
 
-// FindStaleReservations implements [utxostore.Store]: reservations of unspent
-// reserved rows whose oldest ReservedAt is before olderThan, oldest first
-// (approximate ordering is acceptable). Backed by the numeric resAt index.
+// FindStaleReservations implements [utxostore.Store]: reservations of unspent,
+// UNPINNED reserved rows whose oldest ReservedAt is before olderThan, oldest
+// first (approximate ordering is acceptable). Backed by the numeric resAt index.
 //
 // It honors ctx across both phases — phase B fans out one query PER stale
 // reservation, so an unhonored context there is unbounded in the number of index
 // walks, not just in the length of one.
 func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStale(ctx, olderThan, limit, false)
+}
+
+// FindStaleReservationsIncludingPinned implements [utxostore.Store]: the same
+// two-phase listing with the pin filter dropped from BOTH phases, for the
+// fence-first sweep. Dropping it from phase B as well as phase A is what makes
+// the two consistent: a partly-pinned token (only reachable through a crash
+// mid-Pin, since Aerospike has no multi-record transaction) must be reported
+// whole, or the caller would fence a transaction and then be handed only half
+// of its coins.
+func (s *Store) FindStaleReservationsIncludingPinned(ctx context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStale(ctx, olderThan, limit, true)
+}
+
+func (s *Store) findStale(ctx context.Context, olderThan time.Time, limit int, includePinned bool) ([]utxostore.ReservationRef, error) {
 	if s.closed.Load() {
 		return nil, errClosed
 	}
@@ -151,7 +166,16 @@ func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, 
 		return nil, fmt.Errorf("aerostore: set stale filter: %w", err)
 	}
 	qpA := as.NewQueryPolicy()
-	qpA.FilterExpression = as.ExpNot(as.ExpBinExists(binSpentBy)) // unspent only
+	// Unspent and (unless the caller opted in) unpinned only: a pinned row is
+	// the input of an in-flight send, never ordinary stale work (see
+	// [utxostore.Store.Pin]).
+	qpA.FilterExpression = as.ExpNot(as.ExpBinExists(binSpentBy))
+	if !includePinned {
+		qpA.FilterExpression = as.ExpAnd(
+			qpA.FilterExpression,
+			as.ExpNot(as.ExpBinExists(binPinned)),
+		)
+	}
 	if err := s.streamQuery(ctx, qpA, stmt, func(rec *as.Record) error {
 		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
@@ -184,7 +208,7 @@ func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, 
 	// the resBy index (includes rows reserved after the cutoff).
 	refs := make([]utxostore.ReservationRef, 0, len(order))
 	for _, k := range order {
-		ref, ferr := s.reservationMembership(ctx, k.userID, k.res)
+		ref, ferr := s.reservationMembership(ctx, k.userID, k.res, includePinned)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -195,9 +219,24 @@ func (s *Store) FindStaleReservations(ctx context.Context, olderThan time.Time, 
 	return refs, nil
 }
 
-// reservationMembership returns the full set of unspent rows held by
-// (userID, reservation), dated by the oldest.
-func (s *Store) reservationMembership(ctx context.Context, userID int64, reservation string) (utxostore.ReservationRef, error) {
+// reservationMembership returns the full set of unspent rows held by (userID,
+// reservation), dated by the oldest. includePinned mirrors the caller's phase-A
+// filter so a ref never mixes the two rules.
+//
+// With includePinned false, pinned rows are excluded here as well as in phase
+// A, which is belt-and-braces for this repo's own sweeper —
+// storage.Provider.SweepStaleReservations (status_updates.go) releases by TOKEN
+// through ReleaseReservation, and that already refuses pinned rows — but
+// load-bearing for the published contract: a caller is entitled to take
+// ref.Outpoints and hand them to ReleaseOutpoints, which overrides pins by
+// design. A partly-pinned token (only reachable through a crash mid-Pin, since
+// Aerospike has no multi-record transaction) must not route a pinned outpoint
+// into that path.
+//
+// With it true the caller has asked for exactly those rows, having fenced the
+// transaction that pinned them; see
+// [Store.FindStaleReservationsIncludingPinned].
+func (s *Store) reservationMembership(ctx context.Context, userID int64, reservation string, includePinned bool) (utxostore.ReservationRef, error) {
 	ref := utxostore.ReservationRef{Reservation: reservation, UserID: userID}
 	stmt := as.NewStatement(s.namespace, s.set)
 	if err := stmt.SetFilter(as.NewEqualFilter(binResBy, reservation)); err != nil {
@@ -208,6 +247,12 @@ func (s *Store) reservationMembership(ctx context.Context, userID int64, reserva
 		as.ExpEq(as.ExpIntBin(binUserID), as.ExpIntVal(userID)),
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
 	)
+	if !includePinned {
+		qp.FilterExpression = as.ExpAnd(
+			qp.FilterExpression,
+			as.ExpNot(as.ExpBinExists(binPinned)),
+		)
+	}
 	if err := s.streamQuery(ctx, qp, stmt, func(rec *as.Record) error {
 		u, cerr := recordToUTXO(rec)
 		if cerr != nil {

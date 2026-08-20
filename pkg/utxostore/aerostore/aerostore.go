@@ -26,7 +26,11 @@
 //   - invKey ("{userId}|{basket}") is present until a coin is spent (or
 //     removed); it backs Balance and per-(user, basket) scans.
 //   - resBy/resAt mark a reservation (kept as provenance after a spend);
-//     spentBy marks a recorded spend; frozen marks an explicit hold.
+//     spentBy marks a recorded spend; frozen marks an explicit hold; pinned
+//     marks the committed pre-broadcast state (a signed transaction spends this
+//     coin), which makes the reservation unsweepable — see [utxostore.Store.Pin].
+//     A pin never changes claimability: a pinned coin is reserved, so its
+//     claimKey is already gone.
 //   - bucket = floor(log2(sats)) gives 64 best-fit buckets. A denominated pool
 //     shares one bucket, so ClaimExact is a pure index hit; arbitrary amounts
 //     are served by walking buckets (smallest- or largest-first) with a bounded
@@ -74,6 +78,7 @@ const (
 	binResAt    = "resAt"
 	binSpentBy  = "spentBy"
 	binFrozen   = "frozen"
+	binPinned   = "pinned"
 	binCreated  = "createdAt"
 	binClaimKey = "claimKey"
 	binInvKey   = "invKey"
@@ -108,6 +113,25 @@ type Store struct {
 	// production leaves it nil so the check is a single predictable branch.
 	restoreRaceHook func()
 
+	// removeRaceHook, when non-nil, is invoked by the guarded delete paths
+	// (Remove, RemoveByMintTx, RemoveSpentBy) immediately BEFORE each guarded
+	// delete. It is a TEST-ONLY seam for deterministically landing a concurrent
+	// reserve/spend/unspend inside the caller's snapshot→delete window (audit
+	// P1-1); production leaves it nil so the check is a single predictable
+	// branch.
+	//
+	// The seam cannot reach the [utxostore.ErrContention] branches of those
+	// paths: it fires on the caller's own goroutine, so the transition it lands
+	// is still in place when the loop re-reads, and the re-read always classifies
+	// the row as held. Exhausting the budget needs the state to flip BACK and be
+	// taken again inside the same window, which no seam can stage and which real
+	// churn hits far too rarely to test (the concurrent remove/claim test drives
+	// that churn and reports how often it got there — measured runs saw a first
+	// guard loss roughly once per thousand attempts and a second one never). So
+	// those branches are defensive: unreachable by construction here, and safe
+	// by the same invariant the guard itself enforces.
+	removeRaceHook func()
+
 	closeOnce sync.Once
 	closed    atomic.Bool
 }
@@ -116,14 +140,16 @@ type Store struct {
 type Option func(*config)
 
 type config struct {
-	now            func() time.Time
-	logger         *slog.Logger
-	set            string
-	user           string
-	password       string
-	durableDeletes *bool // nil = auto-detect from server edition
-	indexTimeout   time.Duration
-	claimCacheSize int // ClaimExact candidate-cache refill batch; <=0 disables
+	now                func() time.Time
+	logger             *slog.Logger
+	set                string
+	user               string
+	password           string
+	durableDeletes     *bool // nil = auto-detect from server edition
+	indexTimeout       time.Duration
+	claimCacheSize     int           // claim candidate-cache refill batch; <=0 disables the cache
+	claimCacheBuckets  int           // LRU cap on cached buckets; <=0 unbounded
+	claimCacheEmptyTTL time.Duration // how long an empty probe suppresses the next one; <=0 never
 }
 
 // defaultClaimCacheSize is the ClaimExact candidate-cache refill batch: one
@@ -132,6 +158,22 @@ type config struct {
 // per-claim index-query rate (and its single-node routing-lock contention) low
 // while bounding queued memory to O(refill) records per live denomination.
 const defaultClaimCacheSize = 512
+
+// defaultClaimCacheBuckets caps how many claimKey snapshots the cache keeps,
+// least-recently-used first. claimKey embeds the user id, so an uncapped map is
+// unbounded in the number of wallets a process has ever served: 1024 buckets is
+// a few hundred wallets' worth of live (basket, tier, value-bucket)
+// combinations, which covers a hot working set while capping the worst case at
+// O(1024 × refill) cached records. Exceeding it costs a re-probe, never an error.
+const defaultClaimCacheBuckets = 1024
+
+// defaultClaimCacheEmptyTTL bounds how long the cache may answer "this bucket is
+// empty" from a previous probe. It is the cross-process staleness bound, not a
+// tuning knob — see the emptyTTL discussion on [claimCache]. One second keeps a
+// funded-by-another-replica wallet unclaimable for at most a second (it used to
+// be until restart) while still collapsing a busy funder's repeated walks over
+// genuinely empty tiers to one probe per bucket per second.
+const defaultClaimCacheEmptyTTL = time.Second
 
 // WithClock overrides the store's clock (used for ReservedAt and CreatedAt).
 // Intended for tests that need deterministic timestamps.
@@ -162,16 +204,37 @@ func WithDurableDeletes(on bool) Option { return func(c *config) { c.durableDele
 // [defaultClaimCacheSize].
 func WithClaimCache(n int) Option { return func(c *config) { c.claimCacheSize = n } }
 
+// WithClaimCacheBuckets caps how many claimKey snapshots the claim cache keeps,
+// evicting least-recently-used. n <= 0 removes the cap (unbounded growth, one
+// entry per (user, basket, tier, value-bucket) the process has claimed from).
+// Defaults to [defaultClaimCacheBuckets].
+func WithClaimCacheBuckets(n int) Option { return func(c *config) { c.claimCacheBuckets = n } }
+
+// WithClaimCacheEmptyTTL bounds how long the claim cache may skip a bucket's
+// index probe after one came back empty. d <= 0 disables that suppression
+// entirely: every claim on an empty bucket probes, which costs queries but
+// removes all cross-process staleness. Defaults to
+// [defaultClaimCacheEmptyTTL].
+//
+// The bound matters in a multi-process deployment: the cache's event-driven
+// invalidation only sees writes made by ITS process, so this is the window in
+// which a coin another replica made claimable can stay invisible here.
+func WithClaimCacheEmptyTTL(d time.Duration) Option {
+	return func(c *config) { c.claimCacheEmptyTTL = d }
+}
+
 // New connects to the Aerospike cluster at host:port serving namespace, runs
 // the fund-safety and edition checks, ensures the secondary indexes exist, and
 // returns a ready store. It fails if the namespace's default-ttl is not 0.
 func New(ctx context.Context, host string, port int, namespace string, opts ...Option) (*Store, error) {
 	cfg := config{
-		now:            time.Now,
-		logger:         slog.Default(),
-		set:            DefaultSet,
-		indexTimeout:   30 * time.Second,
-		claimCacheSize: defaultClaimCacheSize,
+		now:                time.Now,
+		logger:             slog.Default(),
+		set:                DefaultSet,
+		indexTimeout:       30 * time.Second,
+		claimCacheSize:     defaultClaimCacheSize,
+		claimCacheBuckets:  defaultClaimCacheBuckets,
+		claimCacheEmptyTTL: defaultClaimCacheEmptyTTL,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -197,8 +260,13 @@ func New(ctx context.Context, host string, port int, namespace string, opts ...O
 		logger:    cfg.logger.With("component", "aerostore"),
 	}
 	if cfg.claimCacheSize > 0 {
-		s.claimCache = newClaimCache(cfg.claimCacheSize)
+		// The cache reads the SAME clock the store stamps records with, so a
+		// test that freezes or advances time controls the negative cache's TTL
+		// exactly as it controls reservation ages.
+		s.claimCache = newClaimCache(cfg.claimCacheSize, cfg.claimCacheBuckets, cfg.claimCacheEmptyTTL, cfg.now)
 	}
+
+	s.warnOnDynamicClientConfig(as.AEROSPIKE_CLIENT_CONFIG_URL)
 
 	if err := s.checkFundSafety(ctx); err != nil {
 		client.Close()
@@ -261,6 +329,35 @@ func validateDefaultTTL(namespace, raw string) error {
 		return fmt.Errorf("aerostore: REFUSING TO START: namespace %q has default-ttl=%s (must be 0 so UTXO rows never silently expire)", namespace, ttl)
 	}
 	return nil
+}
+
+// warnOnDynamicClientConfig complains, loudly and once at startup, when the
+// aerospike client is loading a DYNAMIC configuration — the one mechanism
+// outside this package that can change a write policy after this package built
+// it.
+//
+// It matters here for a single field. The claim-reserve CAS must never be
+// auto-retried (see [reservePolicy]: the write falsifies its own guard, so a
+// retried in-doubt reserve reads its own success as a lost race and strands a
+// phantom reservation). The client's own default makes that true, and nothing in
+// this package changes it — but a dynamic config carrying max_retries is applied
+// to a COPY of every write policy at command time, so it would re-enable retries
+// on a CAS whose correctness assumes they are off, invisibly to this code and to
+// any test of it.
+//
+// A warning rather than a refusal: the file may well be there for timeouts or
+// replica policy, and the failure it risks is a coin held by an abandoned token
+// until the stale-reservation sweep reclaims it — bad, self-healing, and nothing
+// like the silent fund loss [Store.checkFundSafety] refuses to start over.
+//
+// The URL is a parameter (the client reads it into an exported package variable
+// at init) so the rule is testable without touching the process environment.
+func (s *Store) warnOnDynamicClientConfig(configURL string) {
+	if strings.TrimSpace(configURL) == "" { // the client's own emptiness test
+		return
+	}
+	s.logger.Warn("aerospike client dynamic configuration is active (AEROSPIKE_CLIENT_CONFIG_URL); if it sets max_retries for writes it re-enables auto-retry on the claim-reserve CAS, which is NOT idempotent — a retried in-doubt reserve reports no coin while the server holds it reserved, until the stale-reservation sweep frees it",
+		"configURL", configURL)
 }
 
 // resolveDurableDeletes decides whether deletes carry a tombstone. Explicit
@@ -418,11 +515,22 @@ func (s *Store) keyFor(op utxostore.Outpoint) (*as.Key, error) {
 	return k, nil
 }
 
-// deleteWritePolicy returns a write policy for deletes, honoring the resolved
-// durable-delete setting.
-func (s *Store) deleteWritePolicy() *as.WritePolicy {
+// deletePolicy returns the write policy for record deletes, honoring the
+// resolved durable-delete setting. filter == nil keeps an unguarded delete (the
+// force paths, where the caller has explicitly asserted authority over the row);
+// a non-nil filter re-asserts the state the caller classified from its snapshot,
+// so a concurrent reserve/spend/freeze landing between that snapshot and the
+// delete FILTERs the delete out instead of destroying a live row — which would
+// silently remove an input of an in-flight broadcast (audit P1-1).
+//
+// A FilterExpression rather than a GenerationPolicy: generation counts ANY
+// concurrent write, so a benign one (a Promote tier bump, say) would abort a
+// legitimate remove, whereas the filter names exactly the states that must veto
+// it.
+func (s *Store) deletePolicy(filter *as.Expression) *as.WritePolicy {
 	wp := as.NewWritePolicy(0, 0)
 	wp.DurableDelete = s.durableDeletes
+	wp.FilterExpression = filter
 	return wp
 }
 
@@ -476,6 +584,9 @@ func recordToUTXO(rec *as.Record) (*utxostore.UTXO, error) {
 	if f, ok := asInt64(b[binFrozen]); ok && f != 0 {
 		u.Frozen = true
 	}
+	if p, ok := asInt64(b[binPinned]); ok && p != 0 {
+		u.Pinned = true
+	}
 	return u, nil
 }
 
@@ -503,6 +614,14 @@ func asString(v any) string {
 
 // --- shared op helpers ------------------------------------------------------
 
+// casAttempts is the per-outpoint budget shared by every snapshot → classify →
+// guarded-CAS loop (spendOne, removeOne, removeMintTxOp). One retry covers the
+// realistic case — a transition landed inside the window and the re-read now
+// sees it — plus the case where it landed and then undid itself. Past that the
+// row is reported as contended rather than acted on with a stale
+// classification, which keeps worst-case latency bounded under contention.
+const casAttempts = 2
+
 // getRecord fetches the record for op. found is false (with nil error) when the
 // outpoint is absent.
 func (s *Store) getRecord(op utxostore.Outpoint) (rec *as.Record, found bool, err error) {
@@ -520,16 +639,108 @@ func (s *Store) getRecord(op utxostore.Outpoint) (rec *as.Record, found bool, er
 	return r, true, nil
 }
 
+// deleteResult is what one guarded delete did. The three real cases are
+// distinct because the callers report them differently: only deleteRemoved may
+// be counted as a removal, deleteGuardLost must be re-read and re-classified,
+// and deleteAbsent is a row somebody else already took care of. The zero value
+// is none of them, so a result that was never assigned cannot pass for an
+// outcome.
+type deleteResult int
+
+const (
+	deleteInvalid   deleteResult = iota // zero value: no outcome; accompanies an error
+	deleteRemoved                       // the record existed and is now deleted
+	deleteGuardLost                     // FILTERED_OUT: the row changed state and survives
+	deleteAbsent                        // there was no record to delete
+)
+
+// deleteRecordGuarded deletes op's record under filter (nil = unguarded; see
+// [Store.deletePolicy]). A guarded delete fires the test-only remove-race seam
+// first, so a test can land a concurrent transition inside exactly the window
+// the guard exists to close.
+//
+// The driver reports the two non-delete outcomes asymmetrically: unlike Operate,
+// which fails a missing record with KEY_NOT_FOUND, Delete maps that case to
+// existed=false with a NIL error — hence deleteAbsent comes from the returned
+// flag while deleteGuardLost comes from a FILTERED_OUT error, and there is no
+// KEY_NOT_FOUND branch here.
+func (s *Store) deleteRecordGuarded(op utxostore.Outpoint, filter *as.Expression) (deleteResult, error) {
+	key, kerr := s.keyFor(op)
+	if kerr != nil {
+		return deleteInvalid, kerr
+	}
+	if filter != nil {
+		s.fireRemoveRaceHook() // guarded deletes only: force races nothing
+	}
+	existed, derr := s.client.Delete(s.deletePolicy(filter), key)
+	if derr != nil {
+		if derr.Matches(types.FILTERED_OUT) {
+			return deleteGuardLost, nil // the row is no longer removable
+		}
+		return deleteInvalid, fmt.Errorf("aerostore: delete %s: %w", op, derr)
+	}
+	if !existed {
+		return deleteAbsent, nil
+	}
+	return deleteRemoved, nil
+}
+
+// fireRemoveRaceHook invokes the test-only remove-race seam if one is set.
+// See the removeRaceHook field.
+func (s *Store) fireRemoveRaceHook() {
+	if s.removeRaceHook != nil {
+		s.removeRaceHook()
+	}
+}
+
+// allTiers is every tier a coin can occupy, in ascending order. It exists so
+// the paths that must consider all of them — the server-side claimKey restore
+// ladder and [Store.noteClaimableAllTiers] — enumerate the same set, and adding
+// a tier is one edit rather than a hunt.
+func allTiers() []utxostore.Tier {
+	return []utxostore.Tier{utxostore.TierSending, utxostore.TierUnproven, utxostore.TierMined}
+}
+
 // noteClaimable tells the claim cache (when enabled) that a coin has been made
 // claimable in the (userID, basket, tier, value-bucket) it names, so a bucket
 // last seen empty is re-probed on the next claim. A no-op when the cache is
 // disabled. Callers invoke it AFTER the backing write commits so the coin is
 // already visible to a probe.
+//
+// Only callers that KNOW the tier the coin landed in may use this: Mint (it
+// wrote the tier) and Promote (it wrote the tier). Every restore path must use
+// [Store.noteClaimableAllTiers] instead.
 func (s *Store) noteClaimable(userID int64, basket string, tier utxostore.Tier, sats uint64) {
 	if s.claimCache == nil {
 		return
 	}
 	s.claimCache.markClaimable(claimKeyFor(userID, basket, tier, bucketOf(sats)))
+}
+
+// noteClaimableAllTiers is [Store.noteClaimable] for the restore paths (release,
+// unspend, unfreeze), which do NOT know which tier's bucket the coin became
+// claimable in.
+//
+// They cannot know: [restoreClaimKeyOp] deliberately derives the restored key's
+// tier server-side from the record's LIVE tier bin, so a Promote that landed
+// between the caller's snapshot read and the restore write moves the coin to a
+// different bucket than the snapshot says. Marking the snapshot's tier then
+// invalidated the wrong bucket and left the coin stranded behind the new
+// bucket's empty-probe suppression — claimable on the server, unclaimable
+// through this process, until something else disturbed that bucket (audit
+// P2-6c).
+//
+// Marking all three is three map operations and no I/O, and a spurious mark
+// costs at most one extra probe of a bucket that turns out to be empty. That is
+// the right trade against a coin that no claim can see.
+func (s *Store) noteClaimableAllTiers(userID int64, basket string, sats uint64) {
+	if s.claimCache == nil {
+		return
+	}
+	bucket := bucketOf(sats)
+	for _, t := range allTiers() {
+		s.claimCache.markClaimable(claimKeyFor(userID, basket, t, bucket))
+	}
 }
 
 // restoreClaimKeyOp returns an operation that RESTORES the claimKey bin (making
@@ -559,7 +770,7 @@ func restoreClaimKeyOp(skipWhen *as.Expression, u *utxostore.UTXO) *as.Operation
 	// (write nothing) when skipWhen holds; otherwise select the claimKey string
 	// whose embedded tier matches the record's LIVE tier bin.
 	pairs := []*as.Expression{skipWhen, as.ExpUnknown()}
-	for _, t := range []utxostore.Tier{utxostore.TierSending, utxostore.TierUnproven, utxostore.TierMined} {
+	for _, t := range allTiers() {
 		pairs = append(pairs,
 			as.ExpEq(as.ExpIntBin(binTier), as.ExpIntVal(int64(t))),
 			as.ExpStringVal(claimKeyFor(u.UserID, u.Basket, t, bucket)),
@@ -580,23 +791,4 @@ func (s *Store) fireRestoreRaceHook() {
 // removeBinOp returns an operation that removes a bin (a Put of a nil value).
 func removeBinOp(name string) *as.Operation {
 	return as.PutOp(as.NewBin(name, nil))
-}
-
-// joinBatch wraps per-item typed errors under the ErrBatch sentinel, or returns
-// nil when there are none (for Remove/Freeze/Unfreeze, whose ops carry no Err
-// slot). errors.Is finds ErrBatch; errors.As finds the item errors.
-func joinBatch(itemErrs []error) error {
-	if len(itemErrs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %w", utxostore.ErrBatch, errors.Join(itemErrs...))
-}
-
-// batchCountErr returns the top-level ErrBatch sentinel (with a count) when any
-// item in a Mint/Spend batch failed, or nil.
-func batchCountErr(failed, total int) error {
-	if failed == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, total)
 }

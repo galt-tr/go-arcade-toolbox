@@ -13,6 +13,7 @@ material behind them.
 - [Migration from go-wallet-toolbox](migration-from-go-wallet-toolbox.md) — the import-path rewrite, the byte-compatibility guarantees, behavior deltas, dropped features, and config-file migration.
 - [Operations](operations.md) — **backup is a correctness requirement**, per-backend backup/restore, the Aerospike fund-safety requirements, monitoring, running the storage server, and the rootless-podman test setup.
 - [Rejection hardening audit](rejection-hardening-audit.md) — every way a client can get a transaction rejected that the library could prevent or explain locally, the broadcast failure taxonomy, and what a client must still do itself.
+- [UTXO reservation audit — remediation closeout](audits/20260819-utxo-reservation-remediation.md) — the "two processes cannot select the same coin" audit mapped finding-by-finding to its fix, the pinned-state architecture that replaced six bespoke in-flight guards, the four amendments where the fix diverged from the review, and the remaining follow-up debt.
 - [Aerospike value review](aerospike-value-review.md) — whether Mode B is earning its keep. Current recommendation: no — plan to drop it and run PostgreSQL-only.
 - [Benchmarks](benchmarks/README.md) — the raw measured write-path throughput numbers.
 

@@ -5,6 +5,13 @@
 // as the fake for funder unit tests. It is fully thread-safe; every method is
 // a single critical section, which trivially satisfies the per-item atomicity
 // and single-round-trip claim contracts.
+//
+// That single critical section is also why none of the delete paths (Remove,
+// RemoveByMintTx, RemoveSpentBy) needs the compare-and-set guard an optimistic
+// backend's does — see the delete-time filters aerostore added for audit
+// finding P1-1. Each classifies a row and deletes it while holding s.mu, so no
+// concurrent reserve, spend or freeze can land in between and no delete can
+// destroy a row that stopped being removable.
 package memstore
 
 import (
@@ -92,21 +99,13 @@ func (s *Store) Mint(_ context.Context, mints []*utxostore.Mint) error {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, len(mints))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(mints))
 }
 
 // mintOne creates a single coin; the caller holds the mutex.
 func (s *Store) mintOne(m *utxostore.Mint) error {
-	switch {
-	case m.UserID <= 0:
-		return fmt.Errorf("memstore: mint %s: user id must be positive", m.Outpoint)
-	case m.Basket == "":
-		return fmt.Errorf("memstore: mint %s: basket must be non-empty", m.Outpoint)
-	case !m.Tier.Valid():
-		return fmt.Errorf("memstore: mint %s: invalid tier %d", m.Outpoint, m.Tier)
+	if err := utxostore.ValidateMint(m); err != nil {
+		return err
 	}
 
 	if existing, ok := s.rows[m.Outpoint]; ok {
@@ -152,7 +151,9 @@ func (s *Store) Get(_ context.Context, op utxostore.Outpoint) (*utxostore.UTXO, 
 }
 
 // Remove implements [utxostore.Store]. Missing rows are no-ops; without
-// force, reserved/spent/frozen rows are refused per item.
+// force, reserved/spent/frozen rows are refused per item. Classification and
+// delete share one critical section, so the sequence needs no compare-and-set
+// guard; see the package doc.
 func (s *Store) Remove(_ context.Context, ops []utxostore.Outpoint, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -181,7 +182,7 @@ func (s *Store) Remove(_ context.Context, ops []utxostore.Outpoint, force bool) 
 		}
 		delete(s.rows, op)
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // claimable reports whether the row can be handed to a claim in scope sc;
@@ -190,21 +191,6 @@ func claimable(r *row, sc utxostore.Scope) bool {
 	u := &r.utxo
 	return u.UserID == sc.UserID && u.Basket == sc.Basket && u.Tier == sc.Tier &&
 		u.ReservedBy == "" && u.SpentBy == nil && !u.Frozen
-}
-
-// validateClaim rejects underspecified claim inputs; see the interface doc.
-func validateClaim(sc utxostore.Scope, reservation string) error {
-	switch {
-	case reservation == "":
-		return errors.New("memstore: reservation must be non-empty")
-	case sc.UserID <= 0:
-		return errors.New("memstore: scope user id must be positive")
-	case sc.Basket == "":
-		return errors.New("memstore: scope basket must be non-empty")
-	case !sc.Tier.Valid():
-		return fmt.Errorf("memstore: invalid scope tier %d", sc.Tier)
-	}
-	return nil
 }
 
 // reserve marks r as held by reservation and returns a copy; the caller
@@ -224,7 +210,7 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 	if s.closed {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 
@@ -247,14 +233,15 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 
 // ClaimLargestInsufficient implements [utxostore.Store]: up to limit
 // claimable coins with Satoshis < capSats, largest first, ties broken by
-// insertion order.
+// REVERSE insertion order (newest first) — the opposite direction from the
+// other two claim shapes. See the comparator below for why.
 func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, reservation string, capSats uint64, limit int) ([]*utxostore.UTXO, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -271,7 +258,22 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 		if c := cmp.Compare(b.utxo.Satoshis, a.utxo.Satoshis); c != 0 {
 			return c // largest first
 		}
-		return cmp.Compare(a.seq, b.seq)
+		// Ties: NEWEST first, unlike ClaimSmallestSufficient/ClaimExact.
+		// This shape is the one that scans DESCENDING, and a descending walk
+		// of a (satoshis, seq) index yields the newest of an equal-value run
+		// first. sqlstore is the reference here rather than the other way
+		// round: asking SQL for (satoshis DESC, seq ASC) cannot be served by
+		// the partial claim index without a sort node, which would cost the
+		// 1000-TPS hot path an O(pool) sort on exactly the equal-value fuel
+		// pool this ordering matters for. So the reference implementation
+		// matches the index instead, and the interface documents it.
+		//
+		// Accepted tradeoff: on a pool of identical coins the tie-break is
+		// LIFO, so the oldest coins sit at the bottom until the pool drains
+		// below them. Cosmetic — every coin is equally spendable — and the
+		// FIFO shapes (ClaimSmallestSufficient, ClaimExact) still drain from
+		// the front.
+		return cmp.Compare(b.seq, a.seq)
 	})
 	candidates = candidates[:min(limit, len(candidates))]
 
@@ -291,7 +293,7 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	if s.closed {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if count <= 0 {
@@ -314,21 +316,99 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	return claimed, nil
 }
 
-// ReleaseReservation implements [utxostore.Store]: frees every unspent row
-// held by (userID, reservation). Idempotent; never touches spent rows.
+// ReserveOutpoints implements [utxostore.Store]: an all-or-nothing hold on the
+// EXACT listed rows. Two phases inside one critical section — classify every op
+// first, and mutate only when the whole set passed — which is all the atomicity
+// the reference implementation needs: no other goroutine can observe the gap.
+func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation string, ops []utxostore.Outpoint) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errClosed
+	}
+	if err := utxostore.ValidateReserveOutpoints(reservation, ops); err != nil {
+		return err
+	}
+
+	var (
+		itemErrs []error
+		toStamp  []*row
+	)
+	for _, op := range distinctOutpoints(ops) {
+		r, ok := s.rows[op]
+		if !ok || r.utxo.UserID != userID {
+			// A row belonging to someone else reads as absent: the caller
+			// supplied the outpoint, so the answer must not confirm that
+			// another user's coin exists.
+			itemErrs = append(itemErrs, &utxostore.NotFoundError{Op: op})
+			continue
+		}
+		switch {
+		case r.utxo.SpentBy != nil:
+			itemErrs = append(itemErrs, &utxostore.SpentError{Op: op, Winner: *r.utxo.SpentBy})
+		case r.utxo.ReservedBy != "" && r.utxo.ReservedBy != reservation:
+			itemErrs = append(itemErrs, &utxostore.ReservedError{Op: op, HeldBy: r.utxo.ReservedBy})
+		case r.utxo.Frozen:
+			itemErrs = append(itemErrs, &utxostore.FrozenError{Op: op})
+		case r.utxo.ReservedBy == reservation:
+			// Already ours: satisfied, and deliberately not re-stamped, so a
+			// replay cannot slide ReservedAt out from under the stale reaper.
+		default:
+			toStamp = append(toStamp, r)
+		}
+	}
+	if len(itemErrs) > 0 {
+		return utxostore.JoinBatch(itemErrs) // nothing mutated: all-or-nothing
+	}
+
+	// ONE timestamp for the whole set: the named inputs were reserved by a
+	// single decision, so they must age as a unit under the stale reaper.
+	now := s.now()
+	for _, r := range toStamp {
+		r.utxo.ReservedBy = reservation
+		r.utxo.ReservedAt = now
+	}
+	return nil
+}
+
+// distinctOutpoints drops repeats, preserving first-seen order. Duplicates in
+// one ReserveOutpoints call name the same row, so classifying it twice would
+// report the same refusal twice for a single coin.
+func distinctOutpoints(ops []utxostore.Outpoint) []utxostore.Outpoint {
+	seen := make(map[utxostore.Outpoint]struct{}, len(ops))
+	out := make([]utxostore.Outpoint, 0, len(ops))
+	for _, op := range ops {
+		if _, dup := seen[op]; dup {
+			continue
+		}
+		seen[op] = struct{}{}
+		out = append(out, op)
+	}
+	return out
+}
+
+// heldBy reports whether the row belongs to the live (unspent) membership of
+// (userID, reservation): the set the janitor release, Pin, and Unpin all act on.
+func heldBy(r *row, userID int64, reservation string) bool {
+	return r.utxo.UserID == userID && r.utxo.ReservedBy == reservation && r.utxo.SpentBy == nil
+}
+
+// ReleaseReservation implements [utxostore.Store]: frees every unspent,
+// UNPINNED row held by (userID, reservation). Idempotent; never touches spent
+// rows, and never frees the inputs of an in-flight send (see [Store.Pin]).
 func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("memstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	released := 0
 	for _, r := range s.rows {
-		if r.utxo.UserID == userID && r.utxo.ReservedBy == reservation && r.utxo.SpentBy == nil {
+		if heldBy(r, userID, reservation) && !r.utxo.Pinned {
 			r.utxo.ReservedBy = ""
 			r.utxo.ReservedAt = time.Time{}
 			released++
@@ -337,16 +417,52 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 	return released, nil
 }
 
+// Pin implements [utxostore.Store]: marks every unspent row held by (userID,
+// reservation) as pinned, returning how many it NEWLY pinned. Idempotent.
+func (s *Store) Pin(_ context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(userID, reservation, true)
+}
+
+// Unpin implements [utxostore.Store]: clears the pin on every unspent row held
+// by (userID, reservation), leaving them reserved. Idempotent.
+func (s *Store) Unpin(_ context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(userID, reservation, false)
+}
+
+// setPinned drives Pin/Unpin: it flips the pin on the reservation's live
+// membership and counts only the rows that actually changed.
+func (s *Store) setPinned(userID int64, reservation string, pinned bool) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, errClosed
+	}
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
+	}
+
+	changed := 0
+	for _, r := range s.rows {
+		if !heldBy(r, userID, reservation) || r.utxo.Pinned == pinned {
+			continue
+		}
+		r.utxo.Pinned = pinned
+		changed++
+	}
+	return changed, nil
+}
+
 // ReleaseOutpoints implements [utxostore.Store]: guard mismatches, spent rows
-// and missing outpoints are per-item skips, not errors.
+// and missing outpoints are per-item skips, not errors. A matching token
+// overrides the pin — this is the verified-dead release path.
 func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []utxostore.Outpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return errClosed
 	}
-	if reservation == "" {
-		return errors.New("memstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return err
 	}
 
 	for _, op := range ops {
@@ -356,13 +472,16 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 		}
 		r.utxo.ReservedBy = ""
 		r.utxo.ReservedAt = time.Time{}
+		r.utxo.Pinned = false
 	}
 	return nil
 }
 
 // Spend implements [utxostore.Store]: reserved(reservation) → spent(txid),
 // idempotent for the same spender, [utxostore.SpentError] for a different one.
-func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
+// With force it records a spend the network has already accepted, skipping the
+// reservation and freeze guards (see [utxostore.Store.Spend]).
+func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -371,42 +490,45 @@ func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp) error {
 
 	failed := 0
 	for _, sp := range spends {
-		sp.Err = s.spendOne(sp)
+		sp.Err = s.spendOne(sp, force)
 		if sp.Err != nil {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, len(spends))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(spends))
 }
 
 // spendOne applies a single spend transition; the caller holds the mutex.
-func (s *Store) spendOne(sp *utxostore.SpendOp) error {
-	if sp.Reservation == "" {
-		return fmt.Errorf("memstore: spend %s: reservation must be non-empty", sp.Outpoint)
+func (s *Store) spendOne(sp *utxostore.SpendOp, force bool) error {
+	if err := utxostore.ValidateSpend(sp); err != nil {
+		return err
 	}
 
 	r, ok := s.rows[sp.Outpoint]
 	if !ok {
 		return &utxostore.NotFoundError{Op: sp.Outpoint}
 	}
+	// The spent_by arbiter runs in BOTH modes: two spend facts cannot both hold.
 	if r.utxo.SpentBy != nil {
 		if *r.utxo.SpentBy == sp.SpendingTxID {
 			return nil // idempotent: same spender replay
 		}
 		return &utxostore.SpentError{Op: sp.Outpoint, Winner: *r.utxo.SpentBy}
 	}
-	if r.utxo.Frozen {
-		return &utxostore.FrozenError{Op: sp.Outpoint}
-	}
-	if r.utxo.ReservedBy != sp.Reservation {
-		return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: r.utxo.ReservedBy}
+	// Fact mode skips exactly these two guards: the spend is already on the
+	// network, so neither a freeze nor a stale reservation can un-happen it.
+	if !force {
+		if r.utxo.Frozen {
+			return &utxostore.FrozenError{Op: sp.Outpoint}
+		}
+		if r.utxo.ReservedBy != sp.Reservation {
+			return &utxostore.ReservedError{Op: sp.Outpoint, HeldBy: r.utxo.ReservedBy}
+		}
 	}
 
 	spentBy := sp.SpendingTxID
 	r.utxo.SpentBy = &spentBy
+	r.utxo.Pinned = false // the send it protected has landed; the coin is consumed
 	return nil
 }
 
@@ -428,6 +550,7 @@ func (s *Store) Unspend(_ context.Context, spendingTxID chainhash.Hash, ops []ut
 		r.utxo.SpentBy = nil
 		r.utxo.ReservedBy = ""
 		r.utxo.ReservedAt = time.Time{}
+		r.utxo.Pinned = false
 		released++
 	}
 	return released, nil
@@ -487,10 +610,8 @@ func (s *Store) RemoveByMintTx(_ context.Context, mintTxID chainhash.Hash, ops [
 	if s.closed {
 		return report, errClosed
 	}
-	for _, op := range ops {
-		if op.TxID != mintTxID {
-			return report, fmt.Errorf("memstore: outpoint %s is not an output of mint tx %s", op, mintTxID.String())
-		}
+	if err := utxostore.ValidateMintOutpoints(mintTxID, ops); err != nil {
+		return report, err
 	}
 
 	reservedRefs := make(map[string]*utxostore.ReservationRef) // by token
@@ -565,7 +686,7 @@ func (s *Store) setFrozen(ops []utxostore.Outpoint, frozen bool) error {
 		}
 		r.utxo.Frozen = frozen
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // Balance implements [utxostore.Store].
@@ -599,8 +720,21 @@ func (s *Store) Balance(_ context.Context, userID int64, basket string) (utxosto
 }
 
 // FindStaleReservations implements [utxostore.Store]: reservations of
-// unspent rows whose oldest ReservedAt is before olderThan, oldest first.
+// unspent, unpinned rows whose oldest ReservedAt is before olderThan, oldest
+// first. Pinned rows are excluded entirely — the reaper must never see the
+// inputs of an in-flight send.
 func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStale(olderThan, limit, false)
+}
+
+// FindStaleReservationsIncludingPinned implements [utxostore.Store]: the same
+// listing with pinned rows counted in, for a caller that has already fenced
+// the transactions holding them.
+func (s *Store) FindStaleReservationsIncludingPinned(_ context.Context, olderThan time.Time, limit int) ([]utxostore.ReservationRef, error) {
+	return s.findStale(olderThan, limit, true)
+}
+
+func (s *Store) findStale(olderThan time.Time, limit int, includePinned bool) ([]utxostore.ReservationRef, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -624,6 +758,9 @@ func (s *Store) FindStaleReservations(_ context.Context, olderThan time.Time, li
 		u := &r.utxo
 		if u.ReservedBy == "" || u.SpentBy != nil {
 			continue
+		}
+		if u.Pinned && !includePinned {
+			continue // pinned rows are in flight, never ordinary stale work
 		}
 		k := key{userID: u.UserID, token: u.ReservedBy}
 		g, ok := groups[k]
@@ -685,14 +822,4 @@ func copyUTXO(u *utxostore.UTXO) *utxostore.UTXO {
 		c.SpentBy = &spentBy
 	}
 	return &c
-}
-
-// joinBatch wraps per-item errors under the ErrBatch sentinel, or returns
-// nil when there are none. errors.Is finds ErrBatch; errors.As finds the
-// item errors.
-func joinBatch(itemErrs []error) error {
-	if len(itemErrs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %w", utxostore.ErrBatch, errors.Join(itemErrs...))
 }

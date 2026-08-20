@@ -18,6 +18,12 @@ var ErrNotFound = errors.New("metastore: not found")
 // [ErrNotFound] instead, so the two cases are always distinguishable.
 var ErrStatusUpdateSkipped = errors.New("metastore: status update skipped (precondition not met)")
 
+// ErrTxIDMismatch is returned by [TransactionsRepo.SetTxID] when the row exists
+// but is already bound to a DIFFERENT txid — distinct from [ErrNotFound] (no
+// such transaction row) and from the idempotent re-bind of the same txid, which
+// succeeds. See SetTxID for why a divergent binding is refused.
+var ErrTxIDMismatch = errors.New("metastore: transaction already bound to a different txid")
+
 // ErrOutputBasketMismatch is returned by RelinquishOutput when the outpoint
 // exists for the user but is not in the requested basket — distinct from
 // [ErrNotFound] (no such outpoint at all).

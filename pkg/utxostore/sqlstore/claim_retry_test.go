@@ -23,10 +23,10 @@ import (
 // transaction, and it used to be the only one with no lock-error retry: every
 // mutation goes through withTx -> sqlkit.WithRetry, while a claim went straight
 // to the pool. A 40001/40P01 there surfaced raw to the funder, which retries
-// only utxostore.ErrContention — an error this backend never returns — so the
-// hottest path in the module failed on the one class of error every colder path
-// survived. Mode A hid it, because the metastore's outer retry wraps the whole
-// unit of work.
+// only utxostore.ErrContention, and a raw driver lock error is not that — so
+// the hottest path in the module failed on the one class of error every colder
+// path survived. Mode A hid it, because the metastore's outer retry wraps the
+// whole unit of work.
 //
 // These tests inject the lock error at the driver so the retry is asserted where
 // it actually has to work, rather than by reading the call site.

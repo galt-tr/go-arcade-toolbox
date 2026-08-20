@@ -25,10 +25,42 @@
 // declines are released explicitly. Cost is flat in pool size.
 //
 // A full walk over every tier that allocates nothing yields [ErrNotEnoughFunds]
-// (reservation released). Optimistic stores that report [utxostore.ErrContention]
-// trigger a bounded, jittered retry of the whole selection; persistent
-// contention yields [ErrUTXOContention] (reservation released). Lock-based
-// stores never contend.
+// (reservation released) — unless the pool says otherwise; see the next
+// section. [utxostore.ErrContention] triggers a bounded, jittered retry of the
+// whole selection; persistent contention yields [ErrUTXOContention]
+// (reservation released).
+//
+// # Telling a starved pass from an empty pool
+//
+// A SQL claim reserves rows FOR UPDATE SKIP LOCKED. In Mode A (utxostore and
+// metastore sharing one transaction) those locks are held until the caller's
+// whole CreateAction commits, so a CONCURRENT CreateAction skips the locked
+// rows and sees a pool that looks empty but is not. Reporting
+// ErrNotEnoughFunds there is a lie the user feels: the funder does not retry
+// exhaustion, so a payment fails while the coins are still in the wallet and
+// may yet be released by a rollback (audit finding P2-4).
+//
+// So a pass that is ABOUT to report ErrNotEnoughFunds asks the store one more
+// question first, through the optional ClaimableExists capability: is there a
+// claimable coin in any of these tiers right now? If there is, the walk should
+// have found it, so it was hidden — the funder reports [utxostore.ErrContention]
+// instead and its own retry loop handles it. If there is not, the answer stays
+// ErrNotEnoughFunds. Stores that do not implement the capability (memstore,
+// whose claims are mutex-serialized; aerostore, whose claims already report
+// contention natively) are unaffected.
+//
+// Two properties matter enough to state plainly, because both were violated by
+// the obvious design of probing inside the store on every empty claim:
+//
+//   - NOTHING is probed on the allocating path. An empty ClaimSmallestSufficient
+//     is the ordinary precondition of the drain, and a denominated ClaimExact
+//     misses on every tier holding no fuel, so probing there would add a query
+//     per payment at full throughput. The probe runs at most once per tier, on a
+//     pass that already failed.
+//   - Contention is reported ONLY when the WHOLE pass allocated nothing. A
+//     mid-walk empty stays "this tier allocated nothing" and the walk continues,
+//     so a single big coin locked by an uncommitted peer can never pre-empt a
+//     fund that a lower tier could have covered.
 //
 // # Transient over-reservation under concurrency
 //

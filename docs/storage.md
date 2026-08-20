@@ -73,6 +73,40 @@ So the **utxostore is the single source of spendability truth**. `ListOutputs`
 and `GetBalance` intersect the metastore's descriptive rows with the utxostore's
 live set; the metastore never decides spendability.
 
+### The seam on the wire (sync)
+
+Storage-to-storage sync has to cross that seam, because the receiving storage
+has no way to re-derive it: the chunk carries metastore rows, and the metastore
+is exactly the half that does not know what is spendable. `GetSyncChunk`
+therefore **projects the seam onto the wire** — for every change output it runs
+the same `outpointSpendable` intersection the read path uses and ships the
+result in `TableOutput.Spendable`, alongside the `SpentBy` history the row
+already carried. A coin that is spent, reserved (including the pre-broadcast
+pin), frozen or simply absent from the source's inventory ships as
+non-spendable.
+
+`ProcessSyncChunk` rebuilds inventory only for coins the source reports as
+still live (`Change && TxID != nil && Spendable && SpentBy == nil`). Anything
+else is stored as descriptive history with no utxostore row. Minting a coin the
+source has already committed to a transaction would make the same outpoint
+spendable in two storages — a wallet-inflicted double spend (audit P1-2).
+
+Two consequences worth knowing:
+
+- **Old sources rebuild nothing.** A chunk produced by a storage that predates
+  this projection ships `Spendable=false` for everything, so the target
+  rebuilds no inventory at all. That is fail-closed, which is the right
+  direction for a double-spend guard — but it is *not* self-healing. Re-running
+  the sync into the same target after upgrading the source does not repair it,
+  because `ProcessSyncChunk` skips every output whose parent transaction is
+  already present. The remedy is a resync into a **fresh** target.
+  `ProcessSyncChunk` logs a warning when a chunk carried change outputs and
+  minted none, which is the signature of this case.
+- **The wire carries no tier.** A coin that is `TierSending` or `TierUnproven`
+  at the source is rebuilt as `TierMined` on the target, so an in-flight coin
+  looks fully settled there. This is pre-existing (every synced coin was
+  already minted at `TierMined`); carrying `Tier` on the wire is a follow-up.
+
 ## Mode A vs Mode B consistency
 
 The provider auto-detects its consistency mode from how the two stores are wired
@@ -88,9 +122,15 @@ The provider auto-detects its consistency mode from how the two stores are wired
 - **Mode B ("split stores")** — the utxostore is a different backend (Aerospike,
   or a separate SQL database), so the two stores cannot share a transaction. The
   inventory ops are applied directly against the utxostore and the metadata half
-  commits in its own transaction. `CreateAction` reserves inputs via the funder,
-  persists metadata, and **compensates** (a whole-token reservation release) if
-  the metadata write fails. A process that crashes *between* the two direct
+  commits in its own transaction. `CreateAction` holds any caller-named inputs
+  (`ReserveOutpoints`) *before* funding, reserves the rest via the funder,
+  persists metadata, and **compensates** (a whole-token reservation release,
+  on a detached context) if the metadata write fails. `AbortAction` is the
+  exception to "applied directly": it commits **no** utxostore write inside its
+  metastore transaction, routing the release and change removal through the
+  outbox instead, because a release that commits while the metadata half is
+  still provisional would free the coins of a transaction the retry then
+  un-aborts. A process that crashes *between* the two direct
   writes is healed by the **transactional outbox**: the durable `utxo_ops_outbox`
   table records the pending inventory ops, and the monitor's `reject_release`
   task drains it (`DrainOutbox`) by replaying the rows idempotently
@@ -115,10 +155,12 @@ than a node's ("spend this exact outpoint"):
 Health
 Mint, Get, Remove, RemoveByMintTx
 ClaimSmallestSufficient, ClaimLargestInsufficient, ClaimExact
+ReserveOutpoints
 ReleaseReservation, ReleaseOutpoints
-Spend, Unspend, Promote
+Pin, Unpin
+Spend, Unspend, RemoveSpentBy, Promote
 Freeze, Unfreeze
-Balance, FindStaleReservations
+Balance, FindStaleReservations, FindStaleReservationsIncludingPinned
 Close
 ```
 
@@ -132,10 +174,13 @@ ClaimExact(ctx, s Scope, reservation string, denomination uint64, count int) ([]
 It reserves up to `count` claimable coins of exactly `denomination` in one atomic
 round trip; `len(result) < count` signals pool underflow and is not an error.
 
-Five atomicity contracts are the core of the interface (every method is atomic
+Seven atomicity contracts are the core of the interface (every method is atomic
 per item, claims are single-round-trip transitions, guards are exact-match
-preconditions, every replayed op is idempotent, and frozen rows are invisible to
-claims). The conformance suite enforces all five.
+preconditions, every replayed op is idempotent, frozen rows are invisible to
+claims and refuse `Spend` without force, pinned rows are reserved rows no
+janitor may free, and four operations create a reservation — the three claim
+shapes plus `ReserveOutpoints` — with nothing downstream asking which one did).
+The conformance suite enforces all seven.
 
 There is **no TTL- or height-based deletion, ever.** A node can rebuild its UTXO
 set from the chain; a wallet cannot, so silently expiring a row is
@@ -147,7 +192,7 @@ transaction is invalid).
 
 | Backend | Package | Selection | `ErrContention`? | Constructed via |
 |---|---|---|---|---|
-| **SQLite / PostgreSQL** | `pkg/utxostore/sqlstore` | **exact** best-fit | never (the candidate SELECT and reserving UPDATE are the same statement) | `sqlstore.New` (Mode A, wrap `*sql.DB`), `OpenPostgres`, `OpenSQLite`, `Open(defs.Database)` |
+| **SQLite / PostgreSQL** | `pkg/utxostore/sqlstore` | **exact** best-fit | never on a **claim** (the candidate SELECT and reserving UPDATE are the same statement); yes on a **guarded mutation** (`Spend`, `Remove`, `RemoveByMintTx`) whose write-then-classify budget is exhausted by a row cycling under it | `sqlstore.New` (Mode A, wrap `*sql.DB`), `OpenPostgres`, `OpenSQLite`, `Open(defs.Database)` |
 | **Aerospike** | `pkg/utxostore/aerostore` | **approximate** (log2 buckets + best-of-16 sample; single-record CAS) | yes, under CAS exhaustion | `aerostore.Open(ctx, dsn)` |
 | **in-memory** | `pkg/utxostore/memstore` | exact (reference impl) | never | `memstore.New()` |
 

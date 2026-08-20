@@ -91,6 +91,12 @@ func WithConnPool(maxOpen, maxIdle int, connMaxIdle, connMaxLife time.Duration) 
 // Mode A constructor — the metastore and the utxostore share one *sql.DB and
 // enlist in a caller-owned transaction via internal/sqltx and [Store.Do].
 // engine must name the dialect db actually speaks.
+//
+// A SQLite db must already be pinned to a single connection
+// (db.SetMaxOpenConns(1)) — the posture [OpenSQLite] installs on the pool it
+// owns. New validates it and refuses otherwise: the pool is the caller's to
+// size, so the alternative is silently reshaping it. sqlstore.New makes the
+// identical check on the same shared handle.
 func New(ctx context.Context, db *sql.DB, engine Engine, opts ...Option) (*Store, error) {
 	return newStore(ctx, db, engine, false, opts...)
 }
@@ -153,6 +159,17 @@ func newStore(ctx context.Context, db *sql.DB, engine Engine, ownsDB bool, opts 
 	case EnginePostgres, EngineSQLite:
 	default:
 		return nil, fmt.Errorf("metastore: unknown engine %q", engine)
+	}
+	// A SQLite pool this store did NOT open must already be pinned to a single
+	// connection: SQLite serializes writes, and the guarded statements here (and
+	// in the utxostore sharing this handle in Mode A) rest on that posture.
+	// Validate rather than mutate — the handle belongs to the caller, and
+	// quietly reshaping their pool is a worse surprise than refusing to start.
+	if engine == EngineSQLite && !ownsDB {
+		if n := db.Stats().MaxOpenConnections; n != 1 {
+			return nil, fmt.Errorf("metastore: a shared SQLite handle must be pinned to one connection "+
+				"(db.SetMaxOpenConns(1)); got MaxOpenConnections=%d", n)
+		}
 	}
 	s := &Store{db: db, engine: engine, ownsDB: ownsDB, now: time.Now}
 	for _, opt := range opts {
@@ -241,18 +258,21 @@ func (s *Store) isClosed() bool {
 type queryer = sqlkit.SQLExecer
 
 // execer returns the queryer for a statement: the ambient transaction carried
-// by ctx (Mode A / Do) if present, else the pool.
+// by ctx (Mode A / Do) if present AND opened over this store's own *sql.DB,
+// else the pool.
 func (s *Store) execer(ctx context.Context) queryer {
 	return sqlkit.Execer(ctx, s.db)
 }
 
-// inTx runs fn inside a transaction. If ctx already carries one (Mode A / a
-// surrounding Do) it is reused and neither committed nor rolled back here — the
-// owner handles that, including retry. Otherwise a fresh transaction is opened,
-// committed on success, rolled back on error, and the whole call is wrapped in
-// the bounded lock-error retry.
+// inTx runs fn inside a transaction. If ctx already carries one opened over
+// this store's own *sql.DB (Mode A / a surrounding Do) it is reused and
+// neither committed nor rolled back here — the owner handles that, including
+// retry. Otherwise — including when ctx carries a transaction opened over a
+// DIFFERENT *sql.DB — a fresh transaction is opened, committed on success,
+// rolled back on error, and the whole call is wrapped in the bounded
+// lock-error retry.
 func (s *Store) inTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	if _, ok := sqltx.From(ctx); ok {
+	if _, ok := sqltx.From(ctx, s.db); ok {
 		return fn(ctx)
 	}
 	return sqlkit.WithRetry(ctx, func() error {
@@ -260,7 +280,7 @@ func (s *Store) inTx(ctx context.Context, fn func(ctx context.Context) error) er
 		if err != nil {
 			return err
 		}
-		if err := fn(sqltx.With(ctx, tx)); err != nil {
+		if err := fn(sqltx.With(ctx, tx, s.db)); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

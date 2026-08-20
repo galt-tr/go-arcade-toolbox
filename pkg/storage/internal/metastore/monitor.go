@@ -247,27 +247,41 @@ func (r KnownTxRepo) FindUnsent(ctx context.Context, limit int) ([]KnownTx, erro
 }
 
 // FindResendable returns known txs that hold a stored raw tx, were never
-// broadcast (was_broadcast=0), and are re-drivable: the delayed queue (status
-// 'unsent') PLUS txs stranded pre-broadcast (status 'unprocessed') — e.g. a
-// broadcast the arcade circuit breaker short-circuited while open. Only rows
-// older than grace are returned, so a freshly-created 'unprocessed' tx whose
-// own ProcessAction is about to broadcast it is not stolen by the sweep.
-// Oldest first, up to limit. This is the SendWaiting sweep's work list; it
-// makes stranded transactions self-heal once arcade is reachable again.
+// broadcast (was_broadcast=0), and are re-drivable — oldest first, up to limit.
+// This is the SendWaiting sweep's work list; it makes stranded transactions
+// self-heal once arcade is reachable again. There are exactly three arms:
+//
+//   - status 'unsent' — the delayed queue. UNGRACED: these rows were parked
+//     deliberately for the sweep to send, so there is no owner to race.
+//   - status 'unprocessed', graced — a tx stranded before its broadcast ever
+//     started, e.g. one the arcade circuit breaker short-circuited while open.
+//     The grace is what stops the sweep stealing a freshly-created tx whose own
+//     ProcessAction is about to broadcast it.
+//   - status 'sending', graced — crash recovery. A row is only in 'sending'
+//     because [KnownTxRepo.ClaimForSend] put it there, so past the grace the
+//     claimant is presumed dead and the send is re-driven. A duplicate POST of
+//     identical bytes is idempotent-by-txid at arcade, which is what makes
+//     re-driving safe. The caller must take such a row with
+//     [KnownTxRepo.ReclaimStaleSend] before re-POSTing it: that CAS picks one
+//     winner among concurrent sweeps and re-stamps updated_at, which is what
+//     drops the row out of this arm for another full grace instead of
+//     re-selecting it every tick.
+//
+// [KnownTxStatusAborted] is structurally outside every arm — it is in none of
+// the three status predicates, at any age — which is the P0-3 fence: a wallet
+// transaction aborted before broadcast can never be re-POSTed by this sweep,
+// however long it sits.
 func (r KnownTxRepo) FindResendable(ctx context.Context, grace time.Duration, limit int) ([]KnownTx, error) {
 	cutoff := r.s.encTime(r.s.now().Add(-grace))
 	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
-	// The delayed queue ('unsent') sends promptly; the stranded set ('unprocessed')
-	// is gated by grace so a freshly-created tx whose own ProcessAction is about
-	// to broadcast it is not double-sent by the sweep.
 	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
 		"WHERE was_broadcast = ? AND raw_tx IS NOT NULL " +
-		"AND (status = ? OR (status = ? AND updated_at <= ?)) " +
+		"AND (status = ? OR (status IN (?, ?) AND updated_at <= ?)) " +
 		"ORDER BY created_at ASC, txid ASC" + clause)
 	args := append([]any{
 		r.s.boolVal(false),
 		string(wdk.ProvenTxStatusUnsent),
-		string(wdk.ProvenTxStatusUnprocessed), cutoff,
+		string(wdk.ProvenTxStatusUnprocessed), string(wdk.ProvenTxStatusSending), cutoff,
 	}, pageArgs...)
 	return r.queryList(ctx, q, args)
 }
@@ -356,6 +370,69 @@ func (r KnownTxRepo) CountMissingArcadeStatus(ctx context.Context, statuses ...w
 		return 0, fmt.Errorf("metastore: count known txs missing arcade status: %w", err)
 	}
 	return n, nil
+}
+
+// deadTransactionStatuses are the wallet-transaction statuses that say the
+// wallet has WRITTEN THE TRANSACTION OFF and acted on that decision by giving
+// its funding coins back: 'aborted' (fenced before broadcast, reservation
+// released) and 'failed' (the reject reconciler's verified release, or its
+// stuck escalation). They are the transactions side of the mined-repair
+// divergence — see [KnownTxRepo.FindMinedOnDeadTransactions].
+var deadTransactionStatuses = []wdk.TxStatus{
+	wdk.TxStatusAborted,
+	wdk.TxStatusFailed,
+}
+
+// FindMinedOnDeadTransactions returns known txs on which the wallet and the
+// network flatly disagree: arcade reports the transaction ON CHAIN (its
+// arcade_status is one of arcadeStatuses — MINED / IMMUTABLE) while the wallet
+// transaction it belongs to is written off (aborted or failed). Oldest change
+// first, up to limit.
+//
+// This is the mined-repair BACKFILL work list, and it is its own query because
+// no other work list can reach these rows. Every poll finder is keyed on a
+// NON-TERMINAL known-tx status; a row here is either terminal ('completed' —
+// the pre-repair silent completion, where SetProof flipped the known tx while
+// its transaction row stayed aborted) or fenced ('aborted' / 'invalidTx' /
+// 'doubleSpend' / 'stuck' — a proof whose verification deferred). Nothing
+// re-drives either.
+//
+// The predicate is deliberately driven from the TRANSACTIONS side. Written-off
+// transactions are the rare population and carry their own partial index (see
+// the 00008 migration); MINED, by contrast, is the majority arcade_status in a
+// healthy deployment, so leading with it would scan almost the whole table
+// every tick. The set that survives both halves — mined AND written off — is
+// the divergence itself, which in a healthy deployment is empty.
+//
+// It SELF-QUIESCES: a successful repair moves the transaction row to
+// 'completed', which drops the row out of the subquery for good.
+//
+// Ordering is [pollOrder], and the caller MUST record the attempt via
+// [KnownTxRepo.MarkPolled] for every row it takes — the same contract
+// [FindByStatusOlderThan] carries, for the same reason. Several of the backfill's
+// outcomes write nothing to the row at all (arcade has forgotten the
+// transaction, or has revised its verdict away from mined), so without the
+// attempt stamp those rows keep their place at the head of every page and hide
+// the whole backlog behind themselves.
+func (r KnownTxRepo) FindMinedOnDeadTransactions(ctx context.Context, arcadeStatuses []string, limit int) ([]KnownTx, error) {
+	if len(arcadeStatuses) == 0 {
+		return nil, nil
+	}
+	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
+		"WHERE arcade_status IN (" + inPlaceholders(len(arcadeStatuses)) + ") " +
+		"AND txid IN (SELECT txid FROM transactions WHERE txid IS NOT NULL " +
+		"AND status IN (" + inPlaceholders(len(deadTransactionStatuses)) + ")) " +
+		pollOrder + clause)
+	args := make([]any, 0, len(arcadeStatuses)+len(deadTransactionStatuses)+len(pageArgs))
+	for _, st := range arcadeStatuses {
+		args = append(args, st)
+	}
+	for _, st := range deadTransactionStatuses {
+		args = append(args, string(st))
+	}
+	args = append(args, pageArgs...)
+	return r.queryList(ctx, q, args)
 }
 
 // FindProvenAtOrAbove returns completed (proven) known txs whose block_height is

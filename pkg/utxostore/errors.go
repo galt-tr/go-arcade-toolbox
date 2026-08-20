@@ -12,15 +12,92 @@ var (
 	// ErrBatch is the top-level sentinel returned by batch methods when one
 	// or more items failed — inspect the per-item Err (Mint, SpendOp) or use
 	// errors.As on the returned error for methods whose ops carry no Err
-	// slot (Remove, Freeze, Unfreeze).
+	// slot (Remove, Freeze, Unfreeze, ReserveOutpoints).
 	ErrBatch = errors.New("utxostore: one or more batch items failed — inspect per-item Err")
 
-	// ErrContention is returned by optimistic providers when their CAS
-	// candidate set is exhausted by concurrent claimers. It is transient:
-	// the funder performs the outer retry. Lock-based providers (SQL,
-	// memstore) never return it.
+	// ErrContention is the transient "could not settle under concurrency"
+	// sentinel: a bounded budget for pinning down one row's state ran out with
+	// NEITHER outcome true of it, so the store reports the ambiguity instead of
+	// guessing. It names a CAUSE, not a backend and not an operation — read it
+	// as "ask me again", never as a verdict on the coin.
+	//
+	// Do not infer the producer set from a store's concurrency style. Optimistic
+	// and lock-based backends alike raise it, because both can lose a write to a
+	// peer and then fail to classify the loss. Two causes exist today:
+	//
+	//   - A candidate set consumed by peers. Coins existed, but racing claimers
+	//     took every one, so an empty answer would understate the pool. Who can
+	//     tell that apart from a genuinely empty pool varies: a store may see it
+	//     within one claim statement, or a caller may only establish it after
+	//     its own bounded retries. Where the funder is the retrier it absorbs
+	//     the error inside its budget; where it is the reporter it hands
+	//     ErrContention on, and nothing above it retries.
+	//
+	//     A caller can also establish it WITHOUT the store ever raising it. A
+	//     SQL claim answers (nil, nil) on an empty result and says no more,
+	//     because within one statement it cannot tell exhaustion from rows its
+	//     FOR UPDATE SKIP LOCKED had to skip — and in Mode A those rows stay
+	//     skipped for as long as a peer's whole CreateAction runs. So the funder
+	//     asks a second question when a full pass allocated nothing: the store's
+	//     non-locking ClaimableExists probe. Coins claimable but unclaimed means
+	//     they were hidden, and the funder raises ErrContention itself, then
+	//     retries it as the retrier of the case above.
+	//
+	//   - A row that would not hold still. A guarded write — a CAS in aerostore,
+	//     a guard-carrying UPDATE/DELETE in sqlstore — matched nothing, yet the
+	//     classifying read that followed found the row eligible again: a peer is
+	//     releasing and re-taking this exact coin right now. After a bounded
+	//     number of passes neither a success nor a typed refusal would be true.
+	//
+	//     Which operations reach that exit differs by backend, so read the
+	//     method's own doc rather than assuming parity. Both backends raise it
+	//     from the guarded deletes (Remove, RemoveByMintTx). sqlstore raises it
+	//     from Spend in BOTH modes. aerostore raises it from fact-mode Spend
+	//     only: its guarded-mode exhaustion reports [ReservedError] naming the
+	//     current holder instead, because under a guard a token mismatch is a
+	//     refusal it can state. A caller recording an already-accepted broadcast
+	//     must tolerate the fact-mode error rather than read it as a refused
+	//     coin.
+	//
+	// Neither the delete nor the spend producer has an outer retry owner. Their
+	// callers either tolerate the error — an un-forced Remove reports it per
+	// item under [ErrBatch], so a caller filtering on ErrBatch reads it as one
+	// more refusal — or propagate it and rely on their own re-drive; e.g. the
+	// reconciler's next tick, an abort returning to the user, or a rejected
+	// ProcessAction whose enclosing metastore transaction rolls back with it,
+	// undoing that pass's failed-status marking so a later pass redoes both.
+	//
+	// The memstore reference implementation never raises it, because one mutex
+	// spans its whole check-and-write and leaves no window for a peer to race
+	// into. That is a property of that implementation alone.
 	ErrContention = errors.New("utxostore: contention — candidates exhausted, retry")
 )
+
+// JoinBatch wraps per-item typed errors under the [ErrBatch] sentinel, or
+// returns nil when there are none. It is what batch methods whose ops carry no
+// Err slot (Remove, Freeze, Unfreeze, ReserveOutpoints) return: errors.Is finds
+// ErrBatch, errors.As finds the item errors.
+//
+// Exported alongside [BatchCountErr] so every backend — including an
+// out-of-tree one registered through [Register] — reports a partly failed batch
+// in the one shape callers filter on.
+func JoinBatch(itemErrs []error) error {
+	if len(itemErrs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrBatch, errors.Join(itemErrs...))
+}
+
+// BatchCountErr returns the top-level [ErrBatch] sentinel with a count summary
+// when any item failed, or nil. It is the counterpart of [JoinBatch] for
+// methods whose ops DO carry an Err slot (Mint, Spend): the per-item verdicts
+// are already on the ops, so the returned error only has to say how many.
+func BatchCountErr(failed, total int) error {
+	if failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %d of %d items failed", ErrBatch, failed, total)
+}
 
 // NotFoundError reports that an outpoint is absent from the store.
 //
@@ -63,9 +140,11 @@ func (e *AlreadyExistsError) Is(target error) bool {
 }
 
 // ReservedError reports a reservation-guard failure. HeldBy names the
-// reservation currently holding the row; HeldBy == "" means the row is not
-// reserved at all (e.g. Spend of an unreserved row). It is also the refusal
-// returned by Remove (without force) for a reserved row.
+// reservation currently holding the row; HeldBy == "" means the row IS in the
+// inventory but is currently unreserved (e.g. a GUARDED Spend of a released
+// row). It never means the outpoint is external — only [NotFoundError] means
+// that. It is also the refusal returned by Remove (without force) for a
+// reserved row.
 //
 // errors.Is(err, &ReservedError{}) matches any ReservedError; use errors.As
 // to extract the outpoint and holder.
@@ -89,9 +168,10 @@ func (e *ReservedError) Is(target error) bool {
 }
 
 // SpentError reports that a row is already spent. Winner is the transaction
-// that spent it — on a Spend guard failure it identifies the competing
-// spender; a Spend replay by the SAME spender is an idempotent success, not
-// this error.
+// that spent it — on a Spend refusal in either mode it identifies the
+// competing spender; a Spend replay by the SAME spender is an idempotent
+// success, not this error. It is the one state refusal a forced (fact-mode)
+// Spend keeps: two spend facts cannot both hold.
 //
 // errors.Is(err, &SpentError{}) matches any SpentError; use errors.As to
 // extract the outpoint and winner.
@@ -112,7 +192,8 @@ func (e *SpentError) Is(target error) bool {
 }
 
 // FrozenError reports that a row is frozen: it refuses Spend and Remove
-// (without force) while the hold is in place.
+// without force while the hold is in place. A forced Spend records the coin as
+// spent and a forced Remove deletes it; neither lifts the freeze itself.
 //
 // errors.Is(err, &FrozenError{}) matches any FrozenError; use errors.As to
 // extract the outpoint.

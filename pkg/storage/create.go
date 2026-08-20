@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/go-sdk/script"
@@ -23,6 +24,12 @@ const (
 	referenceLength       = 12
 	derivationPrefixBytes = 16
 	derivationSuffixBytes = 16
+
+	// releaseTimeout bounds the detached whole-token release that compensates a
+	// failed Mode B persist: generous for one indexed UPDATE, short enough that
+	// a shutdown is never held up waiting on it. Twin of funder.releaseTimeout,
+	// which bounds the same compensation on the funding path.
+	releaseTimeout = 5 * time.Second
 )
 
 // outputPlan is the provider's internal description of one output while
@@ -73,6 +80,7 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 	if err != nil {
 		return nil, err
 	}
+	providedOps := walletOwnedOutpoints(providedInputs)
 
 	// --- target + size math ---
 	providedOutputSats, outputScriptLens, err := providedOutputSizes(args.Outputs)
@@ -100,10 +108,7 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		}
 		nonChangeOutputCount += shape.Count
 	}
-	inputScriptLens, err := providedInputSizes(args.Inputs)
-	if err != nil {
-		return nil, err
-	}
+	inputScriptLens := providedInputSizes(args.Inputs)
 	currentTxSize := txutils.TransactionSizeFromScriptLengths(inputScriptLens, outputScriptLens)
 
 	target := providedOutputSats
@@ -164,9 +169,21 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		return nil
 	}
 
+	// The ORDER below is load-bearing, in both modes: the caller's own named
+	// inputs are reserved BEFORE the funder runs. A reserved row is invisible to
+	// every claim, so this is what stops the funder of this very action from
+	// allocating a coin the caller already committed to spending — which would
+	// double-count it in the fee/change math and hand one outpoint two roles in
+	// one transaction. Reserving after funding would leave that window open.
+
 	if p.modeA {
-		// Fund + persist atomically over the shared database.
+		// Fund + persist atomically over the shared database. A failure anywhere
+		// inside rolls the whole unit of work back, provided-input reservations
+		// included, so there is no compensation to write here.
 		err = p.meta.Do(ctx, func(ctx context.Context) error {
+			if rerr := p.reserveProvidedInputs(ctx, userID, reference, providedOps); rerr != nil {
+				return rerr
+			}
 			fundRes, ferr := p.funder.Fund(ctx, fundArgs)
 			if ferr != nil {
 				return ferr
@@ -181,18 +198,49 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 
 	// Mode B: fund against the split utxostore, then persist metadata; on a
 	// metadata failure, compensate by releasing the reservation.
+	if err := p.reserveProvidedInputs(ctx, userID, reference, providedOps); err != nil {
+		// Cheap insurance, not a correctness requirement. A SQL backend leaves
+		// nothing reserved on a refusal (it validates the whole set before it
+		// writes anything), but a non-transactional one enforces all-or-nothing
+		// by compensating, and a crash mid-compensation can leave rows under
+		// this token. Releasing it costs one indexed write and closes the window
+		// the stale sweep would otherwise have to wait out.
+		p.releaseReservationDetached(ctx, userID, reference)
+		return nil, err
+	}
 	fundRes, err := p.funder.Fund(ctx, fundArgs)
 	if err != nil {
+		// No compensation needed for the provided inputs: Fund releases the
+		// ENTIRE token on any error (funder.Funder.release), and they are held
+		// under that same token.
 		return nil, mapFundError(err)
 	}
 	if err := p.meta.Do(ctx, func(ctx context.Context) error { return persist(ctx, fundRes) }); err != nil {
-		if _, rerr := p.utxo.ReleaseReservation(ctx, int64(userID), reference); rerr != nil {
-			p.logger.WarnContext(ctx, "failed to release reservation after create failure",
-				"reference", reference, "error", rerr)
-		}
+		// Likewise whole-token, so this covers the funded coins and the
+		// provided inputs together.
+		p.releaseReservationDetached(ctx, userID, reference)
 		return nil, fmt.Errorf("storage: persist create action: %w", err)
 	}
 	return result, nil
+}
+
+// releaseReservationDetached frees everything held under (userID, reference) on
+// a context DETACHED from the request's cancellation: a canceled request is one
+// of the likeliest reasons the caller is compensating at all, and a canceled
+// context fails the release at BeginTx without touching a row — leaving every
+// coin the action reserved held until the stale-reservation sweep. WithoutCancel
+// keeps context values, so nothing else about the call changes.
+//
+// Best-effort by construction: a failure here costs availability (coins held
+// until the sweep), never correctness, so it is logged rather than returned —
+// the caller already has the error that actually explains the failure.
+func (p *Provider) releaseReservationDetached(ctx context.Context, userID int, reference string) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if _, rerr := p.utxo.ReleaseReservation(rctx, int64(userID), reference); rerr != nil {
+		p.logger.WarnContext(rctx, "failed to release reservation after create failure",
+			"reference", reference, "error", rerr, "requestCtxCanceled", ctx.Err() != nil)
+	}
 }
 
 // persistCreateAction writes the unsigned transaction, its outputs and the
@@ -555,8 +603,16 @@ func (p *Provider) commissionLockingScript() ([]byte, error) {
 }
 
 // mapFundError normalizes funder errors to the storage surface.
+//
+// In Mode A it also sees everything else the create-action's single unit of
+// work can fail with — the provided-input reserve and the persist both run
+// inside that meta.Do — which is why the first case exists: an error
+// [mapProvidedInputError] already framed must pass through untouched rather
+// than be relabeled as a funding failure it is not.
 func mapFundError(err error) error {
 	switch {
+	case errors.Is(err, wdk.ErrInputUnavailable), errors.Is(err, wdk.ErrUTXOContention):
+		return err
 	case errors.Is(err, funder.ErrNotEnoughFunds):
 		return fmt.Errorf("storage: %w", err)
 	case errors.Is(err, funder.ErrUTXOContention):
@@ -581,7 +637,11 @@ func providedOutputSizes(outputs []wdk.ValidCreateActionOutput) (totalSats int64
 	return totalSats, scriptLens, nil
 }
 
-func providedInputSizes(inputs []wdk.ValidCreateActionInput) ([]uint64, error) {
+// providedInputSizes estimates the unlocking-script length of each caller-named
+// input, for the fee math. It cannot fail: an input whose length is unknowable
+// falls back to a standard P2PKH unlocking script rather than refusing the
+// action, so there is no error to return.
+func providedInputSizes(inputs []wdk.ValidCreateActionInput) []uint64 {
 	lens := make([]uint64, 0, len(inputs))
 	for i := range inputs {
 		l, err := inputs[i].ScriptLength()
@@ -591,7 +651,7 @@ func providedInputSizes(inputs []wdk.ValidCreateActionInput) ([]uint64, error) {
 		}
 		lens = append(lens, l)
 	}
-	return lens, nil
+	return lens
 }
 
 func allocatedTxids(utxos []*utxostore.UTXO) []string {

@@ -1,6 +1,7 @@
 package funder_test
 
 import (
+	"context"
 	"math"
 	"testing"
 
@@ -194,6 +195,44 @@ func TestFund_NotEnoughFundsReleasesReservation(t *testing.T) {
 
 	require.ErrorIs(t, err, funder.ErrNotEnoughFunds)
 	require.Zero(t, reservedSats(t, store), "every coin reserved during the failed pass must be released")
+}
+
+// TestFund_ReleaseRunsOnDetachedContext pins the other half of that invariant:
+// the compensating release must still RUN when the request that started the
+// funding is already gone.
+//
+// A canceled request context used to be handed straight to
+// ReleaseReservation. Against a SQL store that fails at BeginTx before a single
+// row is touched, so every coin the failed pass reserved stayed held until the
+// 15-minute stale-reservation sweep — a client that hangs up (or a deadline
+// that expires) mid-fund silently parked its inputs for a quarter of an hour.
+// The release therefore runs on a context detached from the request's
+// cancellation and bounded by its own timeout.
+//
+// memstore ignores contexts entirely, so the coins here would be freed either
+// way; what the spy pins is the context the store is HANDED, which is the part
+// a SQL store acts on.
+func TestFund_ReleaseRunsOnDetachedContext(t *testing.T) {
+	inner := newMemStore()
+	// Two small mined coins totalling 300 cannot cover a 10_000 target: the pass
+	// reserves both, then fails with ErrNotEnoughFunds and must compensate.
+	mintCoins(t, inner, "tx", utxostore.TierMined, 100, 200)
+	store := newReleaseSpy(inner)
+	f := newFunder(t, store, 1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // the caller is already gone by the time funding fails
+
+	_, err := f.Fund(ctx, baseArgs(10_000, 44, 1))
+	require.ErrorIs(t, err, funder.ErrNotEnoughFunds)
+
+	releases := store.releases()
+	require.Len(t, releases, 1, "the failed pass must attempt exactly one whole-token release")
+	require.NoError(t, releases[0].ctxErr,
+		"the compensating release must run on a context detached from the canceled request; "+
+			"a canceled context fails a SQL release at BeginTx and orphans the reservation")
+	require.True(t, releases[0].hasDeadline,
+		"the detached release must stay bounded by its own timeout, not run unbounded through shutdown")
 }
 
 // TestFund_SmallestSufficientSingleClaim: a single sufficient coin funds the

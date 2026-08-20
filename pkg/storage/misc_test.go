@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"log/slog"
 	"path/filepath"
 	"testing"
 
@@ -139,11 +140,7 @@ func TestSync_RoundTrip(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncArgs := wdk.RequestSyncChunkArgs{
-		FromStorageIdentityKey: "storage-identity-key",
-		ToStorageIdentityKey:   "storage-b",
-		IdentityKey:            testIdentityKey,
-	}
+	syncArgs := syncArgsAB()
 	chunk, err := a.p.GetSyncChunk(ctx, syncArgs)
 	require.NoError(t, err)
 	require.NotEmpty(t, chunk.Transactions)
@@ -218,11 +215,7 @@ func TestSync_RoundTrip_DoesNotPopulateKnownTxs(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncArgs := wdk.RequestSyncChunkArgs{
-		FromStorageIdentityKey: "storage-identity-key",
-		ToStorageIdentityKey:   "storage-b",
-		IdentityKey:            testIdentityKey,
-	}
+	syncArgs := syncArgsAB()
 	chunk, err := a.p.GetSyncChunk(ctx, syncArgs)
 	require.NoError(t, err)
 
@@ -243,6 +236,13 @@ type syncTarget struct {
 
 func newSyncTargetProvider(t *testing.T) *syncTarget {
 	t.Helper()
+	return newSyncTargetProviderWithLogger(t, logging.NewTestLogger(t))
+}
+
+// newSyncTargetProviderWithLogger is newSyncTargetProvider with the provider's
+// logger injected, so a test can assert on what the sync path logs.
+func newSyncTargetProviderWithLogger(t *testing.T, logger *slog.Logger) *syncTarget {
+	t.Helper()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "meta-b.db")
 	meta, err := metastore.OpenSQLite(ctx, path)
@@ -252,7 +252,6 @@ func newSyncTargetProvider(t *testing.T) *syncTarget {
 	utxo := memstore.New()
 	t.Cleanup(func() { _ = utxo.Close(ctx) })
 
-	logger := logging.NewTestLogger(t)
 	fnd := funder.New(logger, utxo, defs.DefaultFeeModel())
 	p, err := New(logger, meta, utxo, fnd, &fakeOracle{}, &fakeHeaders{},
 		WithNetwork(defs.NetworkTestnet), WithScriptsVerifier(alwaysValidScripts{}))

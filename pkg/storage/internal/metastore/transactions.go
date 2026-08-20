@@ -158,9 +158,11 @@ func (r TransactionsRepo) Insert(ctx context.Context, tx NewTx) (uint, error) {
 			`INSERT INTO transactions
 			 (user_id, status, reference, is_outgoing, satoshis, description, version, lock_time, input_beef, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			 RETURNING transaction_id`)
+			 RETURNING transaction_id`,
+		)
 		var got int64
-		if err := r.s.execer(ctx).QueryRowContext(ctx, q,
+		if err := r.s.execer(ctx).QueryRowContext(
+			ctx, q,
 			tx.UserID, string(tx.Status), tx.Reference, r.s.boolVal(tx.IsOutgoing),
 			tx.Satoshis, tx.Description, version, lockTime, inputBEEF, now, now,
 		).Scan(&got); err != nil {
@@ -234,14 +236,32 @@ func (r TransactionsRepo) FindByTxID(ctx context.Context, userID int, txid strin
 	return out, rows.Err()
 }
 
-// SetTxID records the on-chain txid (display hex) on a transaction row.
+// SetTxID binds a transaction row to its on-chain txid (display hex) under a
+// compare-and-set: it applies only while the row carries NO txid yet, or
+// already carries THIS txid.
+//
+// The write used to be unconditional, so a ProcessAction re-drive could
+// overwrite an existing txid with a divergent one. That orphans the raw tx
+// already queued under the old txid — it stays resendable in known_txs with
+// nothing in transactions pointing at it any more, so the wallet can broadcast
+// bytes it no longer believes it owns (audit P1-4). A re-drive that produced
+// the same signing is the common, benign case and stays idempotent.
+//
+// Caller guidance: on [ErrTxIDMismatch] the action must FAIL and the divergence
+// be reconciled — the row is already bound to bytes that may be in flight or
+// on-chain. Do NOT re-read the row and overwrite it with the new txid: that
+// read is not atomic with this CAS (the same argument as
+// [KnownTxRepo.TransitionToAborted]'s skip), and it re-creates exactly the
+// orphaned-raw-tx bug this CAS exists to prevent. [ErrNotFound] still means no
+// such transaction row.
 func (r TransactionsRepo) SetTxID(ctx context.Context, transactionID uint, txid string) error {
 	raw, err := encTxID(txid)
 	if err != nil {
 		return err
 	}
-	q := r.s.rebind("UPDATE transactions SET txid = ?, updated_at = ? WHERE transaction_id = ?")
-	res, err := r.s.execer(ctx).ExecContext(ctx, q, raw, r.s.encTime(r.s.now()), transactionID)
+	q := r.s.rebind("UPDATE transactions SET txid = ?, updated_at = ? " +
+		"WHERE transaction_id = ? AND (txid IS NULL OR txid = ?)")
+	res, err := r.s.execer(ctx).ExecContext(ctx, q, raw, r.s.encTime(r.s.now()), transactionID, raw)
 	if err != nil {
 		return fmt.Errorf("metastore: set txid: %w", err)
 	}
@@ -249,10 +269,32 @@ func (r TransactionsRepo) SetTxID(ctx context.Context, transactionID uint, txid 
 	if err != nil {
 		return err
 	}
-	if n == 0 {
+	if n > 0 {
+		return nil
+	}
+	// Zero rows: distinguish "no such transaction" from "bound elsewhere".
+	exists, err := r.existsByID(ctx, transactionID)
+	if err != nil {
+		return err
+	}
+	if !exists {
 		return fmt.Errorf("metastore: set txid: transaction %d: %w", transactionID, ErrNotFound)
 	}
-	return nil
+	return fmt.Errorf("metastore: set txid: transaction %d: %w", transactionID, ErrTxIDMismatch)
+}
+
+// existsByID reports whether a transaction row with the given id exists.
+func (r TransactionsRepo) existsByID(ctx context.Context, transactionID uint) (bool, error) {
+	q := r.s.rebind("SELECT 1 FROM transactions WHERE transaction_id = ?")
+	var one int
+	err := r.s.execer(ctx).QueryRowContext(ctx, q, transactionID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("metastore: transaction exists: %w", err)
+	}
+	return true, nil
 }
 
 // UpdateStatus transitions a transaction's status. When expectedCurrent is

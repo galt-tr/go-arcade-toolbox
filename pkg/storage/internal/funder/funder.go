@@ -21,13 +21,23 @@ const (
 	insufficientBatchSize = 16
 
 	// maxFundingAttempts bounds how many times the whole selection is retried
-	// when an optimistic store reports contention. Lock-based stores (SQL,
-	// memstore) never trigger a retry.
+	// on contention: an optimistic store whose CAS candidate set was exhausted,
+	// or this funder's own terminal diagnosis
+	// ([Funder.contentionIfInventoryHidden]) finding claimable coins after a
+	// pass that allocated nothing — the Mode A case where an uncommitted peer's
+	// row locks hid them. memstore, whose claims are mutex-serialized, never
+	// triggers a retry.
 	maxFundingAttempts = 3
 
 	// backoff bounds for the jittered wait between contention retries.
 	minBackoff = 25 * time.Millisecond
 	maxBackoff = 100 * time.Millisecond
+
+	// releaseTimeout bounds the detached compensating release: generous for the
+	// single indexed UPDATE it issues, short enough that a shutdown is never
+	// held up waiting on it. Twin of storage.releaseTimeout, which bounds the
+	// same compensation on the Mode B CreateAction path.
+	releaseTimeout = 5 * time.Second
 )
 
 // Funder selects and reserves coins from a [utxostore.Store] to cover a funding
@@ -90,9 +100,10 @@ func SpendTiers(policy defs.SpendPolicy) []utxostore.Tier {
 		return []utxostore.Tier{utxostore.TierMined}
 	case defs.SpendPolicyAny:
 		return []utxostore.Tier{utxostore.TierMined, utxostore.TierUnproven, utxostore.TierSending}
-	case defs.SpendPolicyPreferMined:
-		return []utxostore.Tier{utxostore.TierMined, utxostore.TierUnproven}
 	default:
+		// [defs.SpendPolicyPreferMined], and the fallback for an unrecognized
+		// policy — the two share this walk deliberately: an unreadable policy
+		// must degrade to the safer-but-usable default, never to the widest one.
 		return []utxostore.Tier{utxostore.TierMined, utxostore.TierUnproven}
 	}
 }
@@ -183,9 +194,13 @@ func (a *FundArgs) validate() error {
 // whole-token ReleaseReservation), so nothing is left held — which is why
 // args.Reservation must be unique to this attempt (see FundArgs.Reservation).
 //
-// Contention (from optimistic stores) is retried up to maxFundingAttempts times
-// with a jittered backoff, then surfaced as ErrUTXOContention; lock-based
-// stores never trigger a retry.
+// [utxostore.ErrContention] is retried up to maxFundingAttempts times with a
+// jittered backoff, then surfaced as ErrUTXOContention. This funder is the
+// retry owner for it, from both sources: an optimistic store reporting an
+// exhausted CAS candidate set mid-claim, and this package's own terminal
+// diagnosis of a pass that allocated nothing while claimable coins existed
+// ([Funder.contentionIfInventoryHidden]). Neither would ever be retried if this
+// loop treated them as terminal.
 func (f *Funder) Fund(ctx context.Context, args FundArgs) (*Result, error) {
 	if err := args.validate(); err != nil {
 		return nil, err
@@ -200,8 +215,16 @@ func (f *Funder) Fund(ctx context.Context, args FundArgs) (*Result, error) {
 			// Release whatever this attempt reserved, then back off and retry.
 			f.release(ctx, args.UserID, args.Reservation)
 			if attempt+1 >= maxFundingAttempts {
-				f.logger.WarnContext(ctx, "funding abandoned: contention retries exhausted",
-					logging.UserID(int(args.UserID)), logging.Reference(args.Reservation))
+				attrs := []any{logging.UserID(int(args.UserID)), logging.Reference(args.Reservation)}
+				// When the contention is this package's own diagnosis, say which
+				// tier kept showing claimable coins the walk could not take —
+				// without it the operator sees only "contention" and has no
+				// thread to pull on.
+				var hidden *hiddenInventoryError
+				if errors.As(err, &hidden) {
+					attrs = append(attrs, slog.Int("tier", int(hidden.tier)))
+				}
+				f.logger.WarnContext(ctx, "funding abandoned: contention retries exhausted", attrs...)
 				return nil, ErrUTXOContention
 			}
 			f.backoff(ctx, attempt)
@@ -243,10 +266,113 @@ func (f *Funder) fundOnce(ctx context.Context, args FundArgs) (*Result, error) {
 
 	// Bounded tiered best-fit selection.
 	if err = f.boundedTieredClaim(ctx, args, collector); err != nil {
-		return nil, err
+		return nil, f.contentionIfInventoryHidden(ctx, args, err)
 	}
-	return collector.result()
+	result, err := collector.result()
+	if err != nil {
+		return nil, f.contentionIfInventoryHidden(ctx, args, err)
+	}
+	return result, nil
 }
+
+// claimableProber is the optional store capability behind the contention
+// diagnosis: "is there a claimable coin in this scope right now?", answered
+// WITHOUT taking a lock and without reserving anything. sqlstore implements it
+// ([sqlstore.Store.ClaimableExists]); memstore does not need it (its claims are
+// mutex-serialized, so an empty claim IS an empty pool) and neither does
+// aerostore (its claims already report [utxostore.ErrContention] natively when
+// their CAS candidate set is exhausted). It is a type assertion rather than a
+// [utxostore.Store] method so a backend that cannot answer it simply does not
+// offer it.
+type claimableProber interface {
+	ClaimableExists(ctx context.Context, sc utxostore.Scope, minSats uint64) (bool, error)
+}
+
+// contentionIfInventoryHidden is the LAST thing a failing pass does, and the
+// only place this package probes the store for contention.
+//
+// A SQL claim reserves rows FOR UPDATE SKIP LOCKED. In Mode A those locks are
+// held until the caller's whole CreateAction commits, so a concurrent
+// CreateAction skips the locked rows and sees a false-empty pool. Nothing in
+// the claim's answer distinguishes that from real exhaustion — which is why
+// this asks, ONCE, at the point where the pass has already given up:
+//
+//   - err is not ErrNotEnoughFunds (a hard store error, a canceled context):
+//     returned untouched. Only exhaustion is ambiguous.
+//   - a tier still holds a claimable coin: the walk should have found it, so it
+//     was hidden. Return [utxostore.ErrContention] and let [Funder.Fund] release,
+//     back off, and retry the whole selection.
+//   - nothing claimable anywhere: ErrNotEnoughFunds, exactly as before.
+//
+// Placement is the whole design. Probing inside the claim loop instead would
+// cost a query per empty claim on the ALLOCATING path — ClaimSmallestSufficient
+// coming back empty is the ordinary precondition of the drain, and a denominated
+// ClaimExact misses on every tier that holds no fuel — and, far worse, one big
+// coin locked by an uncommitted peer would pre-empt a fund that a lower tier
+// could have covered: the walk would abort mid-pass on contention instead of
+// walking on. Here, a mid-walk empty is just "this tier allocated nothing", the
+// walk continues, and contention is reported ONLY when the entire pass allocated
+// nothing. The cost is at most one indexed EXISTS per tier, on a path that was
+// about to fail anyway.
+//
+// A probe that errors is logged and swallowed: the pass already has its answer
+// (ErrNotEnoughFunds), and a diagnosis that could not run must not upgrade an
+// honest insufficient-funds into a hard failure.
+func (f *Funder) contentionIfInventoryHidden(ctx context.Context, args FundArgs, err error) error {
+	if !errors.Is(err, ErrNotEnoughFunds) {
+		return err
+	}
+	prober, ok := f.store.(claimableProber)
+	if !ok {
+		return err
+	}
+
+	for _, tier := range args.Tiers {
+		scope := utxostore.Scope{UserID: args.UserID, Basket: args.Basket, Tier: tier}
+		// minSats 0: ANY claimable coin would have been allocated by the walk
+		// (a coin is either >= the remaining need, and the sufficient claim
+		// takes it, or below it, and the drain does), so any coin at all that
+		// the walk did not see was hidden from it.
+		//
+		// One honest false positive survives that reasoning: under RequireChange
+		// a pass can allocate nothing because the recomputed remaining need went
+		// non-positive while the change still sat below the dust floor, and a
+		// coin left claimable in the pool then reads as "hidden" when it was
+		// merely not wanted. The cost is bounded — the retries reach the same
+		// shape and the caller lands on ErrUTXOContention instead of
+		// ErrNotEnoughFunds, both failures either way — and the fix belongs to
+		// the collector's change math, not to this probe, which answers exactly
+		// the question it was asked.
+		exists, probeErr := prober.ClaimableExists(ctx, scope, 0)
+		if probeErr != nil {
+			f.logger.WarnContext(ctx, "claimable probe failed; reporting not-enough-funds",
+				logging.UserID(int(args.UserID)), logging.Reference(args.Reservation),
+				slog.Int("tier", int(tier)), logging.Error(probeErr))
+			return err
+		}
+		if exists {
+			return &hiddenInventoryError{tier: tier}
+		}
+	}
+	return err
+}
+
+// hiddenInventoryError is the contention this package raises itself: a pass
+// allocated nothing, yet this tier still holds a claimable coin. It carries the
+// tier so the abandoning log line can name where the coins were — the first
+// thing anyone asks when ErrUTXOContention turns up in production.
+type hiddenInventoryError struct {
+	tier utxostore.Tier
+}
+
+func (e *hiddenInventoryError) Error() string {
+	return fmt.Sprintf("funder: %v: claimable coins exist in tier %d but every claim came back empty",
+		utxostore.ErrContention, e.tier)
+}
+
+// Unwrap is what routes it into Fund's retry loop, which matches on
+// [utxostore.ErrContention].
+func (e *hiddenInventoryError) Unwrap() error { return utxostore.ErrContention }
 
 // boundedTieredClaim drives allocation rounds until the collector is funded, a
 // round recomputes a non-positive remaining need (GetResult then decides funded
@@ -343,7 +469,11 @@ func (f *Funder) drainBatch(ctx context.Context, args FundArgs, collector *utxoC
 	}
 
 	// Release the unconsumed remainder so those coins re-enter the claimable
-	// pool for the next round's smallest-sufficient claim.
+	// pool for the next round's smallest-sufficient claim. This one stays on the
+	// REQUEST context, unlike Fund's terminal compensating release: it is
+	// mid-flow, so its failure propagates to Fund, whose detached release then
+	// frees the whole token — detaching it here would only mask cancellation on
+	// the success path.
 	if consumed < len(batch) {
 		if err := f.releaseOutpoints(ctx, args.Reservation, batch[consumed:]); err != nil {
 			return allocated, err
@@ -354,10 +484,32 @@ func (f *Funder) drainBatch(ctx context.Context, args FundArgs, collector *utxoC
 
 // release frees every row held under (userID, reservation); best-effort, errors
 // are logged, not propagated (the primary outcome is already decided).
+//
+// It runs on a context DETACHED from the caller's cancellation, bounded by
+// releaseTimeout. This is compensation for a fund attempt that already failed,
+// and it has to run even when the request that started it is gone: a canceled
+// context fails a SQL store at BeginTx before a single row is touched, so every
+// coin this attempt reserved would stay held until the stale-reservation sweep
+// (15 minutes) frees it. That is the whole orphaned-reservation window this
+// detach closes, and it is exactly the case a client hang-up or an expired
+// request deadline produces.
+//
+// [context.WithoutCancel] preserves context VALUES, which is what makes the
+// detach safe in Mode A: the ambient transaction the metastore threads through
+// the context is still found, so the release enlists in the caller's
+// transaction rather than opening a second one. If that transaction was itself
+// doomed by the cancellation the release fails with sql.ErrTxDone and the
+// rollback frees the rows anyway — harmless either way. The detach materially
+// matters in Mode B and standalone use, where the release runs on its own
+// pooled connection. Precedent: the cursor flush in
+// pkg/monitor/status_events.go.
 func (f *Funder) release(ctx context.Context, userID int64, reservation string) {
-	if _, err := f.store.ReleaseReservation(ctx, userID, reservation); err != nil {
-		f.logger.WarnContext(ctx, "failed to release reservation",
-			logging.Reference(reservation), logging.Error(err))
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if _, err := f.store.ReleaseReservation(rctx, userID, reservation); err != nil {
+		f.logger.WarnContext(rctx, "failed to release reservation",
+			logging.Reference(reservation), logging.Error(err),
+			slog.Bool("requestCtxCanceled", ctx.Err() != nil))
 	}
 }
 

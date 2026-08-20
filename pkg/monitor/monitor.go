@@ -24,8 +24,26 @@ const (
 	// abort-abandoned sweep reaps it.
 	defaultFailAbandonedAge = 5 * time.Minute
 	// defaultStaleReservationTTL is how old a funding reservation must be before
-	// the stale-reservation sweep reclaims it (well beyond the re-drive window,
-	// so a tx that can still be re-broadcast keeps its inputs).
+	// the stale-reservation sweep reclaims it.
+	//
+	// This is now a BACKSTOP, not a safety mechanism. The TTL used to be the
+	// thing standing between a janitor and the inputs of a live transaction, so
+	// it was set well beyond the re-drive window and the margin was the whole
+	// point. Two changes retired that role: a signed transaction's inputs are
+	// PINNED, which makes them structurally unsweepable rather than merely
+	// too-young, and the sweep is fence-first — it aborts the owning
+	// transaction (CAS plus the known-tx fence) before it frees a coin, so a
+	// reservation it reclaims belongs to a transaction that provably cannot be
+	// broadcast at any age.
+	//
+	// What the TTL still governs is how long the wallet tolerates three
+	// specific kinds of stuck coin before reclaiming them: reservations from
+	// CreateActions whose signer never arrived, funder-internal holds whose
+	// action never came into existence, and the residue of aborts whose utxo
+	// half never completed. All three are pure availability, so the value
+	// trades recovery latency against the chance of reclaiming a coin a slow
+	// client is still about to sign for — and that client's action is aborted
+	// when it happens, which is a clean refusal rather than a double spend.
 	defaultStaleReservationTTL = 15 * time.Minute
 	// minLeaseTTL floors a job's lease TTL (max(2*interval, minLeaseTTL)) so a
 	// short interval cannot expire a lease mid-run and admit a second instance.
@@ -270,9 +288,14 @@ func (d *Daemon) taskRunner(ctx context.Context, name defs.MonitorTask) (func(),
 func (d *Daemon) runRejectRelease(ctx context.Context) error {
 	if drain, err := d.storage.DrainOutbox(ctx, d.limits.rejectRelease); err != nil {
 		d.logger.WarnContext(ctx, "reconciler: outbox drain failed", slog.String("error", err.Error()))
-	} else if drain.Drained > 0 || drain.Parked > 0 {
+	} else if drain.Drained > 0 || drain.Parked > 0 || drain.ParkedTotal > 0 {
+		// ParkedTotal is in the gate as well as the payload, deliberately: it is
+		// the standing backlog, and a pass that drains nothing while rows sit
+		// parked is exactly the case that used to log nothing at all.
 		d.logger.InfoContext(ctx, "reconciler: outbox drained",
-			slog.Int("drained", drain.Drained), slog.Int("failed", drain.Failed), slog.Int("parked", drain.Parked))
+			slog.Int("drained", drain.Drained), slog.Int("failed", drain.Failed),
+			slog.Int("parked", drain.Parked),
+			slog.Int("outbox_parked_total", drain.ParkedTotal))
 	}
 
 	report, err := d.storage.VerifyAndReleaseSuspects(ctx, d.suspectGrace, d.maxQuarantine, d.limits.rejectRelease)

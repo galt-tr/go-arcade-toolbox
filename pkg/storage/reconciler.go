@@ -69,6 +69,14 @@ const (
 	opReleaseResv   = "RELEASE"        // release inputs still reserved by the dead tx
 	opRemovePhantom = "REMOVE_PHANTOM" // remove inputs whose source tx is itself dead
 	opRemoveMinted  = "REMOVE_MINTED"  // remove the dead tx's phantom change + cascade
+
+	// outbox op_type discriminators for the ABORT path (see abort.go). Abort is
+	// a different two-phase write over the same outbox: its phase 1 commits the
+	// broadcast fence rather than a terminal status, and its ops are whole-token
+	// (a reservation) rather than per-outpoint, which is why they are their own
+	// op types rather than reuses of opReleaseResv/opRemoveMinted.
+	opAbortRelease      = "ABORT_RELEASE"       // unpin + whole-token release of an aborted action
+	opAbortRemoveChange = "ABORT_REMOVE_CHANGE" // remove an aborted tx's minted change (no cascade)
 )
 
 // errAlreadyHandled is returned internally by the release gate when the suspect
@@ -815,8 +823,22 @@ type removeMintedPayload struct {
 	Ops      []string `json:"ops"`
 }
 
+// abortReleasePayload carries the whole-reservation release of an aborted
+// action. It needs the userID that releasePayload does not, because
+// [utxostore.Store.ReleaseReservation] is scoped by (userID, reservation) while
+// ReleaseOutpoints is scoped by outpoint.
+type abortReleasePayload struct {
+	UserID      int64  `json:"userId"`
+	Reservation string `json:"reservation"`
+}
+type abortRemoveChangePayload struct {
+	MintTxID string   `json:"mintTxId"`
+	Ops      []string `json:"ops"`
+}
+
 // DrainOutbox replays pending utxo_ops_outbox rows against the utxostore, oldest
-// first, idempotently — the Mode B crash-recovery half of the release. Each op
+// first, idempotently — the Mode B crash-recovery half of every two-phase write
+// that uses the outbox (the verified-dead release, and the abort). Each op
 // that succeeds is MarkDone-d; each that fails has its attempt counter bumped and
 // is left for a later pass, parking once it crosses the attempts ceiling. It is a
 // no-op in Mode A (that path never enqueues). Fetch + execute + mark share one
@@ -851,6 +873,16 @@ func (p *Provider) DrainOutbox(ctx context.Context, limit int) (defs.OutboxDrain
 			}
 			rep.Drained++
 		}
+		// The standing parked backlog, read inside the same transaction so it
+		// reflects this pass's own parkings. It is a gauge, not a delta: a row
+		// that parked on an earlier pass is invisible in every other counter
+		// here, and for an ABORT_RELEASE op that means stranded user funds
+		// nobody is told about.
+		parked, cerr := p.meta.Outbox().CountParked(ctx)
+		if cerr != nil {
+			return cerr
+		}
+		rep.ParkedTotal = parked
 		return nil
 	})
 	if err != nil {
@@ -861,8 +893,9 @@ func (p *Provider) DrainOutbox(ctx context.Context, limit int) (defs.OutboxDrain
 
 // executeOutboxOp applies one outbox op idempotently against the utxostore (and,
 // for REMOVE_MINTED, cascades children in the ambient metadata transaction). It
-// returns the number of children cascaded. Shared by the inline Mode B release
-// and the background drain worker so both heal identically.
+// returns the number of children cascaded. Shared by the inline Mode B release,
+// the inline Mode B abort (see [Provider.abortViaOutbox]) and the background
+// drain worker, so every producer of an outbox row heals identically.
 func (p *Provider) executeOutboxOp(ctx context.Context, e metastore.OutboxEntry) (cascaded int, err error) {
 	switch e.OpType {
 	case opUnspend:
@@ -913,6 +946,22 @@ func (p *Provider) executeOutboxOp(ctx context.Context, e metastore.OutboxEntry)
 			return 0, derr
 		}
 		return p.doRemoveMinted(ctx, *mintTxID, ops)
+	case opAbortRelease:
+		var pl abortReleasePayload
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			return 0, fmt.Errorf("storage: decode abort-release op: %w", err)
+		}
+		return 0, p.doAbortRelease(ctx, pl.UserID, pl.Reservation)
+	case opAbortRemoveChange:
+		var pl abortRemoveChangePayload
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			return 0, fmt.Errorf("storage: decode abort-remove-change op: %w", err)
+		}
+		ops, derr := decodeOutpoints(pl.Ops)
+		if derr != nil {
+			return 0, derr
+		}
+		return 0, p.doAbortRemoveChange(ctx, pl.MintTxID, ops)
 	default:
 		return 0, fmt.Errorf("storage: unknown outbox op type %q", e.OpType)
 	}

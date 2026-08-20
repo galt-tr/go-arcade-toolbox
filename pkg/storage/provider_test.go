@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-sdk/chainhash"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -104,10 +105,28 @@ type harness struct {
 
 func newHarness(t *testing.T, opts ...Option) *harness {
 	t.Helper()
+	return newHarnessClock(t, nil, opts...)
+}
+
+// newHarnessClock is [newHarness] with a caller-supplied clock driving BOTH the
+// provider and the metastore. Both matter, and for different reasons: the
+// metastore clock stamps updated_at and anchors every age window read off it
+// (the resend grace, the stale scans), while the provider clock stamps the
+// suspect windows. A test that moved only one would be asserting against two
+// disagreeing notions of "now" — exactly the drift the ReclaimStaleSend /
+// FindResendable pairing is documented to avoid. A nil clock leaves both at
+// their production default.
+func newHarnessClock(t *testing.T, now func() time.Time, opts ...Option) *harness {
+	t.Helper()
 	ctx := context.Background()
 
+	var metaOpts []metastore.Option
+	if now != nil {
+		metaOpts = append(metaOpts, metastore.WithClock(now))
+	}
+
 	path := filepath.Join(t.TempDir(), "meta.db")
-	meta, err := metastore.OpenSQLite(ctx, path)
+	meta, err := metastore.OpenSQLite(ctx, path, metaOpts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = meta.Close(ctx) })
 
@@ -123,6 +142,9 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		WithNetwork(defs.NetworkTestnet),
 		WithStorageName("test-storage"),
 		WithScriptsVerifier(alwaysValidScripts{}),
+	}
+	if now != nil {
+		baseOpts = append(baseOpts, WithClock(now))
 	}
 	baseOpts = append(baseOpts, opts...)
 

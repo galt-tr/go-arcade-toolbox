@@ -26,20 +26,12 @@ func (s *Store) Mint(ctx context.Context, mints []*utxostore.Mint) error {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return batchErr(failed, len(mints))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(mints))
 }
 
 func (s *Store) mintOne(ctx context.Context, x queryer, m *utxostore.Mint) error {
-	switch {
-	case m.UserID <= 0:
-		return fmt.Errorf("sqlstore: mint %s: user id must be positive", m.Outpoint)
-	case m.Basket == "":
-		return fmt.Errorf("sqlstore: mint %s: basket must be non-empty", m.Outpoint)
-	case !m.Tier.Valid():
-		return fmt.Errorf("sqlstore: mint %s: invalid tier %d", m.Outpoint, m.Tier)
+	if err := utxostore.ValidateMint(m); err != nil {
+		return err
 	}
 
 	res, err := s.insertMint(ctx, x, m)
@@ -112,8 +104,10 @@ func (s *Store) Get(ctx context.Context, op utxostore.Outpoint) (*utxostore.UTXO
 
 // Remove implements [utxostore.Store]. Missing rows are no-ops; without force,
 // reserved/spent/frozen rows are refused per item (precedence spent > reserved
-// > frozen). Refusals are joined under ErrBatch; removable items in the same
-// batch are still removed.
+// > frozen). Refusals are joined under [utxostore.ErrBatch] — or
+// [utxostore.ErrContention] when a row keeps flipping between removable and
+// held, which is transient: retry the call. Removable items in the same batch
+// are still removed.
 func (s *Store) Remove(ctx context.Context, ops []utxostore.Outpoint, force bool) error {
 	if s.isClosed() {
 		return errClosed
@@ -136,9 +130,14 @@ func (s *Store) Remove(ctx context.Context, ops []utxostore.Outpoint, force bool
 	if err != nil {
 		return err
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
+// removeOne deletes one row, write first: the guarded DELETE carries the same
+// predicates the old pre-flight SELECT used to check, so the removable case is
+// a single statement and only a refusal pays for a read. force is already
+// unconditional — "remove it whatever state it is in" has no predicate worth
+// reading first — and stays a lone DELETE.
 func (s *Store) removeOne(ctx context.Context, x queryer, op utxostore.Outpoint, force bool) (itemErr, fatal error) {
 	if force {
 		if _, err := x.ExecContext(ctx, s.rebind("DELETE FROM utxos WHERE txid=? AND vout=?"), op.TxID[:], op.Vout); err != nil {
@@ -147,35 +146,69 @@ func (s *Store) removeOne(ctx context.Context, x queryer, op utxostore.Outpoint,
 		return nil, nil
 	}
 
+	for range guardAttempts {
+		res, err := x.ExecContext(ctx, s.rebind(
+			"DELETE FROM utxos WHERE txid=? AND vout=? AND reserved_by IS NULL AND spent_by IS NULL AND "+notFrozen),
+			op.TxID[:], op.Vout)
+		if err != nil {
+			return nil, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 1 {
+			return nil, nil
+		}
+		classified, retry, cerr := s.classifyRemoveRefusal(ctx, x, op)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if !retry {
+			return classified, nil
+		}
+	}
+	// The row kept looking removable between the guarded DELETE and the read
+	// that followed it: a peer is cycling this coin's reservation right now.
+	// Retryable, not a refusal — the caller re-drives the Remove rather than
+	// recording a phantom row as un-removable.
+	return fmt.Errorf("sqlstore: remove %s: %w", op, utxostore.ErrContention), nil
+}
+
+// classifyRemoveRefusal turns a guarded DELETE that matched nothing into the
+// per-item verdict, or nil when the row is simply absent (a missing row is a
+// no-op success, not an error). retry is true when the row looks removable
+// again — a concurrent release raced the DELETE. Refusal precedence is spent >
+// reserved > frozen, matching [Store.classifyForReserve] and the interface doc.
+// The read is plain: the DELETE matched nothing, so it holds no lock worth
+// extending.
+func (s *Store) classifyRemoveRefusal(ctx context.Context, x queryer, op utxostore.Outpoint) (itemErr error, retry bool, fatal error) {
 	var (
 		spentBy    []byte
 		reservedBy sql.NullString
 		frozen     boolScan
 	)
-	q := s.rebind("SELECT spent_by, reserved_by, frozen FROM utxos WHERE txid=? AND vout=?" + s.forUpdate())
+	q := s.rebind("SELECT spent_by, reserved_by, frozen FROM utxos WHERE txid=? AND vout=?")
 	err := x.QueryRowContext(ctx, q, op.TxID[:], op.Vout).Scan(&spentBy, &reservedBy, s.boolDest(&frozen))
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil // missing = no-op
+		return nil, false, nil // missing = no-op
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	switch {
 	case len(spentBy) > 0:
 		w, herr := decodeHash(spentBy)
 		if herr != nil {
-			return nil, herr
+			return nil, false, herr
 		}
-		return &utxostore.SpentError{Op: op, Winner: *w}, nil
+		return &utxostore.SpentError{Op: op, Winner: *w}, false, nil
 	case reservedBy.String != "":
-		return &utxostore.ReservedError{Op: op, HeldBy: reservedBy.String}, nil
+		return &utxostore.ReservedError{Op: op, HeldBy: reservedBy.String}, false, nil
 	case s.boolGet(frozen):
-		return &utxostore.FrozenError{Op: op}, nil
+		return &utxostore.FrozenError{Op: op}, false, nil
+	default:
+		return nil, true, nil
 	}
-
-	if _, err := x.ExecContext(ctx, s.rebind("DELETE FROM utxos WHERE txid=? AND vout=?"), op.TxID[:], op.Vout); err != nil {
-		return nil, err
-	}
-	return nil, nil
 }

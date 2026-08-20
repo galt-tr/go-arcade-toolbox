@@ -122,3 +122,35 @@ func (r OutboxRepo) CountPending(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+
+// CountParked returns how many rows have EXHAUSTED their attempts and are no
+// longer handed out by FetchPending — the standing backlog of utxo ops that
+// will never be replayed without intervention.
+//
+// It exists because parking was otherwise unobservable. A row logs one INFO
+// line on the pass that parks it and then disappears: it is absent from
+// CountPending by construction, and the drain report's Parked counts only rows
+// that crossed the ceiling on THAT pass, so a backlog reads as zero forever
+// after. What a non-zero count MEANS depends on the op type, and the cases
+// differ enough to be worth separating before anyone alerts on the number:
+//
+//   - ABORT_RELEASE: user funds pinned and reserved, until the
+//     stale-reservation sweep's aborted arm reclaims them on its own (much
+//     longer) clock. The sweep retires the row when it does, so this part of
+//     the count clears itself — it is a live condition, not a scar.
+//   - ABORT_REMOVE_CHANGE and the reconciler's ops: nothing retires these. A
+//     parked one is a permanent floor on the gauge. For the change removal the
+//     cost is inventory tidiness only (phantom change minted against a txid
+//     that will never reach the network, unspendable either way); no coins are
+//     held and no user funds are affected.
+//
+// So a count that STAYS non-zero is not automatically stuck funds, and a count
+// that stops falling is worth reading by op type rather than in total.
+func (r OutboxRepo) CountParked(ctx context.Context) (int, error) {
+	q := r.s.rebind("SELECT COUNT(*) FROM utxo_ops_outbox WHERE attempts >= ?")
+	var n int
+	if err := r.s.execer(ctx).QueryRowContext(ctx, q, MaxOutboxAttempts).Scan(&n); err != nil {
+		return 0, fmt.Errorf("metastore: outbox count parked: %w", err)
+	}
+	return n, nil
+}

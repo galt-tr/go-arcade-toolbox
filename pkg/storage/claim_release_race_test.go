@@ -155,13 +155,20 @@ func TestSweepRacingCreateActionNeverDoubleAllocates(t *testing.T) {
 		len(strandedCoins))
 }
 
-// A reservation whose transaction can still be re-driven must never be swept.
+// A reservation whose transaction has been handed to the network must never be
+// swept. Freeing those inputs would manufacture exactly the double spend the
+// sweep exists to prevent: the coin goes back to the funder while a transaction
+// spending it is live.
 //
-// reservationResendable is the guard, and it had no concurrent test and no
-// clock-driven one. Sweeping a transaction that SendWaiting is about to
-// re-broadcast would manufacture exactly the double spend the sweep exists to
-// prevent: the coin goes back to the funder while a signed transaction spending
-// it is still queued.
+// This drives the IMMEDIATE path, so by the end of ProcessAction the broadcast
+// has been accepted, the inputs are spent, and the action is 'unproven'. Two
+// independent things then keep the sweep away, and the test asserts the
+// property rather than either mechanism: a spent row is in no stale listing at
+// all, and 'unproven' is not a status the sweep will abort even when the
+// pinned-inclusive listing puts a reservation in front of it. (The other shape
+// — a DELAYED transaction that is genuinely still re-drivable, pinned and
+// waiting for SendWaiting — is covered by
+// TestSweepStaleReservations_WillNotCancelAQueuedDelayedSend.)
 func TestSweepLeavesARedrivableReservationAlone(t *testing.T) {
 	const ttl = 15 * time.Minute
 
@@ -181,10 +188,15 @@ func TestSweepLeavesARedrivableReservationAlone(t *testing.T) {
 	require.False(t, respendSpendable(t, p, auth, fundTxID, 0),
 		"the funding coin should be reserved after a processed action")
 
+	require.Equal(t, string(wdk.TxStatusUnproven), outgoingActionStatus(t, p, auth),
+		"the immediate path leaves the action live on the network, which is what the sweep must respect")
+
 	// Age it well past the TTL and sweep hard.
 	clock.Advance(ttl * 4)
 	require.NoError(t, p.SweepStaleReservations(ctx, clock.Now().Add(-ttl), 256))
 
+	assert.Equal(t, string(wdk.TxStatusUnproven), outgoingActionStatus(t, p, auth),
+		"the sweep aborted a transaction the network already has")
 	assert.False(t, respendSpendable(t, p, auth, fundTxID, 0),
 		"the sweep reclaimed a coin belonging to a transaction that is still "+
 			"re-drivable. That transaction is signed and queued; handing its input "+
@@ -192,7 +204,23 @@ func TestSweepLeavesARedrivableReservationAlone(t *testing.T) {
 }
 
 // The other half: a reservation that genuinely cannot be re-driven must come
-// back, and must be immediately usable rather than merely un-reserved.
+// back, must be immediately usable rather than merely un-reserved — and the
+// action it was taken from must be FENCED on the way out.
+//
+// That last clause is audit P0-4's completion and the reason this test was
+// rewritten. Freeing the coins is only half a sweep: the wallet also has to
+// make sure nothing can still spend them. The stranded shape here is a
+// CreateAction whose signer never arrived, so the transactions row sits at
+// 'unsigned' — which is precisely the status ProcessAction admits. A sweep that
+// only released would leave a live reference whose signer can turn up a second
+// later, sign, and hand storage a broadcastable transaction whose inputs the
+// funder has already re-lent. Post-C1 the coins are only PINNED once
+// processNewTx runs, so this window is real: the sweep sees an unpinned,
+// aged reservation, frees it, and the late signer still finds an abortable row.
+//
+// The fence-first sweep closes it by aborting the row before it touches a coin,
+// so the late ProcessAction is refused by the same "not signable" gate an
+// AbortAction would have installed.
 func TestASweptReservationIsImmediatelyClaimableAgain(t *testing.T) {
 	const ttl = 15 * time.Minute
 
@@ -206,7 +234,7 @@ func TestASweptReservationIsImmediatelyClaimableAgain(t *testing.T) {
 
 	// CreateAction and then nothing — the shape a crash between create and sign
 	// leaves behind. No raw tx, so it is not re-drivable.
-	_, err := p.CreateAction(ctx, auth, conformance.PaymentArgs(40_000))
+	res, err := p.CreateAction(ctx, auth, conformance.PaymentArgs(40_000))
 	require.NoError(t, err)
 	require.False(t, respendSpendable(t, p, auth, fundTxID, 0))
 
@@ -216,10 +244,48 @@ func TestASweptReservationIsImmediatelyClaimableAgain(t *testing.T) {
 	require.True(t, respendSpendable(t, p, auth, fundTxID, 0),
 		"a leaked reservation was never reclaimed; the coin is lost for good")
 
+	// The fence: the action whose inputs were just handed back is aborted, so
+	// nothing downstream still believes it can be signed.
+	assert.Equal(t, string(wdk.TxStatusAborted), outgoingActionStatus(t, p, auth),
+		"the sweep freed the inputs of an action it left signable")
+
+	// And the property that matters — the late signer is refused. Without the
+	// fence this call SUCCEEDS, storing broadcastable bytes whose inputs the
+	// wallet has already re-lent: a double spend the wallet authored itself.
+	late := conformance.BuildSignedTx(t, res)
+	lateTxID := primitives.TXIDHexString(late.TxID().String())
+	ref := res.Reference
+	_, err = p.ProcessAction(ctx, auth, wdk.ProcessActionArgs{
+		IsNewTx:   true,
+		Reference: &ref,
+		TxID:      &lateTxID,
+		RawTx:     primitives.ExplicitByteArray(late.Bytes()),
+	})
+	require.Error(t, err, "a signer arriving after the sweep must be refused, not stored")
+	assert.Contains(t, err.Error(), string(wdk.TxStatusAborted),
+		"and refused BECAUSE the sweep fenced the row")
+
 	// Usable in practice, not merely flagged spendable.
 	_, err = p.CreateAction(ctx, auth, conformance.PaymentArgs(40_000))
 	assert.NoError(t, err,
 		"the swept coin reads as spendable but the funder will not take it")
+}
+
+// outgoingActionStatus reads back the status of the user's single outgoing
+// action. The tests here fund by internalizing (an incoming action) and then
+// create exactly one payment, so "the outgoing one" identifies it without a
+// txid — which a never-signed action does not have.
+func outgoingActionStatus(t *testing.T, p *storage.Provider, auth wdk.AuthID) string {
+	t.Helper()
+	list, err := p.ListActions(context.Background(), auth, wdk.ListActionsArgs{Limit: 10})
+	require.NoError(t, err)
+	for _, a := range list.Actions {
+		if a.IsOutgoing {
+			return a.Status
+		}
+	}
+	t.Fatal("no outgoing action found")
+	return ""
 }
 
 // outpointLedger records which LIVE action claimed which outpoint, and fails

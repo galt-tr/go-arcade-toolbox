@@ -37,12 +37,20 @@ var DefaultListOutputsStatuses = []wdk.TxStatus{
 
 // NewOutput is the input to [OutputsRepo.Insert].
 type NewOutput struct {
-	UserID             int
-	TransactionID      uint
-	Vout               uint32
-	Satoshis           int64
-	LockingScript      []byte
-	Basket             *string // basket NAME; nil = not in a basket
+	UserID        int
+	TransactionID uint
+	Vout          uint32
+	Satoshis      int64
+	LockingScript []byte
+	Basket        *string // basket NAME; nil = not in a basket
+	// SpentBy is the spending transaction's id, when the row is inserted
+	// already-spent. Normal wallet flow leaves this nil and records the spend
+	// later via MarkSpent; sync carries a source row's spend history forward at
+	// insert time, so the target never sees the coin as unspent. Its position
+	// here (between Basket and Change) mirrors the schema, outputCols and the
+	// INSERT column list — keeping all four in one order is the defense against
+	// a misaligned bind.
+	SpentBy            *uint
 	Change             bool
 	Type               string
 	ProvidedBy         string
@@ -145,15 +153,17 @@ func (r OutputsRepo) Insert(ctx context.Context, o NewOutput) (uint, error) {
 		}
 		q := r.s.rebind(
 			`INSERT INTO outputs
-			 (user_id, transaction_id, vout, satoshis, locking_script, basket, change,
+			 (user_id, transaction_id, vout, satoshis, locking_script, basket, spent_by, change,
 			  output_type, provided_by, purpose, description,
 			  derivation_prefix, derivation_suffix, sender_identity_key, custom_instructions,
 			  created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 RETURNING output_id`)
 		var got int64
 		if err := r.s.execer(ctx).QueryRowContext(ctx, q,
-			o.UserID, o.TransactionID, o.Vout, o.Satoshis, locking, strPtrArg(o.Basket),
+			// spent_by is a nullable FK into transactions: nil binds SQL NULL
+			// (the normal, not-yet-spent case).
+			o.UserID, o.TransactionID, o.Vout, o.Satoshis, locking, strPtrArg(o.Basket), uintPtrArg(o.SpentBy),
 			r.s.boolVal(o.Change), o.Type, o.ProvidedBy, o.Purpose, o.Description,
 			strPtrArg(o.DerivationPrefix), strPtrArg(o.DerivationSuffix),
 			strPtrArg(o.SenderIdentityKey), strPtrArg(o.CustomInstructions), now, now,
@@ -362,6 +372,84 @@ func (r OutputsRepo) FindChangeOutputsByTxIDs(ctx context.Context, txids []strin
 		return nil, fmt.Errorf("metastore: find change outputs by txids: %w", err)
 	}
 	return r.collect(rows)
+}
+
+// outpointChunk caps how many outpoints one [OutputsRepo.FindOutputsByOutpoints]
+// statement carries. Both engines have a ceiling worth staying clear of —
+// PostgreSQL binds at most 65535 parameters (two per outpoint) and SQLite caps
+// a statement's variables at 32766 by default — and a bounded chunk also keeps
+// the planner's work per statement flat. It is far above any real input count,
+// so the common call is a single round trip.
+const outpointChunk = 400
+
+// outpointTuple renders one "(txid, vout)" row of the VALUES list.
+//
+// PostgreSQL resolves a VALUES list's column types from its FIRST row, and an
+// untyped parameter defaults to text — against which `bytea = text` resolves to
+// no operator at all, so the statement fails to PARSE rather than quietly
+// mismatching. Casting the first row is therefore mandatory, and sufficient:
+// every later row unifies to the types it fixed. SQLite has no :: cast syntax
+// and needs none, since it compares by value affinity.
+func outpointTuple(engine Engine, first bool) string {
+	if first && engine == EnginePostgres {
+		return "(?::bytea, ?::integer)"
+	}
+	return "(?, ?)"
+}
+
+// FindOutputsByOutpoints returns userID's output rows for the given outpoints,
+// matching the parent transaction's txid and the output's vout, ordered by
+// output_id ASC. Outpoints with no matching row are simply absent from the
+// result; the caller maps what came back and decides what a miss means.
+//
+// It replaces a per-outpoint FindOutputs call with ONE statement per chunk of
+// [outpointChunk]. Both call sites — assembling a created action's inputs and
+// recording the spend history of a broadcast one — walked every input of a
+// transaction issuing a keyed query each, which is a round trip per input on
+// two paths that run once per transaction at full throughput.
+//
+// The key set is a VALUES list joined by row comparison rather than the
+// unnest-array relation the utxostore's PostgreSQL statements use, because this
+// query must run on SQLite too: SQLite has no unnest, and it rejects the
+// column-alias list (`v(txid, vout)`) a derived table would need to be joined
+// by name. `(t.txid, o.vout) IN (VALUES …)` is the one spelling both engines
+// accept — SQLite has supported row values since 3.15.
+func (r OutputsRepo) FindOutputsByOutpoints(ctx context.Context, userID int, ops []wdk.OutPoint) ([]OutputRow, error) {
+	if len(ops) == 0 {
+		return nil, nil
+	}
+
+	var out []OutputRow
+	for start := 0; start < len(ops); start += outpointChunk {
+		end := min(start+outpointChunk, len(ops))
+
+		tuples := make([]string, 0, end-start)
+		args := make([]any, 0, 2*(end-start)+1)
+		args = append(args, userID)
+		for i := start; i < end; i++ {
+			raw, err := encTxID(ops[i].TxID)
+			if err != nil {
+				return nil, err
+			}
+			tuples = append(tuples, outpointTuple(r.s.engine, i == start))
+			args = append(args, raw, ops[i].Vout)
+		}
+
+		q := r.s.rebind("SELECT " + outputCols +
+			" FROM outputs o JOIN transactions t ON t.transaction_id = o.transaction_id" +
+			" WHERE o.user_id = ? AND (t.txid, o.vout) IN (VALUES " + joinComma(tuples) + ")" +
+			" ORDER BY o.output_id ASC")
+		rows, err := r.s.execer(ctx).QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("metastore: find outputs by outpoints: %w", err)
+		}
+		page, err := r.collect(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+	}
+	return out, nil
 }
 
 func (r OutputsRepo) collect(rows *sql.Rows) ([]OutputRow, error) {
