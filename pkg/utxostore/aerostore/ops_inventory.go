@@ -25,17 +25,12 @@ func (s *Store) Mint(_ context.Context, mints []*utxostore.Mint) error {
 			failed++
 		}
 	}
-	return batchCountErr(failed, len(mints))
+	return utxostore.BatchCountErr(failed, len(mints))
 }
 
 func (s *Store) mintOne(m *utxostore.Mint) error {
-	switch {
-	case m.UserID <= 0:
-		return fmt.Errorf("aerostore: mint %s: user id must be positive", m.Outpoint)
-	case m.Basket == "":
-		return fmt.Errorf("aerostore: mint %s: basket must be non-empty", m.Outpoint)
-	case !m.Tier.Valid():
-		return fmt.Errorf("aerostore: mint %s: invalid tier %d", m.Outpoint, m.Tier)
+	if err := utxostore.ValidateMint(m); err != nil {
+		return err
 	}
 
 	key, err := s.keyFor(m.Outpoint)
@@ -113,7 +108,7 @@ func (s *Store) Remove(_ context.Context, ops []utxostore.Outpoint, force bool) 
 			itemErrs = append(itemErrs, err)
 		}
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // removableFilter re-asserts, server-side at delete time, the classification
@@ -214,7 +209,7 @@ func (s *Store) Freeze(_ context.Context, ops []utxostore.Outpoint) error {
 			itemErrs = append(itemErrs, fmt.Errorf("aerostore: freeze %s: %w", op, aerr))
 		}
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // Unfreeze implements [utxostore.Store]: lifts the hold and restores claimKey
@@ -269,7 +264,7 @@ func (s *Store) Unfreeze(_ context.Context, ops []utxostore.Outpoint) error {
 			itemErrs = append(itemErrs, fmt.Errorf("aerostore: unfreeze %s: %w", op, aerr))
 		}
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // Promote implements [utxostore.Store]: retiers rows in either direction.
@@ -339,10 +334,8 @@ func (s *Store) RemoveByMintTx(_ context.Context, mintTxID chainhash.Hash, ops [
 	if s.closed.Load() {
 		return report, errClosed
 	}
-	for _, op := range ops {
-		if op.TxID != mintTxID {
-			return report, fmt.Errorf("aerostore: outpoint %s is not an output of mint tx %s", op, mintTxID.String())
-		}
+	if err := utxostore.ValidateMintOutpoints(mintTxID, ops); err != nil {
+		return report, err
 	}
 
 	reservedRefs := make(map[string]*utxostore.ReservationRef)

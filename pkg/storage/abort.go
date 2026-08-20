@@ -31,6 +31,31 @@ var abortableStatuses = map[wdk.TxStatus]bool{
 	wdk.TxStatusNonFinal:    true,
 }
 
+// ErrAbortLostToSend narrows [wdk.ErrNotAbortableAction] to the one abort
+// refusal a caller can respond to differently: the raw transaction was already
+// CLAIMED for broadcast (or the network already has it), so the abort lost the
+// race and the transaction is on its way out.
+//
+// It matters because the generic refusal invites the wrong reflex. "Not
+// abortable" usually means the action never got far enough or has already
+// settled, and rebuilding is reasonable; here it means the opposite — bytes
+// spending these very inputs are in flight, and rebuilding would author a
+// double spend of coins that are about to be gone. The correct response is to
+// stop and watch the transaction's status: it will land, or it will fail and
+// the reconciler will free its inputs.
+//
+// Do NOT read the ABSENCE of this sentinel as "the abort can be retried". The
+// other refusal — the wallet-side status CAS losing to a concurrent transition
+// — carries [wdk.ErrNotAbortableAction] alone, and is deliberately left
+// unnamed: re-reading the action's status is the only sensible response to it,
+// which is what the generic sentinel already says.
+//
+// It WRAPS [wdk.ErrNotAbortableAction] rather than sitting beside it, so a
+// caller matching only the BRC-100 sentinel keeps working unchanged — including
+// across the REST transport, where the client reconstructs the error from one
+// wire code and matches whatever that code's sentinel wraps.
+var ErrAbortLostToSend = fmt.Errorf("storage: abort lost to an in-flight broadcast: %w", wdk.ErrNotAbortableAction)
+
 // AbortAction aborts a pre-broadcast transaction: it fences the raw transaction
 // so it can never be broadcast, releases the funding reservation held under the
 // transaction Reference, removes any minted change, and marks the transaction
@@ -171,12 +196,13 @@ func (p *Provider) abortTxRow(ctx context.Context, userID int, txRow *wdk.TableT
 //     nothing to lose to. Proceed.
 //
 // Both refusals surface as [wdk.ErrNotAbortableAction], which is the only typed
-// abort failure the BRC-100 surface has. The two are distinguishable only by
-// message today, and they call for different caller responses — losing to a
-// live send means the transaction is going out (do not rebuild), while losing
-// the status CAS means something else moved the row. Giving pkg/storage a typed
-// re-export that separates them is left to E4; it is a public-surface change,
-// not a fence change.
+// abort failure the BRC-100 surface has. ONE of the two is separated out on top
+// of it: the known-tx arm additionally carries [ErrAbortLostToSend], because
+// only that case tells the caller something it can act on differently —
+// the transaction is going out, so do not rebuild it. The status-CAS arm gets
+// no sentinel of its own; "the action is not abortable in its current state" is
+// already exactly what [wdk.ErrNotAbortableAction] says, and a second name for
+// it would export a distinction with no distinct response.
 func (p *Provider) fenceAborted(ctx context.Context, txRow *wdk.TableTransaction, txid string) error {
 	if err := p.meta.Transactions().UpdateStatus(ctx, txRow.TransactionID, wdk.TxStatusAborted,
 		wdk.TxStatusUnsigned, wdk.TxStatusNoSend, wdk.TxStatusUnprocessed, wdk.TxStatusNonFinal); err != nil {
@@ -193,7 +219,7 @@ func (p *Provider) fenceAborted(ctx context.Context, txRow *wdk.TableTransaction
 		// Fenced, or never signed and so nothing to fence.
 	case errors.Is(err, metastore.ErrStatusUpdateSkipped):
 		return fmt.Errorf("storage: transaction %s is claimed for broadcast or already sent: %w",
-			txid, wdk.ErrNotAbortableAction)
+			txid, ErrAbortLostToSend)
 	default:
 		return fmt.Errorf("storage: fence raw tx %s: %w", txid, err)
 	}

@@ -26,20 +26,12 @@ func (s *Store) Mint(ctx context.Context, mints []*utxostore.Mint) error {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return batchErr(failed, len(mints))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(mints))
 }
 
 func (s *Store) mintOne(ctx context.Context, x queryer, m *utxostore.Mint) error {
-	switch {
-	case m.UserID <= 0:
-		return fmt.Errorf("sqlstore: mint %s: user id must be positive", m.Outpoint)
-	case m.Basket == "":
-		return fmt.Errorf("sqlstore: mint %s: basket must be non-empty", m.Outpoint)
-	case !m.Tier.Valid():
-		return fmt.Errorf("sqlstore: mint %s: invalid tier %d", m.Outpoint, m.Tier)
+	if err := utxostore.ValidateMint(m); err != nil {
+		return err
 	}
 
 	res, err := s.insertMint(ctx, x, m)
@@ -138,7 +130,7 @@ func (s *Store) Remove(ctx context.Context, ops []utxostore.Outpoint, force bool
 	if err != nil {
 		return err
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // removeOne deletes one row, write first: the guarded DELETE carries the same

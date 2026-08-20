@@ -158,9 +158,11 @@ func (r TransactionsRepo) Insert(ctx context.Context, tx NewTx) (uint, error) {
 			`INSERT INTO transactions
 			 (user_id, status, reference, is_outgoing, satoshis, description, version, lock_time, input_beef, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			 RETURNING transaction_id`)
+			 RETURNING transaction_id`,
+		)
 		var got int64
-		if err := r.s.execer(ctx).QueryRowContext(ctx, q,
+		if err := r.s.execer(ctx).QueryRowContext(
+			ctx, q,
 			tx.UserID, string(tx.Status), tx.Reference, r.s.boolVal(tx.IsOutgoing),
 			tx.Satoshis, tx.Description, version, lockTime, inputBEEF, now, now,
 		).Scan(&got); err != nil {

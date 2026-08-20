@@ -255,7 +255,7 @@ func (s *Store) ClaimableExists(ctx context.Context, sc utxostore.Scope, minSats
 	if s.isClosed() {
 		return false, errClosed
 	}
-	if err := validateScope(sc); err != nil {
+	if err := utxostore.ValidateScope(sc); err != nil {
 		return false, err
 	}
 	return s.claimableExists(ctx, sc, shapeSmallestSufficient, minSats)
@@ -275,20 +275,6 @@ func (s *Store) claimableExists(ctx context.Context, sc utxostore.Scope, shape c
 	return s.boolGet(exists), nil
 }
 
-// validateScope rejects an underspecified scope. It is [validateClaim] minus
-// the reservation token, which a probe does not take.
-func validateScope(sc utxostore.Scope) error {
-	switch {
-	case sc.UserID <= 0:
-		return errors.New("sqlstore: scope user id must be positive")
-	case sc.Basket == "":
-		return errors.New("sqlstore: scope basket must be non-empty")
-	case !sc.Tier.Valid():
-		return fmt.Errorf("sqlstore: invalid scope tier %d", sc.Tier)
-	}
-	return nil
-}
-
 // ClaimSmallestSufficient implements [utxostore.Store]: the true minimum
 // Satoshis >= minSats among claimable rows in scope, ties broken by insertion
 // order (seq).
@@ -296,7 +282,7 @@ func (s *Store) ClaimSmallestSufficient(ctx context.Context, sc utxostore.Scope,
 	if s.isClosed() {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 
@@ -335,7 +321,7 @@ func (s *Store) ClaimLargestInsufficient(ctx context.Context, sc utxostore.Scope
 	if s.isClosed() {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -381,7 +367,7 @@ func (s *Store) ClaimExact(ctx context.Context, sc utxostore.Scope, reservation 
 	if s.isClosed() {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if count <= 0 {
@@ -461,7 +447,7 @@ func (s *Store) ReserveOutpoints(ctx context.Context, userID int64, reservation 
 	if s.isClosed() {
 		return errClosed
 	}
-	if err := validateReserveOutpoints(reservation, ops); err != nil {
+	if err := utxostore.ValidateReserveOutpoints(reservation, ops); err != nil {
 		return err
 	}
 
@@ -526,7 +512,7 @@ func (s *Store) ReserveOutpoints(ctx context.Context, userID int64, reservation 
 	if err != nil {
 		return err
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // classifyForReserve locks one target row and decides its fate. needsStamp is
@@ -618,8 +604,8 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 	if s.isClosed() {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("sqlstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	var released int
@@ -656,8 +642,8 @@ func (s *Store) ReleaseOutpoints(ctx context.Context, reservation string, ops []
 	if s.isClosed() {
 		return errClosed
 	}
-	if reservation == "" {
-		return errors.New("sqlstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return err
 	}
 
 	return s.withTx(ctx, func(x queryer) error {
@@ -706,8 +692,8 @@ func (s *Store) setPinned(ctx context.Context, userID int64, reservation string,
 	if s.isClosed() {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("sqlstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	// Guard on the CURRENT pin state so only real transitions are counted:

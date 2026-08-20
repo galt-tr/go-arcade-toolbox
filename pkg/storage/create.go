@@ -108,10 +108,7 @@ func (p *Provider) CreateAction(ctx context.Context, auth wdk.AuthID, args wdk.V
 		}
 		nonChangeOutputCount += shape.Count
 	}
-	inputScriptLens, err := providedInputSizes(args.Inputs)
-	if err != nil {
-		return nil, err
-	}
+	inputScriptLens := providedInputSizes(args.Inputs)
 	currentTxSize := txutils.TransactionSizeFromScriptLengths(inputScriptLens, outputScriptLens)
 
 	target := providedOutputSats
@@ -640,7 +637,11 @@ func providedOutputSizes(outputs []wdk.ValidCreateActionOutput) (totalSats int64
 	return totalSats, scriptLens, nil
 }
 
-func providedInputSizes(inputs []wdk.ValidCreateActionInput) ([]uint64, error) {
+// providedInputSizes estimates the unlocking-script length of each caller-named
+// input, for the fee math. It cannot fail: an input whose length is unknowable
+// falls back to a standard P2PKH unlocking script rather than refusing the
+// action, so there is no error to return.
+func providedInputSizes(inputs []wdk.ValidCreateActionInput) []uint64 {
 	lens := make([]uint64, 0, len(inputs))
 	for i := range inputs {
 		l, err := inputs[i].ScriptLength()
@@ -650,7 +651,7 @@ func providedInputSizes(inputs []wdk.ValidCreateActionInput) ([]uint64, error) {
 		}
 		lens = append(lens, l)
 	}
-	return lens, nil
+	return lens
 }
 
 func allocatedTxids(utxos []*utxostore.UTXO) []string {

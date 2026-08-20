@@ -60,10 +60,7 @@ func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp, force bo
 			failed++
 		}
 	}
-	if failed > 0 {
-		return batchErr(failed, len(spends))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(spends))
 }
 
 // spendOne records one spend, write first. The guarded UPDATE re-asserts every
@@ -71,8 +68,8 @@ func (s *Store) Spend(ctx context.Context, spends []*utxostore.SpendOp, force bo
 // row can slip between a check and the write — there is no check to slip away
 // from. Only a write that matched nothing pays for a classifying read.
 func (s *Store) spendOne(ctx context.Context, x queryer, sp *utxostore.SpendOp, force bool) (itemErr, fatal error) {
-	if sp.Reservation == "" {
-		return fmt.Errorf("sqlstore: spend %s: reservation must be non-empty", sp.Outpoint), nil
+	if err := utxostore.ValidateSpend(sp); err != nil {
+		return err, nil
 	}
 
 	for range guardAttempts {
@@ -267,8 +264,8 @@ func (s *Store) spendSet(ctx context.Context, x queryer, spends []*utxostore.Spe
 	// its items never enter a group.
 	pending := make([]*utxostore.SpendOp, 0, len(spends))
 	for _, sp := range spends {
-		if sp.Reservation == "" {
-			sp.Err = fmt.Errorf("sqlstore: spend %s: reservation must be non-empty", sp.Outpoint)
+		if err := utxostore.ValidateSpend(sp); err != nil {
+			sp.Err = err
 			continue
 		}
 		pending = append(pending, sp)
@@ -563,10 +560,8 @@ func (s *Store) RemoveByMintTx(ctx context.Context, mintTxID chainhash.Hash, ops
 	if s.isClosed() {
 		return report, errClosed
 	}
-	for _, op := range ops {
-		if op.TxID != mintTxID {
-			return report, fmt.Errorf("sqlstore: outpoint %s is not an output of mint tx %s", op, mintTxID.String())
-		}
+	if err := utxostore.ValidateMintOutpoints(mintTxID, ops); err != nil {
+		return report, err
 	}
 
 	err := s.withTx(ctx, func(x queryer) error {
@@ -760,7 +755,7 @@ func (s *Store) setFrozen(ctx context.Context, ops []utxostore.Outpoint, frozen 
 	if err != nil {
 		return err
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // Balance implements [utxostore.Store].

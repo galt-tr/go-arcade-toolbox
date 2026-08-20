@@ -89,6 +89,8 @@ func TestProcessNewTx_DivergentReDriveRefused(t *testing.T) {
 	_, err = h.processDelayed(t, res, other)
 	require.Error(t, err, "a differently-signed re-drive must be refused, not applied")
 	assert.ErrorIs(t, err, metastore.ErrTxIDMismatch)
+	assert.ErrorIs(t, err, ErrDivergentReDrive,
+		"and the storage-level sentinel an out-of-tree caller can match on")
 	assert.Contains(t, err.Error(), txid1, "the refusal names the binding it is protecting")
 	assert.Contains(t, err.Error(), txid2, "and the bytes it refused")
 
@@ -121,6 +123,7 @@ func TestDivergentReDriveCASErr_CarriesTheCause(t *testing.T) {
 	cause := fmt.Errorf("metastore: set txid: transaction 7: %w", metastore.ErrTxIDMismatch)
 	err := divergentReDriveCASErr("ref-1", "txid-2", cause)
 	assert.ErrorIs(t, err, metastore.ErrTxIDMismatch, "still matchable as a divergence")
+	assert.ErrorIs(t, err, ErrDivergentReDrive, "and as the exported sentinel, on both detection paths")
 	assert.Contains(t, err.Error(), "transaction 7", "the row identity survives the wrap")
 }
 

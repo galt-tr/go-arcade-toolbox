@@ -10,10 +10,14 @@ import (
 	"github.com/galt-tr/go-arcade-toolbox/pkg/internal/satoshi"
 )
 
+// bytesPerKB is the divisor of a sat/kB rate. It is a constant rather than a
+// feeCalc field because it was never anything but 1000 — the field only made
+// the fee formula look configurable in a dimension that has no configuration.
+const bytesPerKB = 1000.0
+
 // feeCalc is a static sat/kB fee model with per-byte precision: it never rounds
 // the transaction size up to the nearest kilobyte before applying the rate.
 type feeCalc struct {
-	bytes float64
 	value float64
 }
 
@@ -33,10 +37,7 @@ func newFeeCalculator(model defs.FeeModel) *feeCalc {
 		panic("invalid fee model value: " + err.Error())
 	}
 
-	return &feeCalc{
-		value: feeValue,
-		bytes: 1000,
-	}
+	return &feeCalc{value: feeValue}
 }
 
 // Calculate returns the fee for a transaction of txSize bytes, computed with
@@ -47,7 +48,7 @@ func (f *feeCalc) Calculate(txSize uint64) (satoshi.Value, error) {
 		return 0, fmt.Errorf("invalid transaction size: %w", err)
 	}
 
-	feeAmount := math.Ceil(size / f.bytes * f.value)
+	feeAmount := math.Ceil(size / bytesPerKB * f.value)
 
 	fee, err := to.Int64(feeAmount)
 	if err != nil {

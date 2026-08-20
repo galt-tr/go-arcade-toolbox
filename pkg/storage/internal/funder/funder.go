@@ -100,9 +100,10 @@ func SpendTiers(policy defs.SpendPolicy) []utxostore.Tier {
 		return []utxostore.Tier{utxostore.TierMined}
 	case defs.SpendPolicyAny:
 		return []utxostore.Tier{utxostore.TierMined, utxostore.TierUnproven, utxostore.TierSending}
-	case defs.SpendPolicyPreferMined:
-		return []utxostore.Tier{utxostore.TierMined, utxostore.TierUnproven}
 	default:
+		// [defs.SpendPolicyPreferMined], and the fallback for an unrecognized
+		// policy — the two share this walk deliberately: an unreadable policy
+		// must degrade to the safer-but-usable default, never to the widest one.
 		return []utxostore.Tier{utxostore.TierMined, utxostore.TierUnproven}
 	}
 }

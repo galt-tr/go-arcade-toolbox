@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -251,34 +252,44 @@ func (p *Provider) processNewTx(ctx context.Context, userID int, args wdk.Proces
 	})
 }
 
-// divergentReDriveErr is the refusal for audit P1-4 as [Provider.processNewTx]'s
-// pre-check sees it: the row it read is already bound to another signing, and a
-// reference bound to one signing may never be repointed at another.
+// ErrDivergentReDrive is returned when ProcessAction is re-driven for a
+// reference that is ALREADY bound to a different signed transaction (audit
+// P1-4). It is a FINAL, local verdict on these bytes: repointing the row would
+// orphan the raw transaction stored under the old txid, which stays resendable
+// with nothing pointing at it, so storage refuses rather than choose which
+// signing the reference means.
 //
-// Both this and [divergentReDriveCASErr] wrap [metastore.ErrTxIDMismatch], so
-// the two in-tree call sites are matchable as one condition. That is the whole
-// of the claim: there is no storage-level exported sentinel for this yet, the
-// way [ErrFeeBelowFloor] exists for the fee floor, so out-of-tree callers have
-// nothing stable to match on. Re-exporting one belongs with C3's abort work,
-// which gives the divergence a documented resolution to point at.
+// The resolution is not a retry of the same call. A caller holding bytes it
+// still wants to broadcast must abort the action (which fences the bound
+// transaction — see [Provider.AbortAction]) and create a new one; a caller that
+// simply re-sent a stale request should discard it, because the reference's
+// real transaction is the one already bound. Re-driving with the SAME bytes is
+// the benign case and never produces this error.
+//
+// The internal cause travels with it: errors.Is also matches
+// metastore.ErrTxIDMismatch, which is what in-tree callers match.
+var ErrDivergentReDrive = errors.New("storage: reference is already bound to a different transaction")
+
+// divergentReDriveErr is [ErrDivergentReDrive] as [Provider.processNewTx]'s
+// pre-check sees it: the row it read is already bound to another signing.
 func divergentReDriveErr(reference, boundTxID, newTxID string) error {
-	return fmt.Errorf("storage: reference %q is already bound to txid %s; refusing re-drive with %s: %w",
-		reference, boundTxID, newTxID, metastore.ErrTxIDMismatch)
+	return fmt.Errorf("storage: reference %q is already bound to txid %s; refusing re-drive with %s: %w: %w",
+		reference, boundTxID, newTxID, ErrDivergentReDrive, metastore.ErrTxIDMismatch)
 }
 
 // divergentReDriveCASErr is the same refusal detected one layer down, by
 // [metastore.TransactionsRepo.SetTxID]'s CAS, after a racer bound the row
 // between the pre-check's read and this write.
 //
-// It wraps cause rather than the bare sentinel: cause carries the transaction
-// id the CAS was operating on, which is the only identifying detail available
-// here. The winning txid is deliberately absent — learning it would mean
-// re-reading the row, and SetTxID's caller guidance forbids exactly that,
+// It wraps cause rather than the bare metastore sentinel: cause carries the
+// transaction id the CAS was operating on, which is the only identifying detail
+// available here. The winning txid is deliberately absent — learning it would
+// mean re-reading the row, and SetTxID's caller guidance forbids exactly that,
 // because the re-read is the first half of the overwrite this CAS exists to
 // prevent.
 func divergentReDriveCASErr(reference, newTxID string, cause error) error {
 	return fmt.Errorf("storage: reference %q was bound to a different txid concurrently; "+
-		"refusing re-drive with %s: %w", reference, newTxID, cause)
+		"refusing re-drive with %s: %w: %w", reference, newTxID, ErrDivergentReDrive, cause)
 }
 
 // knownTxStatusFor reports a known tx's current status for use in an error
@@ -1074,6 +1085,14 @@ func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Tran
 }
 
 // changeOutpoints returns the outpoints of a transaction's change coins.
+//
+// It keeps a query of its own rather than delegating to
+// [Provider.changeOutpointsByTxIDs] because the scope is genuinely different:
+// this asks for ONE user's transaction row, while the by-txid form asks for
+// every row carrying that txid. The same txid can appear under more than one
+// user (a payment between two local users records a row for each), and the
+// callers here — abort and the create path — must never reach into another
+// user's change.
 func (p *Provider) changeOutpoints(ctx context.Context, userID int, transactionID uint, txid string) ([]utxostore.Outpoint, error) {
 	change := true
 	rows, err := p.meta.Outputs().FindOutputs(ctx, wdk.FindOutputsArgs{
@@ -1181,23 +1200,11 @@ func (p *Provider) validateSignedOutputs(ctx context.Context, transactionID uint
 			return fmt.Errorf("storage: signed tx missing output at vout %d", row.Vout)
 		}
 		got := tx.Outputs[row.Vout].LockingScript
-		if got == nil || !bytesEqual(got.Bytes(), row.LockingScript) {
+		if got == nil || !bytes.Equal(got.Bytes(), row.LockingScript) {
 			return fmt.Errorf("storage: signed tx output %d locking script mismatch", row.Vout)
 		}
 	}
 	return nil
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // firstTxByTxID returns the newest transaction row for txid under userID, or

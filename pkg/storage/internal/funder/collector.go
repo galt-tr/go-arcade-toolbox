@@ -73,7 +73,7 @@ func newCollector(txSats satoshi.Value, txSize, outputCount uint64, numberOfDesi
 		[]uint64{txutils.P2PKHUnlockingScriptLength},
 		[]uint64{txutils.P2PKHLockingScriptLength},
 	)
-	c.dustFloor = satoshi.Value(math.Max(1, math.Ceil(float64(minSpendTxSize)/1000*feeCalculator.value)*2))
+	c.dustFloor = satoshi.Value(math.Max(1, math.Ceil(float64(minSpendTxSize)/bytesPerKB*feeCalculator.value)*2))
 
 	c.calculateMinimumChange()
 

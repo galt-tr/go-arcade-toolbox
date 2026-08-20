@@ -73,6 +73,32 @@ var (
 	ErrContention = errors.New("utxostore: contention — candidates exhausted, retry")
 )
 
+// JoinBatch wraps per-item typed errors under the [ErrBatch] sentinel, or
+// returns nil when there are none. It is what batch methods whose ops carry no
+// Err slot (Remove, Freeze, Unfreeze, ReserveOutpoints) return: errors.Is finds
+// ErrBatch, errors.As finds the item errors.
+//
+// Exported alongside [BatchCountErr] so every backend — including an
+// out-of-tree one registered through [Register] — reports a partly failed batch
+// in the one shape callers filter on.
+func JoinBatch(itemErrs []error) error {
+	if len(itemErrs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrBatch, errors.Join(itemErrs...))
+}
+
+// BatchCountErr returns the top-level [ErrBatch] sentinel with a count summary
+// when any item failed, or nil. It is the counterpart of [JoinBatch] for
+// methods whose ops DO carry an Err slot (Mint, Spend): the per-item verdicts
+// are already on the ops, so the returned error only has to say how many.
+func BatchCountErr(failed, total int) error {
+	if failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %d of %d items failed", ErrBatch, failed, total)
+}
+
 // NotFoundError reports that an outpoint is absent from the store.
 //
 // errors.Is(err, &NotFoundError{}) matches any NotFoundError (type-only

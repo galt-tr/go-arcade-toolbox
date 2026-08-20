@@ -26,9 +26,11 @@ import (
 // method returns a zero value. FindOrInsertUser must be set for any auth-scoped
 // route (the server resolves the AuthID through it).
 type fakeProvider struct {
-	findUser     func(ctx context.Context, identityKey string) (*wdk.FindOrInsertUserResponse, error)
-	getBalance   func(ctx context.Context, auth wdk.AuthID, basket string) (uint64, error)
-	createAction func(ctx context.Context, auth wdk.AuthID, args wdk.ValidCreateActionArgs) (*wdk.StorageCreateActionResult, error)
+	findUser      func(ctx context.Context, identityKey string) (*wdk.FindOrInsertUserResponse, error)
+	getBalance    func(ctx context.Context, auth wdk.AuthID, basket string) (uint64, error)
+	createAction  func(ctx context.Context, auth wdk.AuthID, args wdk.ValidCreateActionArgs) (*wdk.StorageCreateActionResult, error)
+	abortAction   func(ctx context.Context, auth wdk.AuthID, args wdk.AbortActionArgs) (*wdk.AbortActionResult, error)
+	processAction func(ctx context.Context, auth wdk.AuthID, args wdk.ProcessActionArgs) (*wdk.ProcessActionResult, error)
 }
 
 func (f *fakeProvider) FindOrInsertUser(ctx context.Context, identityKey string) (*wdk.FindOrInsertUserResponse, error) {
@@ -61,7 +63,10 @@ func (f *fakeProvider) InternalizeAction(context.Context, wdk.AuthID, wdk.Intern
 	return nil, nil
 }
 
-func (f *fakeProvider) ProcessAction(context.Context, wdk.AuthID, wdk.ProcessActionArgs) (*wdk.ProcessActionResult, error) {
+func (f *fakeProvider) ProcessAction(ctx context.Context, auth wdk.AuthID, args wdk.ProcessActionArgs) (*wdk.ProcessActionResult, error) {
+	if f.processAction != nil {
+		return f.processAction(ctx, auth, args)
+	}
 	return nil, nil
 }
 
@@ -101,7 +106,10 @@ func (f *fakeProvider) ProcessSyncChunk(context.Context, wdk.RequestSyncChunkArg
 	return nil, nil
 }
 
-func (f *fakeProvider) AbortAction(context.Context, wdk.AuthID, wdk.AbortActionArgs) (*wdk.AbortActionResult, error) {
+func (f *fakeProvider) AbortAction(ctx context.Context, auth wdk.AuthID, args wdk.AbortActionArgs) (*wdk.AbortActionResult, error) {
+	if f.abortAction != nil {
+		return f.abortAction(ctx, auth, args)
+	}
 	return nil, nil
 }
 
@@ -297,6 +305,109 @@ func TestREST_ErrorMapping_Internal(t *testing.T) {
 	assert.Contains(t, re.Message, "disk on fire")
 	assert.NotErrorIs(t, err, wdk.ErrNotEnoughFunds)
 	assert.NotErrorIs(t, err, funder.ErrNotEnoughFunds)
+}
+
+// TestREST_ErrorMapping_AbortLostToSend proves the abort pair crosses the wire
+// with the distinction intact and in the right direction. The specific mapping
+// must win — ErrAbortLostToSend WRAPS wdk.ErrNotAbortableAction, so a table
+// scanned in the wrong order would report every lost-to-send abort as the
+// generic refusal and tell a caller to rebuild a transaction whose inputs are
+// already on the wire.
+func TestREST_ErrorMapping_AbortLostToSend(t *testing.T) {
+	fake := &fakeProvider{
+		abortAction: func(context.Context, wdk.AuthID, wdk.AbortActionArgs) (*wdk.AbortActionResult, error) {
+			return nil, fmt.Errorf("storage: transaction abc is claimed for broadcast or already sent: %w",
+				storage.ErrAbortLostToSend)
+		},
+	}
+	client := newFakeClient(t, fake)
+
+	_, err := client.AbortAction(context.Background(), wdk.AuthID{IdentityKey: "02abc"}, wdk.AbortActionArgs{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, storage.ErrAbortLostToSend, "the narrow sentinel survives the round trip")
+	assert.ErrorIs(t, err, wdk.ErrNotAbortableAction, "and so does the BRC-100 one it wraps")
+
+	var re *storage.RemoteError
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, http.StatusConflict, re.Status)
+	assert.Equal(t, storage.CodeAbortLostToSend, re.Code, "the SPECIFIC code, not the generic one")
+}
+
+// TestREST_ErrorMapping_NotAbortable is the generic half: an abort refused on
+// the action's own state carries no lost-to-send claim, on the wire either.
+func TestREST_ErrorMapping_NotAbortable(t *testing.T) {
+	fake := &fakeProvider{
+		abortAction: func(context.Context, wdk.AuthID, wdk.AbortActionArgs) (*wdk.AbortActionResult, error) {
+			return nil, fmt.Errorf("storage: transaction %q has status %q: %w",
+				"ref-1", "completed", wdk.ErrNotAbortableAction)
+		},
+	}
+	client := newFakeClient(t, fake)
+
+	_, err := client.AbortAction(context.Background(), wdk.AuthID{IdentityKey: "02abc"}, wdk.AbortActionArgs{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, wdk.ErrNotAbortableAction)
+	assert.NotErrorIs(t, err, storage.ErrAbortLostToSend, "the wire must not invent the stronger warning")
+
+	var re *storage.RemoteError
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, http.StatusConflict, re.Status)
+	assert.Equal(t, storage.CodeNotAbortable, re.Code)
+}
+
+// TestREST_ErrorMapping_NotAbortableUnknownReference pins the flagged
+// non-neutral decision in this change: an abort whose reference resolves to no
+// transaction reports 409 ERR_NOT_ABORTABLE, not 404 and not the unmapped 500
+// it used to be.
+//
+// 404 would say "no such endpoint" — the route exists and was dispatched, and
+// it is the reference in the body that resolved to nothing. 500 said "something
+// is broken here" about a refusal that will never change its mind, which is an
+// invitation for a retrying mesh to hammer it. 409 is the honest answer, and
+// the one a caller can act on: stop.
+func TestREST_ErrorMapping_NotAbortableUnknownReference(t *testing.T) {
+	fake := &fakeProvider{
+		abortAction: func(context.Context, wdk.AuthID, wdk.AbortActionArgs) (*wdk.AbortActionResult, error) {
+			return nil, fmt.Errorf("storage: no transaction for reference %q: %w",
+				"ref-nope", wdk.ErrNotAbortableAction)
+		},
+	}
+	client := newFakeClient(t, fake)
+
+	_, err := client.AbortAction(context.Background(), wdk.AuthID{IdentityKey: "02abc"}, wdk.AbortActionArgs{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, wdk.ErrNotAbortableAction)
+
+	var re *storage.RemoteError
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, http.StatusConflict, re.Status, "not 404 (the route resolved) and not 500 (nothing is broken)")
+	assert.Equal(t, storage.CodeNotAbortable, re.Code)
+	assert.NotErrorIs(t, err, wdk.ErrNotFoundError,
+		"and it is NOT a not-found: giving this case a 404 lane needs its own sentinel row above CodeNotAbortable")
+}
+
+// TestREST_ErrorMapping_DivergentReDrive proves a ProcessAction refused for a
+// reference already bound to different bytes reaches a remote caller as a
+// matchable 409 rather than an opaque 500 — the whole point of exporting the
+// sentinel is that a wallet client can tell "these bytes are wrong" from "the
+// server is broken".
+func TestREST_ErrorMapping_DivergentReDrive(t *testing.T) {
+	fake := &fakeProvider{
+		processAction: func(context.Context, wdk.AuthID, wdk.ProcessActionArgs) (*wdk.ProcessActionResult, error) {
+			return nil, fmt.Errorf("storage: reference %q is already bound to txid abc: %w",
+				"ref-1", storage.ErrDivergentReDrive)
+		},
+	}
+	client := newFakeClient(t, fake)
+
+	_, err := client.ProcessAction(context.Background(), wdk.AuthID{IdentityKey: "02abc"}, wdk.ProcessActionArgs{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, storage.ErrDivergentReDrive)
+
+	var re *storage.RemoteError
+	require.ErrorAs(t, err, &re)
+	assert.Equal(t, http.StatusConflict, re.Status, "a bound reference is a conflict, not a server fault")
+	assert.Equal(t, storage.CodeDivergentReDrive, re.Code)
 }
 
 // TestREST_Health proves the liveness probe is served unauthenticated.

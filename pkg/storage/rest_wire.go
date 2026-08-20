@@ -137,6 +137,38 @@ const (
 	CodeUnauthenticated  = "ERR_UNAUTHENTICATED"
 	CodeBadRequest       = "ERR_BAD_REQUEST"
 	CodeInternal         = "ERR_INTERNAL"
+
+	// CodeDivergentReDrive carries [ErrDivergentReDrive]: a ProcessAction whose
+	// reference is already bound to different bytes.
+	CodeDivergentReDrive = "ERR_DIVERGENT_REDRIVE"
+	// CodeAbortLostToSend carries [ErrAbortLostToSend]: an abort that lost to a
+	// broadcaster which had already claimed the raw transaction.
+	CodeAbortLostToSend = "ERR_ABORT_LOST_TO_SEND"
+	// CodeNotAbortable carries the generic [wdk.ErrNotAbortableAction]: every
+	// abort refusal that is NOT [ErrAbortLostToSend]. Three of them come from
+	// [Provider.AbortAction]'s own gate before any fence runs — the reference
+	// resolves to no transaction, the transaction is not outgoing, its status is
+	// not in abortableStatuses — plus the wallet-side status CAS losing to a
+	// concurrent transition inside [Provider.fenceAborted].
+	//
+	// All four are 409, INCLUDING the unresolved reference, which is a
+	// deliberate choice and not an oversight. 404 on this route would say "no
+	// such endpoint": the route exists and was dispatched, and it is the
+	// reference in the BODY that resolved to nothing. 409 also carries the
+	// property that matters operationally — non-retryable. The status it
+	// replaces was an unmapped 500, which invites exactly the wrong behavior
+	// from a retrying mesh or client for a refusal that will never change its
+	// mind.
+	//
+	// ORDERING TRAP for anyone revisiting that call: this mapping sits ABOVE
+	// CodeNotFound in sentinelMappings, and codeStatusFor stops at the first
+	// match. Adding [wdk.ErrNotFoundError] alongside the sentinel at the
+	// unresolved-reference refusal would therefore change nothing on the wire —
+	// the error would still match this row first and still report 409. Giving
+	// that case a 404 lane means a NEW sentinel with its own mapping row placed
+	// ABOVE this one, which is the same specific-before-generic pattern
+	// [ErrAbortLostToSend] uses.
+	CodeNotAbortable = "ERR_NOT_ABORTABLE"
 )
 
 // sentinelMapping ties a wire code + HTTP status to the set of sentinel errors
@@ -169,8 +201,19 @@ type sentinelMapping struct {
 // matches. Provided-input unavailability leads because it is the most specific
 // statement about the failure: only the named-input path produces it, while a
 // funding sentinel could plausibly be alongside it in a wrapped chain.
+//
+// The abort pair is ordered for the same reason and needs it more, since one is
+// deliberately a subset of the other: [ErrAbortLostToSend] WRAPS
+// [wdk.ErrNotAbortableAction], so the specific row must come first or the
+// generic one would swallow it and the wire would lose the only abort
+// distinction a caller can act on. The specific row lists just its own
+// sentinel — the client's reconstruction matches through the wrap, so a remote
+// caller testing the BRC-100 sentinel still succeeds.
 var sentinelMappings = []sentinelMapping{
 	{CodeInputUnavailable, http.StatusConflict, []error{wdk.ErrInputUnavailable}},
+	{CodeAbortLostToSend, http.StatusConflict, []error{ErrAbortLostToSend}},
+	{CodeNotAbortable, http.StatusConflict, []error{wdk.ErrNotAbortableAction}},
+	{CodeDivergentReDrive, http.StatusConflict, []error{ErrDivergentReDrive}},
 	{CodeNotEnoughFunds, http.StatusUnprocessableEntity, []error{funder.ErrNotEnoughFunds, wdk.ErrNotEnoughFunds}},
 	{CodeUTXOContention, http.StatusConflict, []error{funder.ErrUTXOContention, wdk.ErrUTXOContention, utxostore.ErrContention}},
 	{CodeAuthorization, http.StatusForbidden, []error{ErrAuthorization}},

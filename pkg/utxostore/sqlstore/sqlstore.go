@@ -55,7 +55,14 @@ type Store struct {
 	engine Engine
 	ownsDB bool
 	now    func() time.Time
-	pool   sqlkit.PoolConfig
+
+	// pool is CONSTRUCTION STATE, not store state: [WithConnPool] writes it,
+	// [newStore] applies it to the handle, and nothing reads it afterwards. It
+	// lives on the struct only because [Option] is a func(*Store), so an option
+	// has nowhere else to land. Do not start reading it at runtime — the pool a
+	// live store is actually using is db.Stats(), which the caller may have
+	// resized since.
+	pool sqlkit.PoolConfig
 
 	mu     sync.Mutex
 	closed bool
@@ -572,46 +579,4 @@ func (s *Store) scanUTXO(sc rowScanner) (*utxostore.UTXO, int64, error) {
 		u.SpentBy = h
 	}
 	return &u, seq, nil
-}
-
-// batchErr wraps the ErrBatch sentinel with a count summary.
-func batchErr(failed, total int) error {
-	return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, total)
-}
-
-// joinBatch wraps per-item errors under ErrBatch (errors.Is finds the
-// sentinel, errors.As finds the item errors), or returns nil when empty.
-func joinBatch(itemErrs []error) error {
-	if len(itemErrs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %w", utxostore.ErrBatch, errors.Join(itemErrs...))
-}
-
-// validateReserveOutpoints rejects underspecified outpoint-reservation inputs.
-// An empty op list is a programmer error rather than a degenerate success: the
-// caller asked for an all-or-nothing hold and named nothing to hold.
-func validateReserveOutpoints(reservation string, ops []utxostore.Outpoint) error {
-	switch {
-	case reservation == "":
-		return errors.New("sqlstore: reservation must be non-empty")
-	case len(ops) == 0:
-		return errors.New("sqlstore: ops must be non-empty")
-	}
-	return nil
-}
-
-// validateClaim rejects underspecified claim inputs; see the interface doc.
-func validateClaim(sc utxostore.Scope, reservation string) error {
-	switch {
-	case reservation == "":
-		return errors.New("sqlstore: reservation must be non-empty")
-	case sc.UserID <= 0:
-		return errors.New("sqlstore: scope user id must be positive")
-	case sc.Basket == "":
-		return errors.New("sqlstore: scope basket must be non-empty")
-	case !sc.Tier.Valid():
-		return fmt.Errorf("sqlstore: invalid scope tier %d", sc.Tier)
-	}
-	return nil
 }

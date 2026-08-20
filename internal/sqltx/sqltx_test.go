@@ -51,4 +51,15 @@ func TestFromAndWith(t *testing.T) {
 	got, ok = sqltx.From(ctx, dbA)
 	require.True(t, ok)
 	require.Same(t, tx, got)
+
+	// nil owner: With records nothing when told a transaction it cannot
+	// attribute, and From never matches a nil owner even so. Without the first
+	// half, a caller that passed a nil *sql.DB by accident would place an
+	// unowned transaction that every store calling From with its own (non-nil)
+	// db would correctly miss — but a second store passing nil would then pick
+	// it up, which is exactly the cross-database leak the owner check exists to
+	// prevent.
+	got, ok = sqltx.From(sqltx.With(base, tx, nil), nil)
+	require.False(t, ok)
+	require.Nil(t, got)
 }

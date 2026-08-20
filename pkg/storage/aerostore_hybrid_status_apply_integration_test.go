@@ -414,7 +414,7 @@ func TestHybrid_MinedAfterAbort_RepairsTheCoins(t *testing.T) {
 // across its bounded CAS budget, and the contract is explicit that it means
 // "ask me again" rather than a verdict on the coin. A caller that read it as a
 // refusal would abandon the repair and leave the coin claimable, so the
-// re-drive is the behaviour under test. Any OTHER error fails immediately.
+// re-drive is the behavior under test. Any OTHER error fails immediately.
 func hybridApplyWithRedrive(t *testing.T, p *storage.Provider, rec arcade.TxRecord) {
 	t.Helper()
 	var err error

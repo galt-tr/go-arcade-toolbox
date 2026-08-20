@@ -923,33 +923,14 @@ func (p *Provider) promoteChangeByTxID(ctx context.Context, txid string, tier ut
 
 // changeOutpointsByTxID returns the change outpoints for txid without needing a
 // userID — the monitor works purely by txid. It is the async analog of
-// changeOutpoints.
+// [Provider.changeOutpoints], and a one-element call of the bulk form: the
+// single-txid query it used to issue selected the same rows in the same order
+// as the one FindChangeOutputsByTxIDs builds for a one-element list — same
+// join, same two conditions, same ORDER BY output_id, differing only in clause
+// order and `txid = ?` against `txid IN (?)`. Keeping a second copy only
+// created somewhere for the two to drift apart.
 func (p *Provider) changeOutpointsByTxID(ctx context.Context, txid string) ([]utxostore.Outpoint, error) {
-	change := true
-	rows, err := p.meta.Outputs().FindOutputs(ctx, wdk.FindOutputsArgs{TxID: &txid, Change: &change})
-	if err != nil {
-		return nil, fmt.Errorf("storage: find change outputs %s: %w", txid, err)
-	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	hash, err := chainhash.NewHashFromHex(txid)
-	if err != nil {
-		return nil, fmt.Errorf("storage: parse txid %s: %w", txid, err)
-	}
-	ops := make([]utxostore.Outpoint, 0, len(rows))
-	for i := range rows {
-		// Every self-owned (change-purpose) output regardless of basket — the
-		// default change basket AND the throughput pool/reserve baskets. Since
-		// promotion to claimable now happens ONLY here (on SEEN) and no longer on
-		// the 202, a default-only filter would strand fuel/pool coins at
-		// TierSending forever. Matches [Provider.changeOutpoints].
-		if rows[i].Basket == nil {
-			continue
-		}
-		ops = append(ops, utxostore.Outpoint{TxID: *hash, Vout: rows[i].Vout})
-	}
-	return ops, nil
+	return p.changeOutpointsByTxIDs(ctx, []string{txid})
 }
 
 // resolveBlockHash returns the block hash bytes to store with a proof: the
@@ -1544,7 +1525,10 @@ func (p *Provider) setArcadeStatusBatch(ctx context.Context, recs []arcade.TxRec
 }
 
 // changeOutpointsByTxIDs returns the change outpoints for all of txids in one
-// bulk query — the batched analog of changeOutpointsByTxID.
+// bulk query. It is the ONE by-txid implementation:
+// [Provider.changeOutpointsByTxID] is a one-element call of it, and
+// [Provider.changeOutpoints] keeps its own query only because it is scoped to a
+// (userID, transactionID) rather than to a txid — see that function.
 func (p *Provider) changeOutpointsByTxIDs(ctx context.Context, txids []string) ([]utxostore.Outpoint, error) {
 	if len(txids) == 0 {
 		return nil, nil

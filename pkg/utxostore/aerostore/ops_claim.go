@@ -2,7 +2,6 @@ package aerostore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 
@@ -20,6 +19,22 @@ const (
 	// casBudget caps the number of failed CAS attempts a single claim call
 	// tolerates before returning ErrContention (the funder's outer retry then
 	// re-drives the claim). Bounds worst-case latency under heavy contention.
+	//
+	// It is deliberately far below the claim cache's refill batch
+	// ([defaultClaimCacheSize] = 512), and the arithmetic of that gap is worth
+	// stating. A snapshot every one of whose candidates has gone stale burns 8
+	// of them per claim before conceding, so ~64 consecutive calls report
+	// ErrContention before the snapshot empties and a refill replaces it. That
+	// is self-healing, not a stall: every one of those calls is retryable, the
+	// funder retries them, and the refill that ends the run REPLACES the
+	// snapshot unconditionally — including with an empty result, which is the
+	// P2-6a fix (see claim_cache.go's refillAndPull) and the reason a poisoned
+	// bucket can no longer wedge forever.
+	//
+	// Raising casBudget toward the refill size would trade that burst of cheap
+	// retryable answers for one long claim call holding the caller's latency
+	// budget while it walks the same corpses; lowering it would concede before
+	// ordinary two- or three-way contention resolves. The gap is the point.
 	casBudget = 8
 )
 
@@ -30,21 +45,6 @@ const (
 	keepPins     = false
 	overridePins = true
 )
-
-// validateClaim rejects underspecified claim inputs (programmer errors).
-func validateClaim(sc utxostore.Scope, reservation string) error {
-	switch {
-	case reservation == "":
-		return errors.New("aerostore: reservation must be non-empty")
-	case sc.UserID <= 0:
-		return errors.New("aerostore: scope user id must be positive")
-	case sc.Basket == "":
-		return errors.New("aerostore: scope basket must be non-empty")
-	case !sc.Tier.Valid():
-		return fmt.Errorf("aerostore: invalid scope tier %d", sc.Tier)
-	}
-	return nil
-}
 
 // candidate is one row returned by a claimKey index probe.
 type candidate struct {
@@ -190,7 +190,7 @@ func (s *Store) ClaimSmallestSufficient(ctx context.Context, sc utxostore.Scope,
 	if s.closed.Load() {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 
@@ -257,7 +257,7 @@ func (s *Store) ClaimLargestInsufficient(ctx context.Context, sc utxostore.Scope
 	if s.closed.Load() {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if limit <= 0 || capSats == 0 {
@@ -322,7 +322,7 @@ func (s *Store) ClaimExact(ctx context.Context, sc utxostore.Scope, reservation 
 	if s.closed.Load() {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if count <= 0 {
@@ -375,19 +375,6 @@ func (s *Store) ClaimExact(ctx context.Context, sc utxostore.Scope, reservation 
 	return claimed, nil
 }
 
-// validateReserveOutpoints rejects underspecified outpoint-reservation inputs.
-// An empty op list is a programmer error, not a degenerate success: the caller
-// asked for an all-or-nothing hold and named nothing to hold.
-func validateReserveOutpoints(reservation string, ops []utxostore.Outpoint) error {
-	switch {
-	case reservation == "":
-		return errors.New("aerostore: reservation must be non-empty")
-	case len(ops) == 0:
-		return errors.New("aerostore: ops must be non-empty")
-	}
-	return nil
-}
-
 // ReserveOutpoints implements [utxostore.Store]: an all-or-nothing hold on the
 // exact rows the caller named, so provided inputs get the same exclusivity a
 // funded coin gets. Each op is one guarded CAS, the same single-record
@@ -422,7 +409,7 @@ func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation st
 	if s.closed.Load() {
 		return errClosed
 	}
-	if err := validateReserveOutpoints(reservation, ops); err != nil {
+	if err := utxostore.ValidateReserveOutpoints(reservation, ops); err != nil {
 		return err
 	}
 
@@ -450,7 +437,7 @@ func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation st
 	}
 	if len(itemErrs) > 0 {
 		s.undoReserveOutpoints(won, reservation)
-		return joinBatch(itemErrs)
+		return utxostore.JoinBatch(itemErrs)
 	}
 	return nil
 }
@@ -621,8 +608,8 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 	if s.closed.Load() {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("aerostore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	// Probe the resBy index; restrict to this user and to unspent, unpinned
@@ -689,26 +676,35 @@ func (s *Store) ReleaseReservation(ctx context.Context, userID int64, reservatio
 //
 // A deployment that needs this atomic rather than bounded wants a SQL backend,
 // where one UPDATE pins the whole membership or none of it.
-func (s *Store) Pin(_ context.Context, userID int64, reservation string) (int, error) {
-	return s.setPinned(userID, reservation, true)
+func (s *Store) Pin(ctx context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(ctx, userID, reservation, true)
 }
 
 // Unpin implements [utxostore.Store]: removes the pinned bin from every unspent
 // row held by (userID, reservation), leaving them RESERVED. Idempotent.
-func (s *Store) Unpin(_ context.Context, userID int64, reservation string) (int, error) {
-	return s.setPinned(userID, reservation, false)
+func (s *Store) Unpin(ctx context.Context, userID int64, reservation string) (int, error) {
+	return s.setPinned(ctx, userID, reservation, false)
 }
 
 // setPinned drives Pin/Unpin: a resBy index probe for the reservation's live
 // membership, then one guarded CAS per record. Claimability is deliberately
 // untouched — a pinned coin is reserved, so its claimKey is already absent and
 // the claim cache has nothing to learn (no noteClaimable call here).
-func (s *Store) setPinned(userID int64, reservation string, pinned bool) (int, error) {
+//
+// Both halves honor ctx, exactly as [Store.ReleaseReservation]'s do: the
+// membership scan through [Store.streamQuery] (which also guarantees the
+// recordset is closed, so an early exit cannot strand the client's producer
+// goroutines), and the per-row CAS loop through a per-iteration check. Stopping
+// early is safe in either direction — pinning and unpinning are idempotent and
+// per row, so the count returned with the error is exactly what changed, and
+// the caller's retry (Pin's own, or the outbox drain's for Unpin) finishes the
+// rest.
+func (s *Store) setPinned(ctx context.Context, userID int64, reservation string, pinned bool) (int, error) {
 	if s.closed.Load() {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("aerostore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	verb := pinVerb(pinned)
@@ -728,25 +724,24 @@ func (s *Store) setPinned(userID int64, reservation string, pinned bool) (int, e
 		as.ExpNot(as.ExpBinExists(binSpentBy)),
 		pinState,
 	)
-	rs, err := s.client.Query(qp, stmt)
-	if err != nil {
-		return 0, fmt.Errorf("aerostore: %s query: %w", verb, err)
-	}
 
 	var ops []utxostore.Outpoint
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return 0, fmt.Errorf("aerostore: %s query result: %w", verb, res.Err)
-		}
-		u, cerr := recordToUTXO(res.Record)
+	if err := s.streamQuery(ctx, qp, stmt, func(rec *as.Record) error {
+		u, cerr := recordToUTXO(rec)
 		if cerr != nil {
-			return 0, cerr
+			return cerr
 		}
 		ops = append(ops, u.Outpoint)
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("aerostore: %s query: %w", verb, err)
 	}
 
 	changed := 0
 	for _, op := range ops {
+		if err := ctx.Err(); err != nil {
+			return changed, err
+		}
 		ok, perr := s.setPinnedRow(op, reservation, pinned)
 		if perr != nil {
 			return changed, perr
@@ -809,8 +804,8 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 	if s.closed.Load() {
 		return errClosed
 	}
-	if reservation == "" {
-		return errors.New("aerostore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return err
 	}
 	for _, op := range ops {
 		rec, found, err := s.getRecord(op)

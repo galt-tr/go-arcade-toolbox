@@ -290,4 +290,10 @@
 //     query, while reserving zero named inputs means the caller lost its
 //     input list — silently succeeding would hand it an all-or-nothing
 //     guarantee over nothing at all.
+//   - Both checks, and the rest of the input contract (mint, spend,
+//     RemoveByMintTx), are implemented ONCE in validate.go and called by every
+//     backend, so no store can drift into answering a malformed call
+//     differently from its peers. [JoinBatch] and [BatchCountErr] are the
+//     matching pair for the batch-error shape. An out-of-tree backend
+//     registered through [Register] should use them too.
 package utxostore

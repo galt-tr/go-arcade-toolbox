@@ -792,22 +792,3 @@ func (s *Store) fireRestoreRaceHook() {
 func removeBinOp(name string) *as.Operation {
 	return as.PutOp(as.NewBin(name, nil))
 }
-
-// joinBatch wraps per-item typed errors under the ErrBatch sentinel, or returns
-// nil when there are none (for Remove/Freeze/Unfreeze, whose ops carry no Err
-// slot). errors.Is finds ErrBatch; errors.As finds the item errors.
-func joinBatch(itemErrs []error) error {
-	if len(itemErrs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %w", utxostore.ErrBatch, errors.Join(itemErrs...))
-}
-
-// batchCountErr returns the top-level ErrBatch sentinel (with a count) when any
-// item in a Mint/Spend batch failed, or nil.
-func batchCountErr(failed, total int) error {
-	if failed == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, total)
-}

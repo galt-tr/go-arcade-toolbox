@@ -99,21 +99,13 @@ func (s *Store) Mint(_ context.Context, mints []*utxostore.Mint) error {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, len(mints))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(mints))
 }
 
 // mintOne creates a single coin; the caller holds the mutex.
 func (s *Store) mintOne(m *utxostore.Mint) error {
-	switch {
-	case m.UserID <= 0:
-		return fmt.Errorf("memstore: mint %s: user id must be positive", m.Outpoint)
-	case m.Basket == "":
-		return fmt.Errorf("memstore: mint %s: basket must be non-empty", m.Outpoint)
-	case !m.Tier.Valid():
-		return fmt.Errorf("memstore: mint %s: invalid tier %d", m.Outpoint, m.Tier)
+	if err := utxostore.ValidateMint(m); err != nil {
+		return err
 	}
 
 	if existing, ok := s.rows[m.Outpoint]; ok {
@@ -190,7 +182,7 @@ func (s *Store) Remove(_ context.Context, ops []utxostore.Outpoint, force bool) 
 		}
 		delete(s.rows, op)
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // claimable reports whether the row can be handed to a claim in scope sc;
@@ -199,21 +191,6 @@ func claimable(r *row, sc utxostore.Scope) bool {
 	u := &r.utxo
 	return u.UserID == sc.UserID && u.Basket == sc.Basket && u.Tier == sc.Tier &&
 		u.ReservedBy == "" && u.SpentBy == nil && !u.Frozen
-}
-
-// validateClaim rejects underspecified claim inputs; see the interface doc.
-func validateClaim(sc utxostore.Scope, reservation string) error {
-	switch {
-	case reservation == "":
-		return errors.New("memstore: reservation must be non-empty")
-	case sc.UserID <= 0:
-		return errors.New("memstore: scope user id must be positive")
-	case sc.Basket == "":
-		return errors.New("memstore: scope basket must be non-empty")
-	case !sc.Tier.Valid():
-		return fmt.Errorf("memstore: invalid scope tier %d", sc.Tier)
-	}
-	return nil
 }
 
 // reserve marks r as held by reservation and returns a copy; the caller
@@ -233,7 +210,7 @@ func (s *Store) ClaimSmallestSufficient(_ context.Context, sc utxostore.Scope, r
 	if s.closed {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 
@@ -264,7 +241,7 @@ func (s *Store) ClaimLargestInsufficient(_ context.Context, sc utxostore.Scope, 
 	if s.closed {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -316,7 +293,7 @@ func (s *Store) ClaimExact(_ context.Context, sc utxostore.Scope, reservation st
 	if s.closed {
 		return nil, errClosed
 	}
-	if err := validateClaim(sc, reservation); err != nil {
+	if err := utxostore.ValidateClaim(sc, reservation); err != nil {
 		return nil, err
 	}
 	if count <= 0 {
@@ -349,7 +326,7 @@ func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation st
 	if s.closed {
 		return errClosed
 	}
-	if err := validateReserveOutpoints(reservation, ops); err != nil {
+	if err := utxostore.ValidateReserveOutpoints(reservation, ops); err != nil {
 		return err
 	}
 
@@ -381,7 +358,7 @@ func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation st
 		}
 	}
 	if len(itemErrs) > 0 {
-		return joinBatch(itemErrs) // nothing mutated: all-or-nothing
+		return utxostore.JoinBatch(itemErrs) // nothing mutated: all-or-nothing
 	}
 
 	// ONE timestamp for the whole set: the named inputs were reserved by a
@@ -390,17 +367,6 @@ func (s *Store) ReserveOutpoints(_ context.Context, userID int64, reservation st
 	for _, r := range toStamp {
 		r.utxo.ReservedBy = reservation
 		r.utxo.ReservedAt = now
-	}
-	return nil
-}
-
-// validateReserveOutpoints rejects underspecified inputs; see the interface doc.
-func validateReserveOutpoints(reservation string, ops []utxostore.Outpoint) error {
-	switch {
-	case reservation == "":
-		return errors.New("memstore: reservation must be non-empty")
-	case len(ops) == 0:
-		return errors.New("memstore: ops must be non-empty")
 	}
 	return nil
 }
@@ -436,8 +402,8 @@ func (s *Store) ReleaseReservation(_ context.Context, userID int64, reservation 
 	if s.closed {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("memstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	released := 0
@@ -471,8 +437,8 @@ func (s *Store) setPinned(userID int64, reservation string, pinned bool) (int, e
 	if s.closed {
 		return 0, errClosed
 	}
-	if reservation == "" {
-		return 0, errors.New("memstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return 0, err
 	}
 
 	changed := 0
@@ -495,8 +461,8 @@ func (s *Store) ReleaseOutpoints(_ context.Context, reservation string, ops []ut
 	if s.closed {
 		return errClosed
 	}
-	if reservation == "" {
-		return errors.New("memstore: reservation must be non-empty")
+	if err := utxostore.ValidateReservation(reservation); err != nil {
+		return err
 	}
 
 	for _, op := range ops {
@@ -529,16 +495,13 @@ func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp, force bool
 			failed++
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%w: %d of %d items failed", utxostore.ErrBatch, failed, len(spends))
-	}
-	return nil
+	return utxostore.BatchCountErr(failed, len(spends))
 }
 
 // spendOne applies a single spend transition; the caller holds the mutex.
 func (s *Store) spendOne(sp *utxostore.SpendOp, force bool) error {
-	if sp.Reservation == "" {
-		return fmt.Errorf("memstore: spend %s: reservation must be non-empty", sp.Outpoint)
+	if err := utxostore.ValidateSpend(sp); err != nil {
+		return err
 	}
 
 	r, ok := s.rows[sp.Outpoint]
@@ -647,10 +610,8 @@ func (s *Store) RemoveByMintTx(_ context.Context, mintTxID chainhash.Hash, ops [
 	if s.closed {
 		return report, errClosed
 	}
-	for _, op := range ops {
-		if op.TxID != mintTxID {
-			return report, fmt.Errorf("memstore: outpoint %s is not an output of mint tx %s", op, mintTxID.String())
-		}
+	if err := utxostore.ValidateMintOutpoints(mintTxID, ops); err != nil {
+		return report, err
 	}
 
 	reservedRefs := make(map[string]*utxostore.ReservationRef) // by token
@@ -725,7 +686,7 @@ func (s *Store) setFrozen(ops []utxostore.Outpoint, frozen bool) error {
 		}
 		r.utxo.Frozen = frozen
 	}
-	return joinBatch(itemErrs)
+	return utxostore.JoinBatch(itemErrs)
 }
 
 // Balance implements [utxostore.Store].
@@ -861,14 +822,4 @@ func copyUTXO(u *utxostore.UTXO) *utxostore.UTXO {
 		c.SpentBy = &spentBy
 	}
 	return &c
-}
-
-// joinBatch wraps per-item errors under the ErrBatch sentinel, or returns
-// nil when there are none. errors.Is finds ErrBatch; errors.As finds the
-// item errors.
-func joinBatch(itemErrs []error) error {
-	if len(itemErrs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("%w: %w", utxostore.ErrBatch, errors.Join(itemErrs...))
 }

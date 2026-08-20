@@ -119,6 +119,8 @@ func TestAbortAction_LosesToAnInFlightSend(t *testing.T) {
 	})
 	require.Error(t, err, "a claimed transaction may already be on the wire; it is not abortable")
 	assert.ErrorIs(t, err, wdk.ErrNotAbortableAction)
+	assert.ErrorIs(t, err, ErrAbortLostToSend,
+		"and narrows it: the caller must NOT rebuild, because these very inputs are in flight")
 
 	assert.Equal(t, wdk.ProvenTxStatusSending, h.knownTx(t, txid).Status,
 		"the live claim is untouched")
@@ -137,6 +139,34 @@ func TestAbortAction_LosesToAnInFlightSend(t *testing.T) {
 	n, err := h.meta.Outbox().CountPending(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, n, "a refused abort records no release intent either")
+}
+
+// TestAbortAction_OrdinaryRefusalIsNotLostToSend pins the other side of the
+// distinction the exported sentinels draw. Only losing to a live broadcaster
+// carries [ErrAbortLostToSend]; a refusal that merely reflects the action's
+// state must NOT, because the two call for opposite responses — "the inputs are
+// in flight, do not rebuild" against "this action already settled". A sentinel
+// that attached to both would be worse than none, since a caller would read the
+// stronger warning into the ordinary case.
+func TestAbortAction_OrdinaryRefusalIsNotLostToSend(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	res, signed, _ := h.createAndSign(t, 0x54, 100_000, 40_000)
+
+	_, err := h.processDelayed(t, res, signed)
+	require.NoError(t, err)
+
+	args := wdk.AbortActionArgs{Reference: primitives.Base64String(res.Reference)}
+	abr, err := h.p.AbortAction(ctx, h.auth, args)
+	require.NoError(t, err)
+	require.True(t, abr.Aborted)
+
+	// 'aborted' is not an abortable status, so the second call is refused by the
+	// wallet-side gate — no broadcaster involved.
+	_, err = h.p.AbortAction(ctx, h.auth, args)
+	require.Error(t, err, "an already-aborted action is not abortable again")
+	assert.ErrorIs(t, err, wdk.ErrNotAbortableAction, "it is the generic BRC-100 refusal")
+	assert.NotErrorIs(t, err, ErrAbortLostToSend, "and nothing is in flight to have lost to")
 }
 
 // TestAbortViaOutbox_FenceSurvivesAFailedUtxoHalf is P0-5. In Mode B the fence

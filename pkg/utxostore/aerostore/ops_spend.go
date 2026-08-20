@@ -17,6 +17,15 @@ import (
 // is an idempotent success. With force it records a spend the network has
 // already accepted, dropping the reservation and freeze conjuncts from the CAS
 // (see [utxostore.Store.Spend]).
+//
+// Refusals are per item under [utxostore.ErrBatch]. A row that will not hold
+// still across the bounded re-CAS budget exits differently per mode, and this
+// backend is the reason [utxostore.ErrContention]'s doc says not to assume
+// parity: FACT mode reports ErrContention (transient — re-drive the spend, and
+// a caller recording an accepted broadcast must not read it as a refused coin),
+// while GUARDED mode reports [utxostore.ReservedError] naming the current
+// holder, because under a guard a token mismatch is a refusal it can state.
+// See [Store.spendFallbackError].
 func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp, force bool) error {
 	if s.closed.Load() {
 		return errClosed
@@ -28,12 +37,12 @@ func (s *Store) Spend(_ context.Context, spends []*utxostore.SpendOp, force bool
 			failed++
 		}
 	}
-	return batchCountErr(failed, len(spends))
+	return utxostore.BatchCountErr(failed, len(spends))
 }
 
 func (s *Store) spendOne(sp *utxostore.SpendOp, force bool) error {
-	if sp.Reservation == "" {
-		return fmt.Errorf("aerostore: spend %s: reservation must be non-empty", sp.Outpoint)
+	if err := utxostore.ValidateSpend(sp); err != nil {
+		return err
 	}
 	key, err := s.keyFor(sp.Outpoint)
 	if err != nil {
