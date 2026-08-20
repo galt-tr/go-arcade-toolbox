@@ -4,6 +4,7 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -299,4 +300,133 @@ func hybridTxStatus(t *testing.T, p *storage.Provider, auth wdk.AuthID, referenc
 	}
 	require.FailNow(t, "no transaction found for reference", reference)
 	return ""
+}
+
+// TestHybrid_MinedAfterAbort_RepairsTheCoins runs the MINED repair on the split
+// Aerospike (inventory) + PostgreSQL (metadata) hybrid, which is where its two
+// riskiest assumptions actually have to hold.
+//
+// Both are backend-shaped, and neither is exercised by the hermetic memstore
+// tests. The repair's fact-mode Spend is the ONLY spend in the codebase issued
+// against coins whose reservation has already been released, and aerostore
+// reaches its ErrContention exit from fact-mode Spend specifically (sqlstore
+// reaches it from both modes) — so the contract's "retryable, not a refused
+// coin" clause is load-bearing here and the re-drive below is part of the
+// assertion, not a flake guard. And the repair spans BOTH stores while
+// metastore.Do covers only one of them, so its idempotency is what makes a
+// partial application converge rather than a transaction rollback.
+//
+// The scenario is the aborted door: a delayed action is aborted (coins unpinned
+// and handed back, change removed), and the client broadcasts the signed bytes
+// it still holds out of band. The network mines them, and the wallet is left
+// offering coins that are consumed on chain.
+func TestHybrid_MinedAfterAbort_RepairsTheCoins(t *testing.T) {
+	ctx := context.Background()
+	pg := testenv.StartPostgres(t)
+	aero := testenv.StartAerospike(t)
+
+	p, meta, utxo := newHybridStatusStores(t, pg, aero, &conformance.FakeHeaders{})
+	_, err := p.Migrate(ctx, "conformance", "conformance-identity-key")
+	require.NoError(t, err)
+
+	identityKey := conformance.NewIdentityKey(t)
+	resp, err := p.FindOrInsertUser(ctx, identityKey)
+	require.NoError(t, err)
+	uid := resp.User.UserID
+	auth := wdk.AuthID{IdentityKey: identityKey, UserID: &uid}
+
+	atomic, fundTxID := conformance.BuildMinedAtomicBEEF(t, 0x53, 900_100, 100_000)
+	_, err = p.InternalizeAction(ctx, auth, wdk.InternalizeActionArgs{
+		Tx:      primitives.ExplicitByteArray(atomic),
+		Outputs: []*wdk.InternalizeOutput{conformance.WalletPaymentOutput(0, conformance.NewIdentityKey(t))},
+	})
+	require.NoError(t, err)
+	fundOp := utxostore.Outpoint{TxID: mustHash(t, fundTxID), Vout: 0}
+
+	// Delayed, so the bytes are stored and the coins pinned but nothing is
+	// broadcast — the state an abort is allowed to kill.
+	res, err := p.CreateAction(ctx, auth, conformance.PaymentArgs(40_000))
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Inputs)
+	signed := conformance.BuildSignedTx(t, res)
+	txid := signed.TxID().String()
+	ref := res.Reference
+	txidHex := primitives.TXIDHexString(txid)
+	_, err = p.ProcessAction(ctx, auth, wdk.ProcessActionArgs{
+		IsNewTx:   true,
+		IsDelayed: true,
+		Reference: &ref,
+		TxID:      &txidHex,
+		RawTx:     primitives.ExplicitByteArray(signed.Bytes()),
+	})
+	require.NoError(t, err)
+	_, changeVout := conformance.ChangeOutpoint(t, res, txid)
+	changeOp := utxostore.Outpoint{TxID: mustHash(t, txid), Vout: changeVout}
+
+	abr, err := p.AbortAction(ctx, auth, wdk.AbortActionArgs{Reference: primitives.Base64String(ref)})
+	require.NoError(t, err)
+	require.True(t, abr.Aborted)
+	require.True(t, hybridSpendable(t, p, auth, fundTxID, 0),
+		"the abort never gave the funding coin back, so the repair has nothing to take away")
+	_, err = utxo.Get(ctx, changeOp)
+	require.ErrorIs(t, err, &utxostore.NotFoundError{}, "the abort removes the change it minted")
+
+	// The bytes were broadcast out of band and mined.
+	minedRec, _ := minedRecord(t, txid, 900_600)
+	hybridApplyWithRedrive(t, p, minedRec)
+
+	require.False(t, hybridSpendable(t, p, auth, fundTxID, 0),
+		"an aborted transaction was mined and the hybrid wallet still offers its "+
+			"input; the next action that claims it double spends against a settled payment")
+	_, err = utxo.Get(ctx, fundOp)
+	require.ErrorIs(t, err, &utxostore.NotFoundError{},
+		"the mined transaction's input was never fact-spent and pruned from the Aerospike inventory")
+
+	changeU, err := utxo.Get(ctx, changeOp)
+	require.NoError(t, err, "the mined transaction's change was not re-minted into the Aerospike inventory")
+	require.Equal(t, utxostore.TierMined, changeU.Tier, "re-minted change must land at TierMined")
+	require.True(t, hybridSpendable(t, p, auth, txid, changeVout), "re-minted change must be spendable")
+
+	require.Equal(t, wdk.TxUpdateStatusMined, hybridTxStatus(t, p, auth, ref),
+		"the transaction row stayed aborted while its known tx completed — the "+
+			"silent completion the repair replaces")
+	kt, found, err := meta.KnownTx().FindByTxID(ctx, txid)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, wdk.ProvenTxStatusCompleted, kt.Status)
+	require.NotEmpty(t, kt.MerklePath, "the verified BUMP is stored")
+
+	// Idempotency across the split stores: the re-apply lands on a completed row
+	// and must change nothing.
+	require.NoError(t, p.ApplyStatusUpdate(ctx, minedRec))
+	changeReU, err := utxo.Get(ctx, changeOp)
+	require.NoError(t, err)
+	require.Equal(t, utxostore.TierMined, changeReU.Tier)
+	_, err = utxo.Get(ctx, fundOp)
+	require.ErrorIs(t, err, &utxostore.NotFoundError{})
+}
+
+// hybridApplyWithRedrive applies one status record, re-driving on
+// [utxostore.ErrContention].
+//
+// This is the documented caller obligation, not a retry-until-green: aerostore
+// raises ErrContention from fact-mode Spend when a row will not hold still
+// across its bounded CAS budget, and the contract is explicit that it means
+// "ask me again" rather than a verdict on the coin. A caller that read it as a
+// refusal would abandon the repair and leave the coin claimable, so the
+// re-drive is the behaviour under test. Any OTHER error fails immediately.
+func hybridApplyWithRedrive(t *testing.T, p *storage.Provider, rec arcade.TxRecord) {
+	t.Helper()
+	var err error
+	for range 5 {
+		err = p.ApplyStatusUpdate(context.Background(), rec)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, utxostore.ErrContention) {
+			break
+		}
+		t.Logf("repair hit contention on %s; re-driving per the fact-mode contract", rec.TxID)
+	}
+	require.NoError(t, err)
 }

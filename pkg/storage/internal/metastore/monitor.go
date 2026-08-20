@@ -372,6 +372,69 @@ func (r KnownTxRepo) CountMissingArcadeStatus(ctx context.Context, statuses ...w
 	return n, nil
 }
 
+// deadTransactionStatuses are the wallet-transaction statuses that say the
+// wallet has WRITTEN THE TRANSACTION OFF and acted on that decision by giving
+// its funding coins back: 'aborted' (fenced before broadcast, reservation
+// released) and 'failed' (the reject reconciler's verified release, or its
+// stuck escalation). They are the transactions side of the mined-repair
+// divergence — see [KnownTxRepo.FindMinedOnDeadTransactions].
+var deadTransactionStatuses = []wdk.TxStatus{
+	wdk.TxStatusAborted,
+	wdk.TxStatusFailed,
+}
+
+// FindMinedOnDeadTransactions returns known txs on which the wallet and the
+// network flatly disagree: arcade reports the transaction ON CHAIN (its
+// arcade_status is one of arcadeStatuses — MINED / IMMUTABLE) while the wallet
+// transaction it belongs to is written off (aborted or failed). Oldest change
+// first, up to limit.
+//
+// This is the mined-repair BACKFILL work list, and it is its own query because
+// no other work list can reach these rows. Every poll finder is keyed on a
+// NON-TERMINAL known-tx status; a row here is either terminal ('completed' —
+// the pre-repair silent completion, where SetProof flipped the known tx while
+// its transaction row stayed aborted) or fenced ('aborted' / 'invalidTx' /
+// 'doubleSpend' / 'stuck' — a proof whose verification deferred). Nothing
+// re-drives either.
+//
+// The predicate is deliberately driven from the TRANSACTIONS side. Written-off
+// transactions are the rare population and carry their own partial index (see
+// the 00008 migration); MINED, by contrast, is the majority arcade_status in a
+// healthy deployment, so leading with it would scan almost the whole table
+// every tick. The set that survives both halves — mined AND written off — is
+// the divergence itself, which in a healthy deployment is empty.
+//
+// It SELF-QUIESCES: a successful repair moves the transaction row to
+// 'completed', which drops the row out of the subquery for good.
+//
+// Ordering is [pollOrder], and the caller MUST record the attempt via
+// [KnownTxRepo.MarkPolled] for every row it takes — the same contract
+// [FindByStatusOlderThan] carries, for the same reason. Several of the backfill's
+// outcomes write nothing to the row at all (arcade has forgotten the
+// transaction, or has revised its verdict away from mined), so without the
+// attempt stamp those rows keep their place at the head of every page and hide
+// the whole backlog behind themselves.
+func (r KnownTxRepo) FindMinedOnDeadTransactions(ctx context.Context, arcadeStatuses []string, limit int) ([]KnownTx, error) {
+	if len(arcadeStatuses) == 0 {
+		return nil, nil
+	}
+	clause, pageArgs := r.s.limitOffsetClause(limit, 0)
+	q := r.s.rebind("SELECT " + knownTxCols + " FROM known_txs " +
+		"WHERE arcade_status IN (" + inPlaceholders(len(arcadeStatuses)) + ") " +
+		"AND txid IN (SELECT txid FROM transactions WHERE txid IS NOT NULL " +
+		"AND status IN (" + inPlaceholders(len(deadTransactionStatuses)) + ")) " +
+		pollOrder + clause)
+	args := make([]any, 0, len(arcadeStatuses)+len(deadTransactionStatuses)+len(pageArgs))
+	for _, st := range arcadeStatuses {
+		args = append(args, st)
+	}
+	for _, st := range deadTransactionStatuses {
+		args = append(args, string(st))
+	}
+	args = append(args, pageArgs...)
+	return r.queryList(ctx, q, args)
+}
+
 // FindProvenAtOrAbove returns completed (proven) known txs whose block_height is
 // at or above height, lowest first, up to limit — the reorg-demote work list.
 func (r KnownTxRepo) FindProvenAtOrAbove(ctx context.Context, height uint32, limit int) ([]KnownTx, error) {

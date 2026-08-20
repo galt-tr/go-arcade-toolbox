@@ -13,6 +13,9 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -85,11 +88,18 @@ func withExtraInfo(s string) func(*arcade.TxRecord) {
 // --- harness ---------------------------------------------------------------
 
 type reconStack struct {
-	t        *testing.T
-	p        *storage.Provider
-	meta     *metastore.Store
-	utxo     utxostore.Store
-	oracle   *fakeOracle
+	t      *testing.T
+	p      *storage.Provider
+	meta   *metastore.Store
+	utxo   utxostore.Store
+	oracle *fakeOracle
+	// hdrs is the harness's header source: a test registers the merkle root it
+	// wants accepted at a height (see [reconStack.minedRec]).
+	hdrs *fakeHeaders
+	// logs captures everything the provider logs, so a test can assert on an
+	// ALERT — an outcome whose only product is a log line (the materialized
+	// double spend the mined repair cannot undo).
+	logs     *logging.TestWriter
 	userID   int
 	refSeq   int
 	clock    *testClock
@@ -100,7 +110,9 @@ type reconStack struct {
 func newReconStack(t *testing.T) *reconStack {
 	t.Helper()
 	ctx := context.Background()
-	logger := logging.NewTestLogger(t)
+	logs := &logging.TestWriter{}
+	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, logs),
+		&slog.HandlerOptions{Level: slog.LevelDebug}))
 	clock := &testClock{t: time.Now()}
 
 	meta, err := metastore.OpenSQLite(ctx, t.TempDir()+"/meta.db", metastore.WithClock(clock.Now))
@@ -111,7 +123,11 @@ func newReconStack(t *testing.T) *reconStack {
 	fnd := funder.New(logger, utxo, defs.DefaultFeeModel())
 	oracle := &fakeOracle{}
 
-	h := &reconStack{t: t, meta: meta, utxo: utxo, oracle: oracle, clock: clock, scripts: map[string]arcade.TxRecord{}}
+	hdrs := newFakeHeaders()
+	h := &reconStack{
+		t: t, meta: meta, utxo: utxo, oracle: oracle, hdrs: hdrs, logs: logs,
+		clock: clock, scripts: map[string]arcade.TxRecord{},
+	}
 
 	// Scriptable GetTx: return the registered record for a txid, else not-found.
 	oracle.getTx = func(_ context.Context, id string) (*arcade.TxRecord, error) {
@@ -126,7 +142,7 @@ func newReconStack(t *testing.T) *reconStack {
 	}
 
 	p, err := storage.New(
-		logger, meta, utxo, fnd, oracle, newFakeHeaders(),
+		logger, meta, utxo, fnd, oracle, hdrs,
 		storage.WithScriptsVerifier(stubScripts{}),
 		storage.WithNetwork(defs.NetworkTestnet),
 		storage.WithStorageName("recon-test"),

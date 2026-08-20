@@ -960,6 +960,17 @@ func (p *Provider) commitRejected(ctx context.Context, userID int, txid string, 
 //     spend, the one thing this function exists to make visible: it logs at
 //     ERROR and fails hard.
 //   - anything else — hard error.
+//
+// A SECOND COPY OF THIS CLASSIFICATION EXISTS, deliberately:
+// [Provider.factSpendMinedInputs] records the same fact for a mined transaction
+// the wallet had written off. The two agree on every verdict except
+// [utxostore.SpentError], where they are OPPOSITE — fatal here, an alert it
+// continues past there — because here the caller can still refuse and there the
+// transaction is already on chain with nothing left to refuse. That single
+// divergence is why they were not folded into one helper. HARDEN BOTH OR
+// NEITHER: a new verdict, a new tolerance, or a change to the ErrBatch
+// reasoning belongs in both places, and a fix applied to only one of them
+// leaves the other silently wrong.
 func (p *Provider) spendReservedInputs(ctx context.Context, tx *transaction.Transaction, txid, reference string) error {
 	// Fact mode still refuses an empty reservation per item, in every backend:
 	// it is a programmer error, not a row state. Every caller resolves the

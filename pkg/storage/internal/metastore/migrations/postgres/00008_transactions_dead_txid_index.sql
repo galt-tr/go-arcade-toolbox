@@ -1,0 +1,56 @@
+-- +goose Up
+-- The mined-repair backfill (KnownTxRepo.FindMinedOnDeadTransactions) asks one
+-- question on every proof-poll tick: which transactions has the wallet WRITTEN
+-- OFF while arcade says they are on chain? Its subquery is
+--
+--   SELECT txid FROM transactions WHERE txid IS NOT NULL
+--    AND status IN ('aborted', 'failed')
+--
+-- and no existing index answers it. idx_transactions_user_status leads with
+-- user_id, so a status-only predicate cannot seek on it; idx_transactions_txid
+-- is partial on `txid IS NOT NULL` but carries no status; and
+-- idx_transactions_abandoned covers the other two statuses ('unsigned',
+-- 'nosend') and orders by created_at. Without this the healer degrades to a
+-- sequential scan of the transactions table on a recurring task — the exact
+-- shape of cost that 00006 was written to remove elsewhere.
+--
+-- This index is TINY by construction. It covers only written-off transactions
+-- that reached signing, which is the rare population: aborts and verified
+-- releases are exceptional events, while the healthy path (completed /
+-- unproven) is excluded by the predicate. In a deployment with no failures it
+-- holds nothing at all.
+--
+-- Indexing `txid` rather than `status` is what makes the subquery INDEX-ONLY:
+-- the status is already pinned by the partial predicate, so txid is the only
+-- column read, and the outer query then probes known_txs by primary key.
+--
+-- Write cost is negligible for the same reason the index is small: `status` is
+-- rewritten on every lifecycle transition, but a row only ENTERS this index
+-- when it lands on 'aborted' or 'failed' — both terminal, so a row is inserted
+-- at most once and never updated in place afterwards.
+--
+-- NOTE ON DEPLOYMENT, matching 00004 and 00006. This is a plain (NOT
+-- CONCURRENTLY) CREATE INDEX and it runs inside goose's transaction, so it takes
+-- a write lock on `transactions` for the duration of the build. The window is
+-- far shorter than 00006's — that one indexed every row of the widest table in
+-- the schema, this one indexes only written-off transactions, a population
+-- measured in failures rather than in throughput — so on any healthy deployment
+-- it is milliseconds, and a fresh database pays nothing. It cannot be
+-- CONCURRENTLY here regardless: goose wraps the migration, and CREATE INDEX
+-- CONCURRENTLY cannot run inside a transaction block.
+--
+-- Escape hatch for a deployment whose failure history is large enough to make
+-- even that window unacceptable: build it by hand out of band, then let goose
+-- record the version over the existing object.
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_transactions_dead_txid
+--       ON transactions (txid)
+--       WHERE txid IS NOT NULL AND status IN ('aborted', 'failed');
+--
+-- (Add IF NOT EXISTS to the statement below when doing that, or apply this
+-- version with `goose up-to` after the manual build has completed.)
+CREATE INDEX idx_transactions_dead_txid ON transactions (txid)
+    WHERE txid IS NOT NULL AND status IN ('aborted', 'failed');
+
+-- +goose Down
+DROP INDEX IF EXISTS idx_transactions_dead_txid;

@@ -142,6 +142,85 @@ func isSeenFenced(st wdk.ProvenTxReqStatus) bool {
 	return false
 }
 
+// minedRepairStatuses are the known-tx statuses on which a header-verified
+// MINED/IMMUTABLE proof must be REPAIRED ([Provider.applyMinedRepair]) rather
+// than either refused or applied normally. They are the four states in which
+// the wallet has DECIDED THE TRANSACTION IS DEAD AND ACTED ON IT — the funding
+// coins were released, or are held pending an operator — so a proof arriving
+// afterwards is not a status update, it is the discovery that the wallet was
+// wrong about coins it has already re-lent.
+//
+// This is audit P1-6 and the aborted door C5's probe found, in one set, because
+// they are one hazard reached through two different guards:
+//
+//   - 'invalidTx' / 'doubleSpend' — the reject reconciler's verified release
+//     already handed the inputs back. These are [wdk.ProvenTxReqStatus.IsTerminalFailure],
+//     so the terminal-wallet-state guard swallowed the MINED and the false
+//     positive could never be repaired.
+//   - 'stuck' — the max-quarantine escalation. Its inputs are deliberately
+//     never auto-released, so nothing is loose; but the transaction really is
+//     on chain, and completing it retires an operator escalation that has been
+//     answered.
+//   - 'aborted' — the wallet fenced the bytes and released the reservation
+//     before any broadcast, and the client broadcast them out of band anyway.
+//     'aborted' is NOT a terminal failure, so no guard saw it at all: the MINED
+//     walked into the ordinary apply, whose SetProof silently completed the
+//     known tx with no fact-spend and no change re-mint. That is why this set
+//     is written out explicitly instead of being derived from IsTerminalFailure.
+//
+// 'suspectFailed' is deliberately ABSENT, and for the same reason it is absent
+// from [seenFencedStatuses]: nothing has been released yet, so there is nothing
+// to repair, and the reconciler's false-positive branch
+// ([Provider.handleRecovered]) recovers such a row by routing it through the
+// ORDINARY apply. Adding it here would reroute every recovered suspect.
+var minedRepairStatuses = []wdk.ProvenTxReqStatus{
+	wdk.ProvenTxStatusInvalid,
+	wdk.ProvenTxStatusDoubleSpend,
+	metastore.KnownTxStatusStuck,
+	metastore.KnownTxStatusAborted,
+}
+
+// isMinedRepairStatus reports whether a known tx at this status needs the
+// repair apply rather than the ordinary one. See [minedRepairStatuses].
+func isMinedRepairStatus(st wdk.ProvenTxReqStatus) bool {
+	for _, s := range minedRepairStatuses {
+		if st == s {
+			return true
+		}
+	}
+	return false
+}
+
+// isMinedClass reports whether an arcade status asserts the transaction is on
+// chain — the only evidence that may drive a repair. A SEEN-class event on a
+// fenced row keeps its existing treatment (a no-op for the terminal failures, an
+// ERROR-logged divert for 'aborted'/'stuck'): "some node has it in a mempool" is
+// not proof the wallet's decision was wrong, and acting on it would re-spend
+// coins on hearsay.
+func isMinedClass(s arcade.Status) bool {
+	return s == arcade.StatusMined || s == arcade.StatusImmutable
+}
+
+// minedArcadeStatuses is [isMinedClass] as the wire strings the backfill query
+// matches against the persisted arcade_status column.
+var minedArcadeStatuses = []string{string(arcade.StatusMined), string(arcade.StatusImmutable)}
+
+// minedRepairTxStatuses is the transaction-row CAS from-set for the repair
+// apply: [Provider.applyMined]'s set EXTENDED with the two written-off statuses
+// ('failed', 'aborted'). The extension is scoped to this path on purpose — the
+// ordinary mined apply must never resurrect a written-off transaction row,
+// because outside a verified repair there is nothing that has re-established
+// the coins behind it.
+var minedRepairTxStatuses = []wdk.TxStatus{
+	wdk.TxStatusSending,
+	wdk.TxStatusNoSend,
+	wdk.TxStatusUnproven,
+	wdk.TxStatusUnprocessed,
+	wdk.TxStatusCompleted,
+	wdk.TxStatusFailed,
+	wdk.TxStatusAborted,
+}
+
 // logSeenOnFenced reports the irreducible race: the wallet decided this
 // transaction was dead and acted on it, and the network has it anyway.
 //
@@ -195,15 +274,24 @@ func (p *Provider) ApplyStatusUpdate(ctx context.Context, rec arcade.TxRecord) e
 		return nil
 	}
 
+	// The MINED REPAIR exception, evaluated BEFORE the terminal guard because it
+	// is the one case where that guard is the bug: a proof on a written-off row
+	// is not a downgrade, it is the discovery that coins the wallet has already
+	// handed back are consumed on chain. See [minedRepairStatuses].
+	repair := isMinedClass(rec.Status) && isMinedRepairStatus(kt.Status)
+
 	// Terminal wallet-state guard: a proven or terminally-failed tx is never
-	// downgraded by a later event (also makes re-applying MINED a no-op).
-	if kt.Status == wdk.ProvenTxStatusCompleted || kt.Status.IsTerminalFailure() {
+	// downgraded by a later event (also makes re-applying MINED a no-op — the
+	// repair completes the row, so its own re-delivery lands here).
+	if !repair && (kt.Status == wdk.ProvenTxStatusCompleted || kt.Status.IsTerminalFailure()) {
 		return nil
 	}
 
 	// Arcade lattice guard: a frame may only advance the status, never regress
 	// it (RECEIVED after SEEN, SEEN after MINED, …). Idempotent same-status
-	// re-applies are allowed (CanSupersede returns true for prev == s).
+	// re-applies are allowed (CanSupersede returns true for prev == s). It
+	// applies to the repair too, and costs it nothing: MINED may supersede every
+	// status but IMMUTABLE, and IMMUTABLE may supersede everything.
 	var prev arcade.Status
 	if kt.ArcadeStatus != nil {
 		prev = arcade.Status(*kt.ArcadeStatus)
@@ -227,6 +315,10 @@ func (p *Provider) ApplyStatusUpdate(ctx context.Context, rec arcade.TxRecord) e
 		}
 		return p.applySeen(ctx, rec)
 	case arcade.StatusMined, arcade.StatusImmutable:
+		if repair {
+			_, rerr := p.applyMinedRepair(ctx, rec, kt)
+			return rerr
+		}
 		return p.applyMined(ctx, rec)
 	case arcade.StatusRejected, arcade.StatusDoubleSpendAttempted:
 		return p.applyRejected(ctx, rec)
@@ -360,6 +452,398 @@ func (p *Provider) applyMined(ctx context.Context, rec arcade.TxRecord) error {
 		}
 		return nil
 	})
+}
+
+// applyMinedRepair is [Provider.applyMined] for a transaction the wallet had
+// already written off: audit P1-6, and the aborted door beside it.
+//
+// The situation it answers is narrow and dangerous. The wallet decided the
+// transaction was dead — a rejection that survived two verified reconciler
+// passes, an abort, a quarantine escalation — and ACTED on that decision, which
+// for the first two means the funding coins went back to the funder. The
+// network then mined the transaction. Nothing local un-mines it: those coins are
+// consumed on chain, and every second the wallet keeps offering them is a second
+// in which the next CreateAction can author a double spend against a settled
+// payment. So a header-verified proof does not merely update a status here, it
+// takes the coins back.
+//
+// It differs from applyMined in exactly three places, and each is forced by the
+// state it is repairing rather than by the proof:
+//
+//  1. It FACT-SPENDS the inputs. applyMined does not need to — the accepted
+//     broadcast already recorded them — but a released or never-spent input has
+//     no such record, and re-establishing it is the whole point.
+//  2. Its transaction-row CAS admits 'failed' and 'aborted' (see
+//     [minedRepairTxStatuses]).
+//  3. It RE-MINTS the change before promoting it. Both the abort
+//     (RemoveByMintTx) and the release (doRemoveMinted) DELETE the coins, so
+//     applyMined's Promote would have nothing to promote; and where the
+//     reconciler only froze them, the freeze has to be lifted or the coins stay
+//     invisible to claims.
+//
+// ORDER: arcade's verdict is recorded FIRST, in its own commit, before the BUMP
+// is verified. That is what makes the repair converge across a crash or a
+// header view that lags arcade — a deferred proof writes no wallet state, and
+// the arcade_status it leaves behind is precisely the signature the backfill
+// ([Provider.repairMinedFenced]) finds it by. Without it a deferred repair would
+// be lost: none of the poll work lists can reach a fenced row.
+//
+// applied reports whether the wallet state was actually repaired, as opposed to
+// deferred for want of a verifiable proof. The live callers ignore it; the
+// backfill counts it, because a pass that deferred every row must not report
+// itself as having healed them.
+func (p *Provider) applyMinedRepair(ctx context.Context, rec arcade.TxRecord, kt *metastore.KnownTx) (applied bool, err error) {
+	txid := rec.TxID
+	if p.hdrs == nil {
+		return false, fmt.Errorf("storage: cannot verify merkle proof for %s: no headers source", txid)
+	}
+	p.logger.WarnContext(ctx, "repair: arcade reports a written-off transaction on chain",
+		slog.String("txid", txid),
+		slog.String("knownTxStatus", string(kt.Status)),
+		slog.String("arcadeStatus", string(rec.Status)))
+	if err := p.recordArcadeStatus(ctx, txid, rec.Status); err != nil {
+		return false, err
+	}
+
+	// The SAME trust anchor the ordinary apply uses, and the same refusals: a
+	// missing, malformed, unverifiable or mismatched BUMP writes NOTHING. The
+	// repair is a bigger write than an ordinary apply, so it may not clear a
+	// lower bar — an unverified proof that could consume a wallet's coins is a
+	// forgery oracle.
+	proof, _ := p.verifyMinedOne(ctx, rec, func(vctx context.Context, root *chainhash.Hash, height uint32) (bool, error) {
+		return p.hdrs.VerifyMerkleRoot(vctx, root, height)
+	})
+	if proof == nil {
+		return false, nil
+	}
+	if cerr := p.commitMinedRepair(ctx, kt, proof); cerr != nil {
+		return false, cerr
+	}
+	return true, nil
+}
+
+// commitMinedRepair applies a VERIFIED proof to a written-off transaction in one
+// [metastore.Store.Do]. Every step is idempotent, so a Mode B re-run (or a
+// re-delivered event, or the backfill re-reaching a half-applied row) converges:
+// a fact-mode spend by the same spender is a success, Mint of an existing coin
+// is a no-op, Unfreeze/Promote of a coin already in that state is uncounted, and
+// RemoveSpentBy of already-removed rows removes nothing.
+func (p *Provider) commitMinedRepair(ctx context.Context, kt *metastore.KnownTx, proof *minedProof) error {
+	txid := kt.TxID
+	txRow := p.repairTxRow(ctx, txid)
+	return p.meta.Do(ctx, func(ctx context.Context) error {
+		// The coins first: a crash after this leaves the spend recorded and the
+		// row still written off, which the backfill re-reaches. The reverse
+		// ordering would complete the transaction while leaving its inputs
+		// claimable — off every work list, with nothing to come back for them.
+		if err := p.factSpendMinedInputs(ctx, kt, proof.txidHash, repairReservation(txRow, txid)); err != nil {
+			return err
+		}
+		// The descriptive half of the same fact. The abort cleared this history
+		// (fenceAborted's ClearSpentBy) and the never-broadcast paths never wrote
+		// it, so without this a completed transaction would list its own inputs as
+		// unspent — the utxostore says otherwise and drives spendability, but the
+		// two views must not contradict each other.
+		if txRow != nil {
+			if err := p.markInputsSpentFromRaw(ctx, txRow, kt.RawTx); err != nil {
+				return err
+			}
+		}
+		if err := p.meta.KnownTx().SetProof(ctx, txid, proof.height, proof.blockHash, proof.mpBytes, proof.root); err != nil &&
+			!errors.Is(err, metastore.ErrNotFound) {
+			return fmt.Errorf("storage: repair: set proof: %w", err)
+		}
+		if err := p.meta.Transactions().UpdateStatusByTxID(ctx, txid, wdk.TxStatusCompleted,
+			minedRepairTxStatuses...); err != nil && !errors.Is(err, metastore.ErrStatusUpdateSkipped) {
+			return fmt.Errorf("storage: repair: mark completed: %w", err)
+		}
+		if err := p.meta.Transactions().ClearInputBEEFByTxID(ctx, txid); err != nil {
+			return fmt.Errorf("storage: repair: clear input beef: %w", err)
+		}
+		if err := p.remintChangeByTxID(ctx, txid, utxostore.TierMined); err != nil {
+			return err
+		}
+		// As in applyMined: a mined tx's inputs are permanently consumed, so they
+		// leave the hot inventory. Only rows spent BY this txid go — a coin a
+		// competing transaction won stays, still recorded to its winner.
+		removed, err := p.utxo.RemoveSpentBy(ctx, proof.txidHash)
+		if err != nil {
+			return fmt.Errorf("storage: repair: remove spent inputs: %w", err)
+		}
+		p.logger.InfoContext(ctx, "repair: completed a written-off transaction the network mined",
+			slog.String("txid", txid),
+			slog.Uint64("height", uint64(proof.height)),
+			slog.Int("prunedInputs", removed))
+		return nil
+	})
+}
+
+// repairTxRow resolves the wallet transaction behind a repair, CROSS-USER
+// (the monitor works by txid) and preferring the OUTGOING row: a txid can back
+// several rows — a self-payment is recorded by both sides — and only the
+// spender's row carries the reservation that funded it and the transaction-id
+// the input spend-history hangs off. Exactly [Provider.applyAcceptedBroadcast]'s
+// selection, for exactly its reasons.
+//
+// nil is a legitimate answer here, unlike on the broadcast path where it is
+// corruption: a repair may be handed a known tx whose wallet rows an operator
+// has pruned, and the coin-side of the repair still has to run.
+func (p *Provider) repairTxRow(ctx context.Context, txid string) *wdk.TableTransaction {
+	rows, err := p.meta.Transactions().FindByTxIDAllUsers(ctx, txid)
+	if err != nil {
+		p.logger.WarnContext(ctx, "repair: could not resolve the transaction row",
+			slog.String("txid", txid), slog.String("error", err.Error()))
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	for i := range rows {
+		if rows[i].IsOutgoing {
+			return &rows[i]
+		}
+	}
+	return &rows[0]
+}
+
+// repairReservation is the reservation token the repair's fact-mode spend
+// carries. Fact mode does not GUARD on it (the spend is on chain; no local
+// reservation state can refuse it) but every backend still refuses an EMPTY one
+// as a programmer error, so the caller must always name the funding run it
+// believes it is recording.
+//
+// The transaction row's reference is that name where one survives. With no row
+// (or a row carrying no reference) the spend must STILL be recorded — refusing
+// for want of a label would leave the coins claimable, which is the whole hazard
+// — so a placeholder naming the repair is used: honest about its provenance, and
+// never matched against by anything.
+func repairReservation(txRow *wdk.TableTransaction, txid string) string {
+	if txRow != nil && txRow.Reference != "" {
+		return string(txRow.Reference)
+	}
+	return "mined-repair:" + txid
+}
+
+// markInputsSpentFromRaw records the input spend-history of a repaired
+// transaction from its retained raw bytes. Unparseable or absent bytes are not
+// an error: [Provider.factSpendMinedInputs] has already reported that at ERROR
+// (it is the same read, and it is the one that matters), and the descriptive
+// history is not worth failing a repair over.
+func (p *Provider) markInputsSpentFromRaw(ctx context.Context, txRow *wdk.TableTransaction, rawTx []byte) error {
+	if len(rawTx) == 0 {
+		return nil
+	}
+	tx, err := transaction.NewTransactionFromBytes(rawTx)
+	if err != nil {
+		return nil //nolint:nilerr // already reported by the fact-spend; see the doc
+	}
+	return p.markInputsSpent(ctx, txRow.UserID, txRow.TransactionID, tx)
+}
+
+// factSpendMinedInputs records, in FACT MODE, that a mined transaction consumed
+// the inputs its retained raw tx names. It is the counterpart of
+// [Provider.spendReservedInputs] on the broadcast path, and it exists separately
+// for ONE reason: the two have opposite policies on a competing recorded spend.
+//
+//   - On the broadcast path a [utxostore.SpentError] is FATAL. Nothing has been
+//     committed yet, the caller can still refuse, and refusing preserves the
+//     recorded winner while the apply is re-driven.
+//   - Here it is an ALERT the repair continues past. The transaction is already
+//     mined; there is nothing left to refuse. Failing would abandon everything
+//     the repair CAN still fix — the other inputs, the proof, the change — in
+//     exchange for nothing, and would leave the row diverged so the backfill
+//     re-attempted it forever. The conflict is real and unrepairable either way:
+//     two spend facts exist for one coin, the chain has already picked one, and
+//     only the reconciler's competing-tx machinery plus a person can settle the
+//     wallet side. So it is named out loud, the recorded winner is left
+//     untouched (overwriting it would erase the evidence), and the repair
+//     carries on.
+//
+// The other verdicts are classified exactly as the broadcast path classifies
+// them: [utxostore.NotFoundError] is the only benign skip (a pruned or genuinely
+// external input), [utxostore.ErrContention] is retryable and returned so the
+// whole repair is re-driven, and a top-level error that is NOT
+// [utxostore.ErrBatch] is never explained away by the per-item verdicts — the
+// batch may have written nothing.
+//
+// A missing or unparseable raw tx is reported at ERROR and does NOT stop the
+// repair. It is the one case where the inputs cannot be enumerated at all, and
+// completing the transaction with its change re-minted is still strictly better
+// than leaving the row diverged as well; the abort path deliberately retains
+// raw_tx for exactly this reader (see [Provider.fenceAborted]), so it should not
+// happen.
+func (p *Provider) factSpendMinedInputs(
+	ctx context.Context, kt *metastore.KnownTx, spendingTxID chainhash.Hash, reservation string,
+) error {
+	txid := kt.TxID
+	if len(kt.RawTx) == 0 {
+		p.logger.ErrorContext(ctx, "repair: no retained raw tx; cannot record the mined transaction's spends",
+			slog.String("txid", txid))
+		return nil
+	}
+	tx, err := transaction.NewTransactionFromBytes(kt.RawTx)
+	if err != nil {
+		p.logger.ErrorContext(ctx, "repair: retained raw tx is unparseable; cannot record the mined transaction's spends",
+			slog.String("txid", txid), slog.String("error", err.Error()))
+		return nil
+	}
+	ops := make([]*utxostore.SpendOp, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		if in.SourceTXID == nil {
+			continue
+		}
+		ops = append(ops, &utxostore.SpendOp{
+			Outpoint:     utxostore.Outpoint{TxID: *in.SourceTXID, Vout: in.SourceTxOutIndex},
+			Reservation:  reservation,
+			SpendingTxID: spendingTxID,
+		})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	serr := p.utxo.Spend(ctx, ops, true)
+	if serr == nil {
+		return nil
+	}
+
+	var (
+		failed    int
+		tolerated int // NotFound (external) + SpentError (alerted): survivable here
+		fatal     error
+		contended error
+	)
+	for _, op := range ops {
+		if op.Err == nil {
+			continue
+		}
+		failed++
+		var spent *utxostore.SpentError
+		switch {
+		case errors.Is(op.Err, &utxostore.NotFoundError{}):
+			tolerated++
+		case errors.As(op.Err, &spent):
+			tolerated++
+			// THE UNREPAIRABLE OUTCOME. Named from the store's own report of the
+			// outpoint and the winner, not from our re-derivation of them.
+			p.logger.ErrorContext(ctx,
+				"repair: input consumed by a competing recorded spend — double spend materialized",
+				slog.String("txid", txid),
+				slog.String("outpoint", spent.Op.String()),
+				slog.String("winner", spent.Winner.String()))
+		case errors.Is(op.Err, utxostore.ErrContention):
+			if contended == nil {
+				contended = fmt.Errorf("storage: repair: record spend of %s for %s: %w",
+					op.Outpoint, txid, op.Err)
+			}
+		default:
+			if fatal == nil {
+				fatal = fmt.Errorf("storage: repair: record spend of %s for %s: %w",
+					op.Outpoint, txid, op.Err)
+			}
+		}
+	}
+	switch {
+	case fatal != nil:
+		return fatal
+	case contended != nil:
+		return contended
+	case errors.Is(serr, utxostore.ErrBatch) && failed > 0 && failed == tolerated:
+		return nil
+	default:
+		return fmt.Errorf("storage: repair: record spends for %s: %w", txid, serr)
+	}
+}
+
+// remintChangeByTxID makes a repaired transaction's change spendable again at
+// tier, whichever way the wallet's write-off had disposed of it.
+//
+// Three dispositions have to converge on one claimable coin, which is why this
+// is Mint-then-Promote-then-Unfreeze and not simply a Promote:
+//
+//   - REMOVED (the abort's RemoveByMintTx, the release's doRemoveMinted): the
+//     row is gone, so only a Mint brings it back — and it must, because the
+//     mined transaction genuinely created that output.
+//   - FROZEN (the reconciler's pass-1 hold): the row survives, so Mint is an
+//     idempotent no-op and does NOT touch the tier; the Promote is what fixes
+//     the tier and the Unfreeze is what makes the coin visible to claims again.
+//   - UNTOUCHED (a 'stuck' escalation never removes anything): Promote alone.
+//
+// The descriptive output rows are the source of truth for what to re-mint. They
+// outlive all three dispositions — none of them deletes wallet metadata — which
+// is what makes the re-mint reconstructible at all.
+//
+// A per-item [utxostore.AlreadyExistsError] is tolerated with a warning rather
+// than failing the repair: it means a row exists under a DIFFERENT coin identity
+// than the ledger describes, which the Promote and Unfreeze below still put into
+// a claimable state, and abandoning the whole repair over a satoshi-value
+// disagreement would leave the mined transaction's inputs unrecorded.
+func (p *Provider) remintChangeByTxID(ctx context.Context, txid string, tier utxostore.Tier) error {
+	change := true
+	rows, err := p.meta.Outputs().FindOutputs(ctx, wdk.FindOutputsArgs{TxID: &txid, Change: &change})
+	if err != nil {
+		return fmt.Errorf("storage: repair: find change outputs %s: %w", txid, err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	hash, err := chainhash.NewHashFromHex(txid)
+	if err != nil {
+		return fmt.Errorf("storage: repair: parse txid %s: %w", txid, err)
+	}
+	mints := make([]*utxostore.Mint, 0, len(rows))
+	ops := make([]utxostore.Outpoint, 0, len(rows))
+	for i := range rows {
+		// Every self-owned (change-purpose) output regardless of basket, matching
+		// [Provider.mintChange] and [Provider.changeOutpointsByTxID].
+		if rows[i].Basket == nil {
+			continue
+		}
+		// …except one the ledger already records as SPENT by a descendant. That
+		// coin's fate belongs to the descendant's own lifecycle, and re-minting it
+		// claimable here would hand out a coin something else has taken. Skipping
+		// is the conservative half of a genuinely ambiguous case: a coin left
+		// absent is recoverable, a coin handed out twice is not.
+		if rows[i].SpentBy != nil {
+			p.logger.WarnContext(ctx, "repair: change already recorded spent; not re-minting",
+				slog.String("txid", txid), slog.Int64("vout", int64(rows[i].Vout)))
+			continue
+		}
+		op := utxostore.Outpoint{TxID: *hash, Vout: rows[i].Vout}
+		ops = append(ops, op)
+		mints = append(mints, &utxostore.Mint{
+			Outpoint:  op,
+			UserID:    int64(rows[i].UserID),
+			Basket:    *rows[i].Basket,
+			Satoshis:  uint64(rows[i].Satoshis), //nolint:gosec // change value non-negative
+			InputSize: utxostore.DefaultP2PKHInputSize,
+			Tier:      tier,
+		})
+	}
+	if len(mints) == 0 {
+		return nil
+	}
+	if err := p.utxo.Mint(ctx, mints); err != nil {
+		for _, m := range mints {
+			switch {
+			case m.Err == nil:
+			case errors.Is(m.Err, &utxostore.AlreadyExistsError{}):
+				p.logger.WarnContext(ctx, "repair: change coin already exists with a different identity",
+					slog.String("outpoint", m.String()), slog.String("error", m.Err.Error()))
+			default:
+				return fmt.Errorf("storage: repair: re-mint change %s: %w", m.Outpoint, m.Err)
+			}
+		}
+		if !errors.Is(err, utxostore.ErrBatch) {
+			return fmt.Errorf("storage: repair: re-mint change %s: %w", txid, err)
+		}
+	}
+	if _, err := p.utxo.Promote(ctx, ops, tier); err != nil {
+		return fmt.Errorf("storage: repair: promote change %s: %w", txid, err)
+	}
+	if err := p.utxo.Unfreeze(ctx, ops); err != nil && !errors.Is(err, &utxostore.NotFoundError{}) {
+		return fmt.Errorf("storage: repair: unfreeze change %s: %w", txid, err)
+	}
+	return nil
 }
 
 // applyRejected marks a known tx suspectFailed and records the competing txids
@@ -564,12 +1048,39 @@ func (p *Provider) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord)
 		if !ok {
 			continue // not ours
 		}
+		evs := perTxid[txid]
+		// The MINED REPAIR divert, ahead of the terminal guard exactly as in
+		// ApplyStatusUpdate. It sends the txid to the per-event fallback rather
+		// than repairing inline, because the repair is per-transaction work by
+		// nature (its own inputs' fact-spend, its own change re-mint) with nothing
+		// to batch, and it is rare enough that the round trips do not matter.
+		//
+		// Diverting here is what stops the batch BURNING THE FENCE: 'aborted' and
+		// 'stuck' are not terminal failures, so without this a fenced row fell
+		// straight through to applyMinedBatch's bulk SetProof loop — completing the
+		// known tx, writing the proof, and destroying the very state the repair
+		// keys on, all before any poll could reach it.
+		//
+		// The divert is NOT atomic, and does not need to be. Like every other
+		// guard in this classifier it reads the row OUTSIDE the write
+		// transaction, so an abort landing between this read and applyMinedBatch's
+		// SetProof still burns the fence. What makes that tolerable — and what
+		// makes leaving SetProof unguarded tolerable at all — is the BACKFILL, not
+		// this check: a burned fence lands squarely in its signature (arcade says
+		// mined, the transaction row says aborted), so the next
+		// [Provider.repairMinedFenced] tick repairs the coins the burn skipped. A
+		// CAS-guarded SetProof would turn that race into a refusal instead, which
+		// is a worse outcome: the proof would be dropped and only the poll — which
+		// cannot see a fenced row — would be left to re-drive it.
+		if minedRepairBatchRoute(kt.Status, evs) {
+			fallback = append(fallback, txid)
+			continue
+		}
 		// Terminal wallet-state guard: a proven or terminally-failed tx is never
 		// downgraded by a later event (identical to ApplyStatusUpdate).
 		if kt.Status == wdk.ProvenTxStatusCompleted || kt.Status.IsTerminalFailure() {
 			continue
 		}
-		evs := perTxid[txid]
 		if multipleDistinctStatuses(evs) {
 			fallback = append(fallback, txid)
 			continue
@@ -662,6 +1173,21 @@ func (p *Provider) ApplyStatusBatch(ctx context.Context, recs []arcade.TxRecord)
 		}
 	}
 	return nil
+}
+
+// minedRepairBatchRoute reports whether a batched txid must leave the set-based
+// path for the per-event fallback because a MINED/IMMUTABLE record has arrived
+// for a written-off row. See the call site and [minedRepairStatuses].
+func minedRepairBatchRoute(st wdk.ProvenTxReqStatus, evs []arcade.TxRecord) bool {
+	if !isMinedRepairStatus(st) {
+		return false
+	}
+	for i := range evs {
+		if isMinedClass(evs[i].Status) {
+			return true
+		}
+	}
+	return false
 }
 
 // multipleDistinctStatuses reports whether a txid's batch records carry more
@@ -1693,6 +2219,19 @@ func mergeKnownTxs(a, b []metastore.KnownTx) []metastore.KnownTx {
 // CheckProofs is the proof poll fallback: for broadcast-accepted-but-unproven
 // known txs it fetches the record via GetTx (which carries the full BUMP) and
 // routes it through ApplyStatusUpdate, promoting any that have since mined.
+//
+// It also carries the MINED-REPAIR BACKFILL (see
+// [Provider.repairMinedFenced]). The two ride together because they are the
+// same job at two ends of the same pipe: this task exists to reconcile the
+// wallet with proofs it has not applied, and a written-off transaction the
+// network mined is exactly that — a proof the wallet refused. Sharing the task
+// also means the backfill inherits its lease, its cadence and its batch limit
+// rather than adding a fifth scheduled sweep for a condition that should be
+// empty.
+//
+// The backfill's outcome never fails the proof poll: they are independent work
+// lists, and a repair that cannot complete must not stop unproven transactions
+// from being promoted.
 func (p *Provider) CheckProofs(ctx context.Context, limit int) error {
 	if limit <= 0 {
 		limit = defaultMonitorBatchLimit
@@ -1701,7 +2240,213 @@ func (p *Provider) CheckProofs(ctx context.Context, limit int) error {
 	if err != nil {
 		return fmt.Errorf("storage: find unproven: %w", err)
 	}
-	return p.pollAndApply(ctx, unproven)
+	perr := p.pollAndApply(ctx, unproven)
+	if rerr := p.repairMinedFenced(ctx, limit); rerr != nil {
+		p.logger.ErrorContext(ctx, "repair: mined-on-written-off backfill failed",
+			slog.String("error", rerr.Error()))
+	}
+	return perr
+}
+
+// repairMinedFenced is the BACKFILL half of the mined repair: the healer for
+// rows on which the divergence is already durable rather than arriving as an
+// event.
+//
+// It exists because nothing else can reach them. Two populations sit in that
+// state, and neither appears on any poll work list — every one of those is keyed
+// on a non-terminal known-tx status:
+//
+//   - PRE-REPAIR ROWS. Before this change a MINED on an aborted row ran the
+//     ordinary apply, whose SetProof completed the known tx and stored the proof
+//     while the transaction row stayed 'aborted', no input was ever fact-spent
+//     and the change stayed removed. A deployment carries one such row per
+//     mined-after-abort that ever happened, and its known tx now reads
+//     'completed' — the most thoroughly ignored status there is.
+//   - DEFERRED REPAIRS. A live repair whose BUMP could not be verified yet (our
+//     header view lagging arcade), or whose commit failed, writes no wallet
+//     state but does leave arcade's verdict on the row.
+//
+// One signature covers both: arcade says MINED/IMMUTABLE, the wallet transaction
+// says written off. It also picks up a case neither the guard nor the repair
+// route reaches — a SYNCHRONOUS 4xx rejection (which fails the transaction row
+// but leaves the known tx merely 'suspectFailed', so a later MINED takes the
+// ORDINARY apply) whose transaction-row CAS then finds 'failed' outside its
+// from-set and skips. The known tx completes, the row stays failed, and the
+// inputs stay reserved: same divergence, same signature, healed here. Rows are repaired from their STORED proof where one exists —
+// it was header-verified when it was written, and this re-verifies it — and
+// otherwise from a fresh GetTx, which is what carries the BUMP for a deferred
+// row that never got one.
+//
+// It SELF-QUIESCES: a successful repair moves the transaction row to
+// 'completed', which is not in the finder's predicate, so a drained backlog
+// costs one bounded index scan per tick and nothing else. A row that cannot be
+// repaired (a permanently unverifiable proof) is retried on each tick and stays
+// loudly visible, which for a transaction arcade claims is mined and the wallet
+// has written off is the correct amount of noise.
+func (p *Provider) repairMinedFenced(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		limit = defaultMonitorBatchLimit
+	}
+	diverged, err := p.meta.KnownTx().FindMinedOnDeadTransactions(ctx, minedArcadeStatuses, limit)
+	if err != nil {
+		return fmt.Errorf("storage: find mined-on-written-off transactions: %w", err)
+	}
+	if len(diverged) == 0 {
+		return nil
+	}
+	p.logger.WarnContext(ctx, "repair: transactions the wallet wrote off that arcade reports on chain",
+		slog.Int("found", len(diverged)), slog.Int("limit", limit))
+
+	// ANTI-STARVATION, and it is not optional here. Three of the four outcomes
+	// below write NOTHING to the known tx — arcade has forgotten the
+	// transaction, arcade has revised its verdict, or the row could not be
+	// repaired — and the finder orders by this stamp. Without it such a row keeps
+	// its place at the head of every page and hides the entire backlog behind
+	// itself, which is the failure the poll fallbacks already learned the hard
+	// way (see [metastore.KnownTxRepo.MarkPolled]). Recorded BEFORE any of the
+	// work, so it holds however the pass ends.
+	attempted := make([]string, len(diverged))
+	for i := range diverged {
+		attempted[i] = diverged[i].TxID
+	}
+	if merr := p.meta.KnownTx().MarkPolled(ctx, attempted); merr != nil {
+		p.logger.WarnContext(ctx, "repair: failed to record the backfill attempt; the work list may not advance",
+			slog.Int("batch", len(attempted)), slog.String("error", merr.Error()))
+	}
+
+	var repaired, deferredN, disagreed, failed int
+	for i := range diverged {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		kt := &diverged[i]
+		outcome, rerr := p.repairOneMinedFenced(ctx, kt)
+		switch {
+		case rerr != nil:
+			failed++
+			p.logger.WarnContext(ctx, "repair: backfill of one transaction failed; retrying next tick",
+				slog.String("txid", kt.TxID), slog.String("error", rerr.Error()))
+		case outcome == repairApplied:
+			repaired++
+		case outcome == repairDeferred:
+			deferredN++
+		case outcome == repairDisagreed:
+			disagreed++
+		}
+	}
+	// The counters are split because they mean opposite things to an operator and
+	// only one of them is progress. A single "repaired" that also counted the
+	// deferred and the disagreed would report a healthy drain on a pass that
+	// healed nothing at all — the same illusion the arcade-status repair sweep
+	// was diagnosed with.
+	p.logger.InfoContext(ctx, "repair: mined-on-written-off backfill pass complete",
+		slog.Int("attempted", len(diverged)), slog.Int("repaired", repaired),
+		slog.Int("deferred", deferredN), slog.Int("disagreed", disagreed), slog.Int("failed", failed))
+	return nil
+}
+
+// repairOutcome names what one backfill row cost the pass. Only
+// [repairApplied] is progress; the rest leave the row diverged for a later tick
+// (or, for [repairDisagreed], for good).
+type repairOutcome int
+
+const (
+	// repairApplied: the proof verified and the wallet state was repaired.
+	repairApplied repairOutcome = iota
+	// repairDeferred: nothing could be verified yet (a lagging header view, a
+	// missing BUMP). No wallet state was written; the next tick retries.
+	repairDeferred
+	// repairDisagreed: arcade no longer says the transaction is mined — it has
+	// forgotten the record, or revised the verdict. Nothing to repair.
+	repairDisagreed
+)
+
+// repairOneMinedFenced re-drives [Provider.applyMinedRepair] for one diverged
+// row, sourcing the proof material it needs.
+//
+// The STORED proof is preferred and is the common case: a pre-repair row already
+// has a header-verified BUMP in known_txs, so re-verifying it locally costs one
+// header read and no arcade round trip — which matters, because the alternative
+// on a large backlog is a GetTx per row. The oracle is asked only when there is
+// nothing stored, which is the deferred-repair case: the row is fenced precisely
+// because no BUMP has ever verified for it.
+func (p *Provider) repairOneMinedFenced(ctx context.Context, kt *metastore.KnownTx) (repairOutcome, error) {
+	rec, ok := storedProofRecord(kt)
+	if !ok {
+		if p.oracle == nil {
+			return repairDeferred, fmt.Errorf(
+				"storage: repair: %s has no stored proof and there is no oracle to refetch it", kt.TxID)
+		}
+		fetched, gerr := p.oracle.GetTx(ctx, kt.TxID)
+		switch {
+		case errors.Is(gerr, arcade.ErrTxNotFound), fetched == nil && gerr == nil:
+			// Arcade no longer has the record it once gave a verdict for (it drops
+			// them on its own schedule). Nothing to verify, so nothing may be
+			// repaired. The row keeps its recorded verdict — that is the only
+			// remaining trace that this transaction was ever reported mined, and
+			// erasing it would take the divergence out of the work list without
+			// resolving it. The attempt stamp is what keeps it from blocking the
+			// page.
+			p.logger.WarnContext(ctx, "repair: arcade no longer knows a transaction it reported mined",
+				slog.String("txid", kt.TxID))
+			return repairDisagreed, nil
+		case gerr != nil:
+			return repairDeferred, fmt.Errorf("storage: repair: refetch %s: %w", kt.TxID, gerr)
+		}
+		if fetched.TxID == "" {
+			fetched.TxID = kt.TxID
+		}
+		if !isMinedClass(fetched.Status) {
+			// Arcade has revised its verdict since the status was recorded. The
+			// repair is only ever driven by a mined verdict, so nothing is repaired
+			// — but the REVISED verdict is recorded, which both keeps the row honest
+			// and (because it is a real status write) drops it out of the backfill's
+			// predicate for good.
+			p.logger.WarnContext(ctx, "repair: arcade has revised its mined verdict",
+				slog.String("txid", kt.TxID), slog.String("arcadeStatus", string(fetched.Status)))
+			if serr := p.recordArcadeStatus(ctx, kt.TxID, fetched.Status); serr != nil {
+				return repairDisagreed, serr
+			}
+			return repairDisagreed, nil
+		}
+		rec = *fetched
+	}
+
+	// applyMinedRepair keys the repair off the CURRENT known-tx status, and a
+	// pre-repair row is already 'completed' — the divergence is on the
+	// transaction row, not the known tx — so the backfill calls the repair
+	// DIRECTLY rather than routing through ApplyStatusUpdate, whose terminal
+	// guard would (correctly, for a live event) drop it.
+	applied, err := p.applyMinedRepair(ctx, rec, kt)
+	switch {
+	case err != nil:
+		return repairDeferred, err
+	case applied:
+		return repairApplied, nil
+	default:
+		return repairDeferred, nil
+	}
+}
+
+// storedProofRecord rebuilds an arcade record from the BUMP already stored on a
+// known tx, so the repair can re-verify and re-apply it without asking arcade.
+// ok is false when the row carries no usable stored proof.
+func storedProofRecord(kt *metastore.KnownTx) (arcade.TxRecord, bool) {
+	if len(kt.MerklePath) == 0 || kt.BlockHeight == nil {
+		return arcade.TxRecord{}, false
+	}
+	rec := arcade.TxRecord{
+		TxID:        kt.TxID,
+		Status:      arcade.StatusMined,
+		BlockHeight: uint64(*kt.BlockHeight),
+		MerklePath:  kt.MerklePath,
+	}
+	if len(kt.BlockHash) == chainhash.HashSize {
+		var h chainhash.Hash
+		copy(h[:], kt.BlockHash)
+		rec.BlockHash = h.String()
+	}
+	return rec, true
 }
 
 // pollPeers bounds concurrent GetTx calls in the poll fallback. GetTx is a

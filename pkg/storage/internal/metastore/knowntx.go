@@ -294,7 +294,12 @@ func (s *Store) stickyOr(col, excl string) string {
 // tx regressing once it has moved beyond the broadcast stage. A fresh insert,
 // or an applied update, it returns nil. On a guarded skip (an existing row whose
 // status is in skipForStatuses) it returns [ErrStatusUpdateSkipped], matching
-// the package-wide guarded-transition convention. was_broadcast is sticky.
+// the package-wide guarded-transition convention.
+//
+// THREE COLUMNS ARE STICKY — was_broadcast, arcade_status and reject_reason —
+// and each for the same reason: no upsert caller ever supplies them, they are
+// owned by writers elsewhere, and so an unguarded EXCLUDED could only erase.
+// See the conflict clause below.
 func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...wdk.ProvenTxReqStatus) error {
 	raw, err := encTxID(kt.TxID)
 	if err != nil {
@@ -320,7 +325,18 @@ func (r KnownTxRepo) Upsert(ctx context.Context, kt KnownTx, skipForStatuses ...
 	}
 
 	conflict := "ON CONFLICT (txid) DO UPDATE SET " +
-		"status = EXCLUDED.status, arcade_status = EXCLUDED.arcade_status, " +
+		"status = EXCLUDED.status, " +
+		// Sticky, like was_broadcast and reject_reason below. NO upsert caller
+		// carries an arcade status — both of them (the freshly-signed-tx insert in
+		// processNewTx, and internalize) leave the field nil — while arcade's
+		// verdict is written exclusively by SetArcadeStatus/BulkSetArcadeStatus,
+		// so an unguarded EXCLUDED here could only ever ERASE a verdict, never set
+		// one. That erasure is not cosmetic: an internalize of a transaction the
+		// wallet had written off would blank the very column the mined-repair
+		// backfill finds the divergence by
+		// ([KnownTxRepo.FindMinedOnDeadTransactions]), taking the row off the
+		// healer's work list while leaving its coins exactly as wrong as before.
+		"arcade_status = COALESCE(EXCLUDED.arcade_status, known_txs.arcade_status), " +
 		"attempts = EXCLUDED.attempts, rebroadcast_attempts = EXCLUDED.rebroadcast_attempts, " +
 		"was_broadcast = " + r.s.stickyOr("known_txs.was_broadcast", "EXCLUDED.was_broadcast") + ", " +
 		"notified = EXCLUDED.notified, batch = EXCLUDED.batch, notify = EXCLUDED.notify, " +

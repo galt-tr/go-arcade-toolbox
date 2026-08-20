@@ -97,6 +97,7 @@ func runMetastoreSuite(t *testing.T, factory storeFactory) {
 	t.Run("Outputs_ListOutputs_Seam", func(t *testing.T) { t.Parallel(); testOutputs(t, factory) })
 	t.Run("KnownTx_SuspectFailed", func(t *testing.T) { t.Parallel(); testKnownTx(t, factory) })
 	t.Run("KnownTx_PollProgressAndRepair", func(t *testing.T) { t.Parallel(); testKnownTxPollProgress(t, factory) })
+	t.Run("KnownTx_MinedOnDeadTransactions", func(t *testing.T) { t.Parallel(); testKnownTxMinedOnDead(t, factory) })
 	t.Run("KnownTx_BulkMutatorsOverlappingTxIDs", func(t *testing.T) { t.Parallel(); testKnownTxBulkOverlap(t, factory) })
 	t.Run("KnownTx_TransitionToAborted", func(t *testing.T) { t.Parallel(); testKnownTxTransitionToAborted(t, factory) })
 	t.Run("KnownTx_ClaimForSend", func(t *testing.T) { t.Parallel(); testKnownTxClaimForSend(t, factory) })
@@ -580,6 +581,69 @@ func testKnownTxPollProgress(t *testing.T, factory storeFactory) {
 	stranded, err = s.KnownTx().FindMissingArcadeStatus(ctx, cutoff, rows, wdk.ProvenTxStatusUnconfirmed)
 	require.NoError(t, err)
 	require.NotContains(t, knownTxIDs(stranded), txids[1])
+}
+
+// testKnownTxMinedOnDead covers the mined-repair backfill's work list: known txs
+// arcade reports on chain whose wallet transaction the wallet has written off.
+//
+// It runs on both dialects because the failure it guards against is silent
+// rather than loud: the predicate binds two same-typed placeholder groups (the
+// arcade statuses, then the transaction statuses) and the rebind that turns `?`
+// into PostgreSQL's `$n` numbers them positionally across the whole statement,
+// subquery included. Swap the two groups and the query still runs and still
+// returns rows — just never the right ones, i.e. a healer that quietly heals
+// nothing.
+func testKnownTxMinedOnDead(t *testing.T, factory storeFactory) {
+	ctx := context.Background()
+	s := factory(t)
+	uid := mustUser(ctx, t, s, "mined-repair-user")
+
+	mined := []string{"MINED", "IMMUTABLE"}
+
+	// seed pairs a transaction row at txStatus with a known tx at arcadeStatus.
+	seed := func(ref string, txStatus wdk.TxStatus, arcadeStatus string) string {
+		txid := randTxID(t)
+		id, err := s.Transactions().Insert(ctx, metastore.NewTx{UserID: uid, Status: txStatus, Reference: ref})
+		require.NoError(t, err)
+		require.NoError(t, s.Transactions().SetTxID(ctx, id, txid))
+		require.NoError(t, s.KnownTx().Upsert(ctx, metastore.KnownTx{TxID: txid, Status: wdk.ProvenTxStatusCompleted}))
+		require.NoError(t, s.KnownTx().SetArcadeStatus(ctx, txid, arcadeStatus))
+		return txid
+	}
+
+	// The two divergences: the pre-repair silent completion (aborted row, MINED
+	// known tx) and a released false positive whose proof landed later.
+	abortedMined := seed("dead-1", wdk.TxStatusAborted, "MINED")
+	failedImmutable := seed("dead-2", wdk.TxStatusFailed, "IMMUTABLE")
+
+	// Everything that must NOT be selected: a healthy mined transaction, a
+	// written-off one arcade agrees is dead, and a written-off one still in
+	// flight as far as arcade is concerned.
+	seed("live-1", wdk.TxStatusCompleted, "MINED")
+	seed("dead-3", wdk.TxStatusFailed, "REJECTED")
+	seed("dead-4", wdk.TxStatusAborted, "SEEN_ON_NETWORK")
+
+	got, err := s.KnownTx().FindMinedOnDeadTransactions(ctx, mined, 100)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{abortedMined, failedImmutable}, knownTxIDs(got),
+		"the backfill's work list is wrong; it either misses a diverged row (the "+
+			"coins of a mined transaction stay claimable forever) or selects a healthy "+
+			"one (it re-repairs rows that are already correct, every tick)")
+
+	// The healer quiesces on the transaction row, which is what a repair moves.
+	require.NoError(t, s.Transactions().UpdateStatusByTxID(ctx, abortedMined, wdk.TxStatusCompleted))
+	got, err = s.KnownTx().FindMinedOnDeadTransactions(ctx, mined, 100)
+	require.NoError(t, err)
+	require.Equal(t, []string{failedImmutable}, knownTxIDs(got), "a repaired row must leave the work list")
+
+	// And it is bounded, so a large backlog cannot turn the sweep into the load.
+	got, err = s.KnownTx().FindMinedOnDeadTransactions(ctx, mined, 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+
+	empty, err := s.KnownTx().FindMinedOnDeadTransactions(ctx, nil, 100)
+	require.NoError(t, err)
+	require.Empty(t, empty, "no arcade statuses means no work list, never every row")
 }
 
 // testKnownTxBulkOverlap drives the bulk mutators concurrently over OVERLAPPING
